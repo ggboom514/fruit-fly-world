@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="UTF-8" />
+		<!--
+			这里刻意没有加 CSP meta：
+			本应用完全离线，不加载任何远程资源，渲染进程也没开 nodeIntegration。
+			加 'self' 反而会在 file:// 下把本地模块一起挡掉。
+		-->
+		<title>果蝇世界</title>
+		<link rel="stylesheet" href="./style.css" />
+	</head>
+	<body>
+		<!-- 果蝇们画在这里 -->
+		<canvas id="stage"></canvas>
+
+		<!--
+			食物投放区参考框：所有食物（开局那份、自动投放、玩家买的）都只会落在这块矩形里。
+			位置和大小来自 CONFIG.food.zone（归一化比例），由 ui.js 换算成像素摆好。
+
+			默认 **不显示** —— 这是桌宠，一个长期挂着的大虚线框会挡桌面。
+			调位置的时候把 config 里 zone.show 改成 true 就能看见。
+
+			⚠ 位置很讲究：它**必须**紧跟在 canvas 后面、且在 #hud 前面。
+			这里靠的全是「同为 position 定位元素、按 DOM 顺序叠」这条默认规则，
+			所以它**不能写 z-index** —— 一写 1 就会跑到所有 z-auto 的兄弟上面去，
+			把工具栏、启动选择框、集群提示条统统盖住（它们都是 z-auto）。
+			同理它也**不能**像别的那样放在 </body> 前面。
+
+			⚠ 另外两条和其他浮层一样：pointer-events: none，
+			而且**不能**参与 ui._updateInteractive() —— 它是常驻的视觉元素，
+			一旦参与「要不要接管鼠标」，整块区域的桌面点击都会被吞掉。
+		-->
+		<div id="food-zone" class="food-zone hidden"></div>
+
+		<!--
+			工具栏做成一扇小窗口：拖动标题栏可以挪位置，点「–」收起整个面板。
+			除了这扇窗口，其余区域的鼠标事件都会穿透到桌面上。
+		-->
+		<div id="hud">
+			<div class="window" id="panel">
+				<!-- 标题栏：拖动区 + 最小化 / 关闭 -->
+				<div class="titlebar" id="titlebar">
+					<span class="title">果蝇世界</span>
+					<div class="winbtns">
+						<button id="btn-min" class="winbtn" title="收起面板（只留标题栏）">–</button>
+						<button id="btn-quit" class="winbtn close" title="退出（Ctrl+Shift+Q）">✕</button>
+					</div>
+				</div>
+
+				<!-- 主体：最小化时整块收起 -->
+				<div class="body" id="panel-body">
+					<!--
+						统计。
+						⚠ 这一行**只放存活和死亡两个数** —— 其余全部收进右边那个三条杠里。
+						面板只有 318px 宽，一行塞五个数会挤成一片，而且那五个里
+						只有这两个是「一眼要看到」的：它们回答「现在还有多少活的」。
+						分类明细是想查的时候才会看的东西，不该常驻。
+					-->
+					<div class="group stats">
+						<div class="stat">
+							<i class="dot living"></i>
+							<b id="s-living">0</b>
+							<span>存活</span>
+						</div>
+						<div class="stat">
+							<i class="dot dead"></i>
+							<b id="s-deaths">0</b>
+							<span>死亡</span>
+						</div>
+						<button id="btn-stats" class="stats-toggle" title="展开 / 收起细分数量：成虫、幼虫、卵、食物、成虫总价值">
+							<span class="bars"></span>
+						</button>
+					</div>
+
+					<!--
+						细分数量。默认收起，点三条杠展开。
+						没有做折叠动画：一行小字，展开收起都该是「啪」一下的事，
+						加个高度过渡反而显得拖沓
+					-->
+					<div class="group stats-detail collapsed" id="stats-detail">
+						<span title="成虫数量"><i class="dot adult"></i>成虫 <b id="s-adults">0</b></span>
+						<span title="幼虫数量"><i class="dot larva"></i>幼虫 <b id="s-larvae">0</b></span>
+						<span title="卵的数量"><i class="dot egg"></i>卵 <b id="s-eggs">0</b></span>
+						<span title="食物数 · 正在啃食的幼虫数"><i class="dot food"></i>食物 <b id="s-food">0</b></span>
+						<span class="wide" title="屏幕上所有成虫的售价之和 —— 也就是「现在全卖了能拿多少钱」">
+							<i class="dot worth"></i>成虫总价值 <b id="s-value">$0.000</b>
+						</span>
+					</div>
+
+					<!--
+						游戏币。单独一行而且用金色，是因为它是**玩家自己的**数字，
+						和上面那排「世界有多少只虫」不是一回事。
+						格式由 market.js 的 formatMoney 决定：千分位 + 至少三位小数
+					-->
+					<div class="group money" title="卖掉成虫换来的游戏币。在商店里买道具">
+						<span class="coin"></span>
+						<b id="s-money">$0.000</b>
+						<span class="money-label">已售 <i id="s-sold">0</i></span>
+					</div>
+
+					<!--
+						工具。默认收起，点标题行才展开 ——
+						六个按钮本身就要占两行，收起来能让面板短一截。
+						收起时标题行右侧会显示**当前拿着哪个工具**，
+						不然收起来之后完全看不出状态（快捷键仍然直接生效）。
+					-->
+					<div class="fold collapsed" id="tools-box">
+						<button class="fold-toggle" id="btn-tools" title="展开 / 收起工具。快捷键不用展开也能直接用：G 手套 · F 拍 · N 网 · B 扫帚 · C 擦 · W 冲 · R 烤 · V 查看 · Esc 观察">
+							<span>工具</span>
+							<b id="tools-current">观察</b>
+							<span class="caret">▾</span>
+						</button>
+						<div class="group tools fold-body" id="tools">
+							<button class="tool active" data-tool="none" title="只看不动。鼠标基本穿透，但悬停在玻璃罐上时还能直接拖它（Esc）">观察</button>
+							<!--
+								查看：点一下虫弹数据面板。
+								⚠ 这一步以前是**观察模式直接就能点**，改成专用工具有两个理由：
+								1. 观察模式的定位是「纯看不打扰」，而「能点开东西」会让窗口在那只虫
+								   头上接管鼠标、吞掉桌面点击 —— 和那档的定位自相矛盾
+								2. 罐子的判定排在所有工具之前，观察模式下压在罐子上的虫**永远点不开**
+								   （见 ui.js 的 _grabbableAt）。分开之后「想查看」和「想拖罐子」
+								   各有一条明确的路，不再互相盖
+							-->
+							<button class="tool" data-tool="inspect" title="点一下果蝇或幼虫，弹出它的数据面板（V）。飞行中的也能点">查看</button>
+							<button class="tool" data-tool="glove" title="戴上手套才能拖动物件：食物、蛹壳、成虫、尸体（G）。⚠ 玻璃罐不用手套，观察模式直接就能拖">手套</button>
+							<button class="tool" data-tool="swatter" title="点一下拍死拍面底下的果蝇，会爆汁留渍。留下的尸体可以拿去烤（F）">苍蝇拍</button>
+							<button class="tool locked" id="btn-net" data-tool="net" title="点一下把附近的成虫网进最近的玻璃罐（N）。要先在商店买下捕虫网">捕虫网</button>
+							<button class="tool" data-tool="cloth" title="按住并**来回滑动**擦掉尸体、汁渍和蛹壳。停在原地按住不动是擦不掉的（C）">抹布</button>
+							<!--
+								扫帚：免费工具，不进商店。
+								⚠ 排在这里（抹布和喷水枪中间，而不是最后）是刻意的：
+								   最后那颗位置会随着「买没买打火机」出现/消失，
+								   放那儿的话按钮会跳来跳去。烤制永远是最后一颗
+							-->
+							<button class="tool" data-tool="broom" title="按住左键把圈里的幼虫朝外扫开。滚轮调半径（30~200px）。⚠ 它只推幼虫，不杀不抓，也扫不掉果子上那份食物；而且照常会把成虫惊飞（B）">扫帚</button>
+							<!--
+								喷水枪：一条可以转向、可以调长的水线，碰到「可清洁物」就直接冲掉，
+								不用像抹布那样来回滑。
+								⚠ 名字和下面那颗「喷火枪」只差一个字、还押韵，但两件事完全不同：
+								   喷**水**枪冲掉地上的脏东西，喷**火**枪把尸体烤熟卖钱。
+								   好在烤制那颗要买到打火机才出现，而且排在最后，不会挨在一起
+							-->
+							<button class="tool locked" id="btn-squirt" data-tool="squirt" title="按住左键喷水，冲掉尸体 / 污渍 / 蛹壳。滚轮改水线长度，Shift+滚轮转方向（W）。要先在商店买下喷水枪">喷水枪</button>
+							<!--
+								烤制。⚠ 默认 hidden，买到打火机（lv1）之后才出现，
+								文字和快捷键提示由 ui.refreshRoastTool() 按当前档位改。
+								lv1 打火机 / lv2 喷火枪是「按住烤」的工具，
+								lv3 烤炉则变成「点一下摆一个炉子」——同一颗按钮换行为
+							-->
+							<button class="tool hidden" id="btn-roast" data-tool="roast" title="">烤制</button>
+						</div>
+					</div>
+
+					<!--
+						时间。「时停」在最左边，往右是 1× / 2× / 5× / 10× ——
+						左边慢右边快，一眼看得出是一根速度轴。
+
+						时停和倍速**是同一件事的两端**（都是「世界推进得多快」），
+						所以放在同一组里，而不是各占一个按钮：
+						分开的话会出现「暂停着、同时倍速按钮还亮着 5×」这种自相矛盾的状态。
+
+						时停只是 world.paused = true，world.timeScale **原样留着** ——
+						所以从时停里按 1×「恢复」之后不会再跳回 5×。
+
+						果蝇一个世代要 25 分钟，想看完整的「卵 → 蛆 → 蛹 → 蝇」只能靠加速：
+						10× 走完一代约两分半。
+						加速只改 timeScale，物理仍然是分步积分的（见 world.update），
+						所以 10× 下不会出现果蝇瞬移或者穿过罐壁。
+					-->
+					<div class="fold collapsed" id="speed-box">
+						<button class="fold-toggle" id="btn-speed" title="展开 / 收起倍速。最左边是时停，往右依次是 1× / 2× / 5× / 10×（Space 也能时停）">
+							<span>倍速</span>
+							<b id="speed-current">1×</b>
+							<span class="caret">▾</span>
+						</button>
+						<div class="group speeds fold-body" id="speeds">
+							<button class="speed" data-speed="0" title="时停：整个世界停住，但鼠标、工具、存档都照常（Space）">时停</button>
+							<button class="speed active" data-speed="1" title="正常速度（真实时间）">1×</button>
+							<button class="speed" data-speed="2" title="两倍速">2×</button>
+							<button class="speed" data-speed="5" title="五倍速">5×</button>
+							<button class="speed" data-speed="10" title="十倍速，一代约两分半">10×</button>
+						</div>
+					</div>
+
+					<!-- 窗口与生态控制 -->
+					<div class="group actions">
+						<button id="btn-top" class="toggle on" title="浮在所有窗口之上（Ctrl+Shift+T）">置顶</button>
+						<button id="btn-through" class="toggle on" title="开启时只有这扇窗口接管鼠标，其余地方不挡你操作桌面（Ctrl+Shift+F）">
+							穿透
+						</button>
+						<!--
+							⚠ 「玻璃罐」那颗按钮**撤掉了** —— 它挪到了投放弹窗的「其他」组里
+							（见 #feed-pop）。同一个功能留两个入口的话，工具栏这一行会更挤，
+							而且「摆罐子」和「买东西」分在两处、玩家得记两个地方
+						-->
+						<!--
+							投放 / 商店：金色 + 边框渐变流动。用 .gold 而不是 .ghost ——
+							这两个都是**花钱**的地方，和出售区、数据面板的金档共用一套金色。
+							投食和投蝇原来各占一个按钮，现在合并进投放面板：
+							每个动作都要选 1 个还是 10 个，按钮上还得标价，一行排不下了
+						-->
+						<button id="btn-feed" class="gold" title="打开投放面板（屏幕正中的弹窗）。买苹果、金苹果、补果蝇，或者摆一个玻璃罐">投放</button>
+						<button id="btn-shop" class="gold" title="打开商店（屏幕正中的弹窗）。卖掉成虫换来的游戏币可以在这里买道具">商店</button>
+						<button id="btn-reset" class="ghost" title="清空重来（钱和已购道具也会一起清掉）">重置</button>
+					</div>
+
+					<!--
+						投放 / 商店面板**搬走了** —— 见文件末尾那两张 #feed-pop / #shop-pop。
+						它们现在是屏幕正中的弹窗，和设置卡同一套，不能再放在这扇窗里
+						（.window 有 overflow: hidden，放进来会被整个剪掉）。
+
+						⚠ 按钮和面板标题都叫「投放」，但代码里的 id / 方法名一律还是 feed ——
+						feed 是这一块在**代码里**的名字（refreshFeed / #feed-list），
+						和玩家看到的两个字是两回事，不用跟着改
+					-->
+
+					<!--
+						垃圾桶：戴上手套把食物 / 罐子 / 蛹壳拖进来就销毁。
+						注意拖拽一律要手套，所以这里不能再写「观察模式下」。
+						**不接收成虫** —— 成虫拖过来是「放走」，卖要走下面那个金色区
+					-->
+					<div class="trash" id="trash" title="戴上手套，按住食物、玻璃罐或蛹壳，拖到这里丢掉">
+						<span class="bin"></span>
+						<span>戴手套拖食物 / 罐子 / 蛹壳来丢</span>
+					</div>
+
+					<!--
+						出售区：戴手套把成虫拖进来松手就卖掉，换游戏币。
+						和垃圾桶同一套「悬停高亮 + 松手结算」，只是收的东西不一样：
+						垃圾桶销毁物件，出售区收果蝇
+					-->
+					<div class="sell" id="sell" title="戴上手套，把成虫拖到这里卖掉。价格 = 体重，养成大只的更值钱">
+						<span class="tag">$</span>
+						<span>戴手套拖成虫来卖</span>
+					</div>
+
+					<!--
+						提示条。⚠ 文字必须单独包一层 #hint-text —— _flashHint() 是直接写
+						textContent 的，写在 #hint 上的话会把这个捐款按钮一起抹掉。
+
+						捐款按钮钉在整块面板的右下角。它只是个入口，点开才弹二维码
+					-->
+					<div class="hint" id="hint">
+						<span id="hint-text">G 手套 · F 拍 · N 网 · C 擦 · V 查看 · Esc 观察 · Ctrl+Shift+Q 退出</span>
+						<!--
+							图鉴：和设置齿轮并排。图标是纯 CSS 画的（和 .gear-icon / .jar-icon
+							同一套做法）——项目不用 emoji，emoji 的字体可用性看运气，
+							打包发给别人用缺字体就变成豆腐块
+						-->
+						<button id="btn-codex" class="donate codex" title="图鉴：看看这个世界里都有哪些食物和基因">
+							<span class="book-icon"></span>
+						</button>
+						<button id="btn-settings" class="donate gear" title="设置：正常模式 / 烦人模式">
+							<span class="gear-icon"></span>
+						</button>
+						<button
+							id="btn-donate"
+							class="donate"
+							title="请我喝瓶水 —— 打开收款码。完全自愿，和游戏里的一切都无关"
+						>
+							<span class="jar-icon"></span>
+						</button>
+					</div>
+
+				</div>
+			</div>
+
+			<!--
+				捐款卡片：点工具栏右下角那个小罐子才出来，**钉在屏幕正中**。
+				位置全在 style.css 里（50% / 50% + translate），没有任何 JS 摆位 ——
+				早先是贴在面板正上方、由 ui._placeDonate() 每帧现算，
+				面板一拖到屏幕边缘，卡片被 clamp 到边上，二维码就顶出可视区了。
+
+				⚠ 三条位置上的讲究，都是踩出来的：
+
+				1. **不能放进 .window 里面** —— 那扇窗有 overflow: hidden（用来裁圆角），
+				   放进去会被整个剪掉，一点都看不见。
+				2. **必须给 .donate-pop 一个 z-index。** 卡片居中之后和面板是可以重叠的
+				   （面板默认停在底部中央，窗口一矮就压上），而面板底色是
+				   rgba(18,16,14,0.84)（半透明）—— 让它盖在卡片上，二维码就会从
+				   面板底下透出来糊成一片。style.css 里那个 30 就是为这个加的。
+				3. **挂在 #hud 里**（和 .window 并列），不要直接放 body 下。
+				   直接挂 body 的那一版，卡片在这个透明窗口里合成得不对
+				   （截图里糊成半透明的浅灰，和 DOM 里量到的样式对不上）。
+
+				⚠ 附带代价：没有全屏背板，就没有「点空白处关闭」。
+				关法是 ✕ / Esc / 再点一下小罐子 / 点面板别处。
+				所以它必须参与 ui._updateInteractive()（走 _overDonate 的命中判定）——
+				不接管鼠标的话，卡片长得完全正常，只是点上去会穿到桌面上，关都关不掉。
+			-->
+			<div id="donate-pop" class="donate-pop hidden">
+				<div class="donate-card">
+					<button id="donate-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">自愿捐款，理性消费哦</p>
+					<img class="donate-qr" id="donate-qr" src="./assets/alipay-qr.png" alt="支付宝收款码" />
+					<p class="donate-note">支付宝扫一扫</p>
+				</div>
+			</div>
+
+			<!--
+				设置卡片。和捐款卡片共用 .donate-pop / .donate-card 那一套
+				（居中的定位、层级、关闭方式全部继承），只是内容换成两档模式。
+			-->
+			<div id="settings-pop" class="donate-pop hidden">
+				<div class="donate-card">
+					<button id="settings-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">设置</p>
+					<div class="mode-list" id="mode-list">
+						<button class="mode" id="mode-normal" data-mode="normal">
+							<span class="mode-name">正常模式</span>
+							<span class="mode-desc">标准的上限，果蝇一个世代约 25 分钟</span>
+						</button>
+						<button class="mode" id="mode-annoying" data-mode="annoying">
+							<span class="mode-name annoying">烦人模式</span>
+							<span class="mode-desc">生态上限拉高 50 倍。会明显吃性能，风扇会响</span>
+						</button>
+					</div>
+					<p class="donate-note" id="settings-note">点一下切换，立刻就生效</p>
+				</div>
+			</div>
+
+			<!--
+				养蝇人配置卡。和设置卡共用 .donate-pop / .donate-card 那一套
+				（居中定位、层级 30、关闭方式全部继承）。
+
+				六行分段选择器，每行一个标签 + 一排按钮，选中的用现成的
+				button.active 样式。按钮由 ui.refreshKeeperCard() 按
+				CONFIG.market.keeperOptions 渲染 —— 选项本身在 config 里，
+				改选项不用动这里。
+
+				⚠ 它的「自动出售」那几行只有养蝇人升到 Lv2 才可用。
+				   没到 Lv2 时按钮 disabled + 压暗，而不是藏起来 ——
+				   藏起来的话玩家不知道升上去会多出什么
+			-->
+			<div id="keeper-pop" class="donate-pop mid hidden">
+				<div class="donate-card keeper-card">
+					<button id="keeper-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">养蝇人</p>
+					<div class="keeper-rows" id="keeper-rows"></div>
+					<p class="donate-note" id="keeper-note">已自动投放 0 次 · 已自动卖出 0 只</p>
+				</div>
+			</div>
+
+			<!--
+				重置的二次确认。⚠ 这张卡是**必须**的：重置会连存档一起清掉，
+				而工具栏上那颗按钮和「重开一局」只差一次误触。
+			-->
+			<div id="reset-pop" class="donate-pop hidden">
+				<div class="donate-card">
+					<p class="donate-slogan">确定要重置吗？</p>
+					<p class="confirm-body">
+						会把果蝇、食物、<b>游戏币和已买的道具</b>全部清空，<br />
+						并且<strong>覆盖掉存档</strong>。这一步没法撤销。
+					</p>
+					<div class="confirm-btns">
+						<button id="reset-cancel" class="confirm-btn">取消</button>
+						<button id="reset-ok" class="confirm-btn danger">确定重置</button>
+					</div>
+				</div>
+			</div>
+
+			<!--
+				罐子「全部出售」的二次确认。
+
+				⚠ 这个小罐子为什么要有确认，而「全部放逐」没有：
+				   出售是**不可撤销**的 —— 果蝇一旦卖掉就没了，钱虽然到账，
+				   但那只养了二十分钟的虫回不来。而罐子恰恰是玩家**特意存下来**的地方，
+				   一次误触就全空，风险和「重置」是同一类（而重置已经有确认了）。
+				   放逐不一样：虫子只是回到屏幕上，照样活着，随时能再网回去。
+
+				数量那行由 ui.js 现填（卖几只、能拿多少钱），
+				所以这里和重置卡不同 —— 是个「你确定吗」的岔路口。
+			-->
+			<div id="sellall-pop" class="donate-pop hidden">
+				<div class="donate-card">
+					<p class="donate-slogan">把罐子里的全卖掉？</p>
+					<p class="confirm-body" id="sellall-body">
+						罐子里现在有 0 只，一共能换 <b>$0.000</b>。<br />
+						卖掉之后它们就回不来了。
+					</p>
+					<div class="confirm-btns">
+						<button id="sellall-cancel" class="confirm-btn">取消</button>
+						<button id="sellall-ok" class="confirm-btn danger">确定出售</button>
+					</div>
+				</div>
+			</div>
+
+			<!--
+				投放弹窗。**从工具栏小窗里搬出来的** —— 那一行两块折叠区展开之后，
+				垃圾桶和提示条会被顶到看不见的地方；而且面板一共才 318px 宽，
+				三行六键挤在一行里已经在硬撑了。
+
+				⚠ 位置：必须挂 #hud 下、和 .donate-pop 并列，**不能放进 .window** ——
+				   那扇窗有 overflow: hidden（用来裁圆角），放进去会被整个剪掉。
+
+				内容由 ui.refreshFeed() 按 CONFIG.market.feedCats 分组渲染：
+				   食物类 → 苹果 / 金苹果
+				   其他   → 果蝇 / 玻璃罐
+				⚠ 玻璃罐（jar）不花钱，但仍然列在这里 —— 它原来是工具栏上的一颗按钮，
+				   现在撤掉了，避免同一个功能有两个入口
+			-->
+			<div id="feed-pop" class="donate-pop wide hidden">
+				<div class="donate-card shop-card">
+					<button id="feed-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">投放 <b id="feed-money">$0.000</b></p>
+					<div class="shop-cats" id="feed-list"></div>
+					<p class="donate-note">食物只落在屏幕左上角那块区域里</p>
+				</div>
+			</div>
+
+			<!--
+				商店弹窗。同上，从工具栏小窗里搬出来的。
+				内容由 ui.refreshShop() 按 CONFIG.market.shopCats 分组渲染：
+				   工具类 → 捕虫网 / 放大镜 / 喷水枪 / 打火机链
+				   帮手类 → 警报器 / 养蝇人链
+			-->
+			<div id="shop-pop" class="donate-pop wide hidden">
+				<div class="donate-card shop-card">
+					<button id="shop-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">商店 <b id="shop-money">$0.000</b></p>
+					<div class="shop-cats" id="shop-list"></div>
+					<p class="donate-note">卖掉成虫换来的游戏币在这里花</p>
+				</div>
+			</div>
+
+			<!--
+				图鉴。格子式列出这个世界里**全部**的食物和基因。
+
+				⚠ 不做「解锁 / 未发现」那一套 —— 用户要的是「显示出所有食物和突变」，
+				   一上来就该看得见全部。想改成渐进解锁的话，加一个「见过没有」的
+				   集合、再把没见过的画成问号即可，但那是另一个功能。
+
+				内容由 ui.refreshCodex() 渲染：食物格子是**真的画出来的**
+				（每格一个小 canvas，复用 render.js 的 drawFoodIcon），
+				突变格子复用现成的 .gene-badge 胶囊。
+			-->
+			<div id="codex-pop" class="donate-pop wide hidden">
+				<div class="donate-card shop-card">
+					<button id="codex-close" class="donate-close" title="关掉（Esc）">✕</button>
+					<p class="donate-slogan">图鉴</p>
+					<div class="codex-body" id="codex-body"></div>
+				</div>
+			</div>
+
+			<!--
+				罐中果蝇：**一扇独立的小窗**，不在工具栏面板里面。
+
+				原本它是面板里的一块折叠区，但 4 个罐子最多能塞 32 只果蝇，
+				列表一展开就把垃圾桶、提示条顶到看不见的地方 —— 面板一共才 318px 宽，
+				八列挤在一行里也已经在硬撑了。
+
+				现在改成：**默认收起，只留一个标题条**，点一下才展开。
+				场上一只罐子都没有时整扇窗都不出现（连带那个标题条也没有）。
+
+				⚠ 默认停在**右上角**。左下是面板、正中是捐款卡片，右上角是唯一不会
+				和它们打架的地方。位置由 ui._placeJarWindow() 摆，拖标题条可以挪。
+
+				⚠ 和捐款卡片一样挂在 #hud 里（不能放进 .window，那扇窗 overflow: hidden
+				会把列表整个剪掉）。z-index 25 夹在面板之上、捐款卡片之下。
+			-->
+			<div id="jar-window" class="jar-window collapsed hidden">
+				<div class="jar-head" id="jar-head" title="拖动可以挪位置；点一下展开 / 收起罐中果蝇列表">
+					<span class="jar-title">罐中果蝇</span>
+					<b id="s-jarred">0</b>
+					<span class="jar-caret" id="jar-caret">▾</span>
+				</div>
+				<!--
+					一键出售 / 一键放逐。罐子装满时一行一行点太磨人，
+					尤其是「养大了一批准备一起卖」这种最常见的用法。
+
+					⚠ 这两颗按钮**必须在 #jar-head 外面**。那一行的 click 是折叠开关，
+					   放进去的话每点一次都会顺手把列表收起来（见 ui.js 的 jarHead 监听）。
+					⚠ CSS 里还有一条 `.jar-window.collapsed .jar-actions { display: none }` ——
+					   少了它，收起状态下这两颗按钮会浮在标题条下面
+				-->
+				<div class="jar-actions">
+					<button id="jar-sell-all" class="jar-action sell" title="把罐子里所有果蝇一次卖掉，立刻换游戏币。会先问一次">全部出售</button>
+					<button id="jar-release-all" class="jar-action" title="把罐子里所有果蝇放回屏幕，恢复自由（寿命加成同时取消）。这一步可以反悔，不再确认">全部放逐</button>
+				</div>
+				<div class="jar-list" id="jar-list"></div>
+			</div>
+		</div>
+
+		<!--
+			启动选择：只有上次留下了存档才会出现。
+			它会临时把鼠标整个接管过来（窗口平时是穿透的），
+			否则这两个按钮点不到，点击会直接穿到桌面上。
+		-->
+		<div id="boot" class="boot hidden">
+			<div class="boot-card">
+				<div class="boot-title">果蝇世界</div>
+				<p class="boot-sub" id="boot-sub">上次的生态还在桌上</p>
+				<div class="boot-stats" id="boot-stats"></div>
+				<div class="boot-note" id="boot-note"></div>
+				<div class="boot-actions">
+					<button id="boot-continue" class="primary">继续上次</button>
+					<button id="boot-new">重新开始</button>
+				</div>
+			</div>
+		</div>
+
+		<!-- 集群提示：幼虫开始成群结队时冒出来 -->
+		<div id="swarm-badge" class="badge hidden">幼虫集群中</div>
+
+		<!-- 暂停提示 -->
+		<div id="pause-badge" class="badge pause hidden">已暂停</div>
+
+		<!--
+			数据面板：**拿着「查看」工具点一下成虫**弹出（V），钉在虫旁边直到玩家关掉
+			（Esc / 点空白处 / 换工具 / 目标死掉）。
+			更早是悬停 1 秒自动弹，上一版是观察模式点一下 —— 现在归专用工具。
+
+			⚠ **只有成虫能查看，幼虫点不开。** 蛆满天都是（上限 45，烦人模式 ×50），
+			   点一下弹一张卡片会把屏幕糊满；而且卡片上能填的东西它基本都没有 ——
+			   不卖钱、没有体格（体重档是羽化那一刻才抽的）、成长和体重对它也没意义。
+			   所以幼虫那条路是从根上删掉的（`_creatureAt` 不再返回幼虫），
+			   不是靠 CSS 藏起来
+
+			卡片内容：上面一行是性别 + **价值档**（值多少钱），底下一行小字是**体格**
+			（长得多沉），再往下是成长 / 体重 / 生命 / 售价 / 基因。
+
+			⚠ 卡片本体必须是 pointer-events: none，而且**不能**参与
+			ui._updateInteractive()。那个方法决定「整扇窗口要不要接管鼠标」。
+			卡片是纯展示，不接收任何鼠标事件。
+			接管鼠标的是**另一条**谓词 _overInspectable（指针底下有没有能点开的虫），
+			两者别合并 —— 合并成一个的话，卡片一显示就会开始吞桌面点击
+
+			配色按价值分档，类名由 ui.js 设成 tier-<id>
+			（common/uncommon/rare/epic/legendary/mythic），
+			后两档还有边框流动 / 反光扫过，规则都在 style.css 里
+		-->
+		<div id="inspect" class="inspect hidden">
+			<div class="inspect-row">
+				<span class="inspect-sex" id="inspect-sex">♀</span>
+				<span class="inspect-rarity" id="inspect-rarity">普通</span>
+			</div>
+			<!--
+				体格那一行小字。上面是**价值档**（值多少钱），这一行是**体重档**
+				（长得多沉：轻盈 / 超重 / 巨兽）—— 两者是两回事，见 config.js。
+
+				⚠ 带一个「体格」的前缀不是啰嗦：卡片上并排两行档位名，
+				   不加标签的话玩家分不清哪个是哪个 —— 而这正是当初把体重档
+				   从面板上撤掉的起因，现在两边各用各的词之后回来了
+				⚠ 幼虫**没有**这一行，也**没有**上面那行价值档：体重档是羽化那一刻
+				   才抽的（见 world.addFly），一条蛆现在还不知道自己将来多沉
+			-->
+			<div class="inspect-build" id="inspect-build">体格 轻盈</div>
+			<div class="inspect-row">
+				<span>成长</span>
+				<span class="inspect-bar"><i id="inspect-bar"></i></span>
+				<b id="inspect-pct">0%</b>
+			</div>
+			<div class="inspect-row">
+				<span>体重</span>
+				<b id="inspect-weight">0.200 mg</b>
+			</div>
+			<div class="inspect-row">
+				<span>生命</span>
+				<b id="inspect-hp">20 / 20</b>
+			</div>
+			<div class="inspect-row inspect-price">
+				<span>售价</span>
+				<b id="inspect-value">$0.002</b>
+			</div>
+			<div class="inspect-genes" id="inspect-genes"></div>
+		</div>
+
+		<script type="module" src="./src/app.js"></script>
+	</body>
+</html>

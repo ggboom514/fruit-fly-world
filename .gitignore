@@ -1,0 +1,21 @@
+# 依赖与构建产物都不进版本库
+node_modules/
+dist/
+
+# 打包图标是可选的，但一般希望它进版本库 —— 如果你把 build/ 整个忽略了，
+# 记得至少保留 build/icon.*，否则别人 clone 下来打出来的包会没有图标
+# build/
+
+*.log
+.DS_Store
+Thumbs.db
+
+# 存档正常写在 %APPDATA%\FruitFlyWorld 下，不在仓库里。
+# 但万一有人把 userData 指到项目目录（调试时常干），别让它进来
+save.json
+save.selftest.json
+save.bak
+save.selftest.bak
+
+.vscode/
+.idea/

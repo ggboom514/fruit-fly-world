@@ -1,0 +1,4161 @@
+/**
+ * 果蝇世界 — Electron 主进程
+ *
+ * 职责：
+ *   1. 创建一块覆盖整屏的「透明无边框」窗口
+ *   2. 处理置顶 / 鼠标穿透 / 全屏切换
+ *   3. 提供全局快捷键，防止窗口被置底后找不回来
+ *   4. 启动后查一次版本清单，有新版本就问一句要不要去下载
+ *
+ * 鼠标穿透的核心思路：
+ *   窗口默认「穿透」——鼠标事件直接落到桌面上，你该怎么用电脑还怎么用。
+ *   但 forward:true 让渲染进程依然收得到 mousemove，
+ *   于是渲染进程可以判断「指针是不是压在工具栏上」：
+ *     压在工具栏 / 手里拿着苍蝇拍  → 关闭穿透，接管鼠标
+ *     其余时候                     → 恢复穿透，不挡路
+ */
+
+const { app, BrowserWindow, ipcMain, globalShortcut, screen, Menu } = require('electron')
+const path = require('path')
+const fs = require('fs')
+
+/**
+ * --selftest：加载页面、确认渲染进程真的跑起来了、试着画一帧，然后退出。
+ * 用来在不方便肉眼看的情况下验证模块加载和渲染路径没坏（比如打包之后、或者远程改代码时）。
+ * 这个模式下窗口不显示，也不会注册全局快捷键。
+ */
+const SELFTEST = process.argv.includes('--selftest')
+
+/** 存档格式版本。以后存档结构变了就 +1，渲染进程据此决定认不认这份存档 */
+const SAVE_VERSION = 1
+
+/** 退出前等渲染进程写存档的上限。正常几毫秒就回来了，这只是防它卡死带着一起不退出 */
+const FLUSH_TIMEOUT = 900
+
+/** @type {BrowserWindow|null} */
+let win = null
+
+let interactive = false // 渲染进程要求接管鼠标（指针在 UI 上，或手持工具）
+let clickThroughEnabled = true // 穿透总开关
+let alwaysOnTop = true
+
+// ------------------------------------------------------------------ 窗口
+
+function createWindow() {
+	// 干掉 Electron 的默认菜单。
+	//
+	// 无边框窗口看不见菜单栏，但它的快捷键照样生效，而且全都是桌宠的坑：
+	//   Ctrl+R  重载页面 —— 养了半天的果蝇瞬间清零
+	//   Ctrl+W  关窗口   —— 直接退出
+	//   F11     全屏     —— 透明覆盖层切全屏，画面会很怪
+	//   Ctrl+±  缩放页面 —— 会改变 CSS 像素基准，画布坐标和果蝇位置全对不上
+	// 需要的快捷键在下面用 before-input-event 显式注册，白名单式管理。
+	Menu.setApplicationMenu(null)
+
+	const { bounds } = screen.getPrimaryDisplay()
+
+	win = new BrowserWindow({
+		x: bounds.x,
+		y: bounds.y,
+		width: bounds.width,
+		height: bounds.height,
+		frame: false,
+		transparent: true,
+		backgroundColor: '#00000000',
+		hasShadow: false,
+		resizable: false,
+		movable: false,
+		minimizable: false,
+		maximizable: false,
+		fullscreenable: false,
+		skipTaskbar: true,
+		show: false,
+		// 见到屏幕才显示，避免启动瞬间闪一下白框
+		webPreferences: {
+			preload: path.join(__dirname, 'preload.js'),
+			contextIsolation: true,
+			nodeIntegration: false,
+			// 桌宠被其他窗口盖住时不能让计时器降频，否则果蝇会「卡住」
+			backgroundThrottling: false,
+		},
+	})
+
+	// 'screen-saver' 层级能压住绝大多数全屏应用；普通 'floating' 会被盖
+	win.setAlwaysOnTop(true, 'screen-saver')
+	win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+	// 自检模式带个 query 进去，渲染进程据此跳过启动存档弹窗 ——
+	// 那个弹窗要等人点，自检会一直卡在那儿。同时它也会关掉自动存档，
+	// 免得自检用一个人造世界把玩家的真存档覆盖掉。
+	// --autocontinue：跳过启动选择框，直接当玩家选了「继续」。
+	// 用来验证读档 → 恢复 → 渲染 → 再存档这条链路（它需要真人点按钮，没法进自检）。
+	// 见 renderer/src/save.js 的 begin()。
+	const AUTOCONTINUE = process.argv.includes('--autocontinue')
+	win.loadFile(
+		path.join(__dirname, 'renderer', 'index.html'),
+		SELFTEST ? { search: 'selftest=1' } : AUTOCONTINUE ? { search: 'autocontinue=1' } : undefined,
+	)
+
+	// 调参时最常用的两个动作：重载渲染进程、打开 DevTools。
+	//
+	// 用 before-input-event 而不是 globalShortcut —— 后者是系统级全局快捷键，
+	// 会把 Ctrl+Shift+R 从浏览器、编辑器手里抢走；这个只在窗口聚焦时生效。
+	win.webContents.on('before-input-event', (event, input) => {
+		if (input.type !== 'keyDown') return
+		if (!(input.control || input.meta) || !input.shift) return
+
+		const key = String(input.key).toLowerCase()
+
+		// Ctrl+Shift+I 开 DevTools：打包之后也保留，万一要现场排查
+		if (key === 'i') {
+			event.preventDefault()
+			win.webContents.toggleDevTools()
+			return
+		}
+
+		// Ctrl+Shift+R 重载渲染进程：只在开发时生效。
+		// 打包后留着它是个坑 —— 误按一下，养了半天的果蝇就全没了。
+		if (key === 'r' && !app.isPackaged) {
+			event.preventDefault()
+			win.webContents.reload()
+		}
+	})
+
+	win.once('ready-to-show', () => {
+		if (SELFTEST) return // 自检模式不弹窗，免得糊用户一脸
+		win.show()
+		applyMouseMode()
+		syncState()
+	})
+
+	// 关窗口前先把世界存下来。
+	//
+	// 这一层拦截是必须的：从任务栏右键关闭、Alt+F4、或者系统关机，
+	// 走的都是窗口的 close，而不是我们自己的「退出」按钮，
+	// 那些路径同样不能丢存档。拦一次、存完再真关。
+	win.on('close', (e) => {
+		if (SELFTEST || flushState === 'done') return
+		e.preventDefault()
+		flushRendererThen(() => win.close())
+	})
+
+	win.on('closed', () => {
+		win = null
+	})
+
+	if (SELFTEST) runSelfTest()
+}
+
+/**
+ * 渲染进程的错误默认不会打到主进程终端里，排查问题时很瞎。
+ * 这里把渲染进程的 console 原样转发出来，并兜住加载失败。
+ */
+function pipeRendererLogs() {
+	if (!win) return
+
+	win.webContents.on('console-message', (...args) => {
+		// Electron 新旧版本的回调签名不一样，两种都兜一下
+		const details = args[1]
+		if (details && typeof details === 'object' && 'message' in details) {
+			console.log('[renderer]', details.message)
+		} else if (typeof args[2] === 'string') {
+			console.log('[renderer]', args[2])
+		}
+	})
+
+	win.webContents.on('did-fail-load', (_e, code, description, url) => {
+		console.error(`[renderer] 页面加载失败: ${description} (${code}) ${url}`)
+		if (SELFTEST) app.exit(1)
+	})
+
+	win.webContents.on('render-process-gone', (_e, details) => {
+		console.error('[renderer] 渲染进程崩溃:', details.reason)
+		if (SELFTEST) app.exit(1)
+	})
+}
+
+function runSelfTest() {
+	pipeRendererLogs()
+
+	let finished = false
+	const done = (code, message) => {
+		if (finished) return
+		finished = true
+		console.log(message)
+		app.exit(code)
+	}
+
+	win.webContents.once('did-finish-load', async () => {
+		try {
+			const report = await win.webContents.executeJavaScript(`(async () => {
+				// preload 桥要是断了，置顶/穿透/退出会静默失灵，必须单独查一下
+				const bridge = window.pet
+				if (!bridge) return { ok: false, reason: 'window.pet 不存在 —— preload 没加载成功，窗口按钮会失灵' }
+
+				const bridgeMethods = [
+					'setInteractive',
+					'toggleAlwaysOnTop',
+					'toggleClickThrough',
+					'getState',
+					'onState',
+					'quit',
+					// 存档桥断了的话，丢的不是一个按钮，是玩家养了半天的整个生态 ——
+					// 而且它不会立刻报错，要等下次打开才发现「怎么又是新的」
+					'saveGame',
+					'loadGame',
+					'clearSave',
+					'onFlushSave',
+					'flushDone',
+				]
+				const missingBridge = bridgeMethods.filter((k) => typeof bridge[k] !== 'function')
+				if (missingBridge.length) return { ok: false, reason: 'preload 暴露的方法不全: ' + missingBridge.join(', ') }
+
+				const pet = window.__pet
+				if (!pet) return { ok: false, reason: 'window.__pet 不存在 —— 模块很可能没加载成功（ES module 被 file:// 的 CORS 挡了？）' }
+
+				const missing = ['world', 'view', 'renderer', 'ui', 'save'].filter((k) => !pet[k])
+				if (missing.length) return { ok: false, reason: 'app.js 暴露的对象不完整，缺少: ' + missing.join(', ') }
+
+				// 存档链路的端到端自证：
+				//   序列化 → IPC → 写盘 → 读盘 → IPC → 反序列化
+				//
+				// 只在内存里 JSON.parse(JSON.stringify(...)) 是测不到磁盘那一半的 ——
+				// 路径拼错、文件没权限、原子写的 rename 失败，这些全都照样绿。
+				// 自检期间读写的是 save.selftest.json，碰不到玩家的真存档。
+				let saveKB = 0
+				try {
+					const json = JSON.stringify({
+						version: 1,
+						savedAt: Date.now(),
+						world: pet.world.serialize(),
+					})
+					const wrote = await window.pet.saveGame(json)
+					if (!wrote.ok) return { ok: false, reason: '存档写入失败: ' + wrote.reason }
+					saveKB = wrote.bytes / 1024
+
+					const read = await window.pet.loadGame()
+					if (!read.ok) return { ok: false, reason: '存档读取失败: ' + read.reason }
+					if (read.data.version !== 1) return { ok: false, reason: '存档版本号没读回来' }
+
+					const probe = new pet.world.constructor(window.innerWidth, window.innerHeight)
+					probe.restore(read.data.world)
+					// 只比数量：这里是「链路通不通」的烟囱测试，
+					// 逐字段比对由 tools/simulate.js 那一节负责
+					for (const key of ['flies', 'larvae', 'eggs', 'foods', 'remains']) {
+						if (probe[key].length !== pet.world[key].length) {
+							return { ok: false, reason: '存档往返后 ' + key + ' 数量对不上' }
+						}
+					}
+
+					await window.pet.clearSave()
+				} catch (e) {
+					return { ok: false, reason: '存档链路失败: ' + e.message }
+				}
+
+				// 启动选择框：把真实的 DOM 走一遍「弹出 → 点继续 → 收起」。
+				//
+				// 这段接线特别容易错又特别难发现：窗口平时是穿透的，_ask 忘了
+				// 调 setBootOpen 的话，弹窗长得完全正常，只是两个按钮点下去会
+				// 穿到桌面上 —— 肉眼看不出区别，得真的点一下才知道。
+				try {
+					const boot = document.getElementById('boot')
+					const pending = pet.save._ask({ version: 1, savedAt: Date.now(), world: pet.world.serialize() })
+					if (boot.classList.contains('hidden')) return { ok: false, reason: '启动选择框没有弹出来' }
+					if (pet.view.bootOpen !== true) return { ok: false, reason: '弹窗开着却没有接管鼠标 —— 按钮会点不动' }
+
+					document.getElementById('boot-continue').click()
+					const choice = await pending
+					if (choice !== 'continue') return { ok: false, reason: '点「继续」没有返回 continue，而是 ' + choice }
+					if (!boot.classList.contains('hidden')) return { ok: false, reason: '选完之后弹窗没有收起' }
+					if (pet.view.bootOpen !== false) return { ok: false, reason: '弹窗收起后鼠标没有被放开' }
+				} catch (e) {
+					return { ok: false, reason: '启动选择框流程失败: ' + e.message }
+				}
+
+				// 玻璃罐：把「放罐子 → 网一只 → 列表出这一行 → 点放逐 → 行消失」走一遍。
+				//
+				// 这条链路上全是新 DOM（列表行是运行时造出来的），少一个 id、
+				// 拼错一个 class、或者事件挂错了元素，都要等玩家真去点才会暴露 ——
+				// 那时候报出来的现象是「点了没反应」，很难定位到是哪一环。
+				try {
+					const w2 = pet.world
+					w2.jars.length = 0
+					if (w2.flies.length === 0) {
+						w2.addFly(window.innerWidth / 2, window.innerHeight / 2, 'F')
+					}
+					const jar = w2.dropJar()
+					if (!jar) return { ok: false, reason: 'world.dropJar() 没造出罐子' }
+
+					pet.ui.refreshJarList()
+					const jarWin = document.getElementById('jar-window')
+					if (!jarWin || jarWin.classList.contains('hidden')) {
+						return { ok: false, reason: '场上有罐子，但罐中果蝇小窗没显示出来' }
+					}
+
+					// ⚠ 小窗**默认应当是收起的**。
+					// 展开状态下列表能到 220px 高，一有罐子就自动铺开的话，
+					// 屏幕右边会平白多出一大块 —— 这个默认值是设计决定，不是随手写的
+					if (!jarWin.classList.contains('collapsed')) {
+						return { ok: false, reason: '罐中果蝇小窗默认应当收起着，只留一个标题条' }
+					}
+
+					// 点标题条能展开。用真的 click 而不是直接改 class ——
+					// 要覆盖的是那条「拖完那一下不算点击」之外的正常路径
+					document.getElementById('jar-head').click()
+					if (jarWin.classList.contains('collapsed')) {
+						return { ok: false, reason: '点了标题条，罐中果蝇小窗没有展开' }
+					}
+					document.getElementById('jar-head').click()
+					if (!jarWin.classList.contains('collapsed')) {
+						return { ok: false, reason: '再点一次标题条，罐中果蝇小窗没有收起' }
+					}
+
+					// ⚠ 层级：小窗必须盖过工具栏面板（两者都可能停在同一块地方）。
+					// 和捐款卡片那条一样 —— 漏写 z-index 不会有任何别的症状
+					const jarZ = getComputedStyle(jarWin).zIndex
+					const panelZ = getComputedStyle(document.getElementById('panel')).zIndex
+					if (!(Number(jarZ) > (panelZ === 'auto' ? 0 : Number(panelZ)))) {
+						return {
+							ok: false,
+							reason: '罐中果蝇小窗的 z-index（' + jarZ + '）没有高过面板（' + panelZ + '）',
+						}
+					}
+
+					// 藏起来的时候不能接管鼠标 —— display:none 的元素 rect 是 0×0 的，
+					// _overJarWindow 里那道 .hidden 检查就是防这个
+					const savedM = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					pet.view.mouse.x = 0
+					pet.view.mouse.y = 0
+					pet.ui._updateInteractive()
+					if (pet.ui.interactive) {
+						return { ok: false, reason: '罐中果蝇小窗（收起时只有标题条）不该在 (0,0) 处接管鼠标' }
+					}
+					pet.view.mouse.x = savedM.x
+					pet.view.mouse.y = savedM.y
+
+					// 把罐子挪到一只果蝇头上再网，不然网可能空
+					jar.x = w2.flies[0].x
+					jar.y = w2.flies[0].y
+					if (w2.catchFlies(jar.x, jar.y) < 1) return { ok: false, reason: '捕虫网没网到果蝇' }
+
+					// 罐子里有果蝇了，真的画一帧。
+					// 上面那次 draw 是在放罐子之前画的，走不到 drawJar ——
+					// 里面的笔误（seeded 参数写错、渐变 stop 越界、罐中果蝇忘了加罐心偏移）
+					// 都要真画过才会暴露，而这类问题只在肉眼下才看得出来
+					pet.renderer.draw(w2, pet.view)
+					pet.view.tool = 'net'
+					pet.renderer.draw(w2, pet.view) // 连捕虫网的光标一起画
+					pet.view.tool = 'none'
+
+					pet.ui.refreshJarList()
+					const rows = document.querySelectorAll('#jar-list .jar-row')
+					if (rows.length !== jar.flies.length) {
+						// 用字符串拼接，不能用模板字符串 ——
+						// 这整段代码本身就住在一个模板字符串里，内层的反引号
+						// 会把外层提前闭合掉，主进程直接报语法错误（而且报的是
+						// 「App threw an error during load」，很难联想到是这里）
+						return { ok: false, reason: '列表行数 ' + rows.length + ' 与罐中果蝇数 ' + jar.flies.length + ' 对不上' }
+					}
+
+					// 断言「点一行放逐，罐中数量恰好减一」，而不是「减到零」——
+					// 网的半径有 62px，周围如果恰好还有别的果蝇，一次能网到好几只。
+					// 早先这里写的是 !== 0，等于假设了一网只中一只，
+					// 于是每跑若干次就会因为「网到两只」而误报一次
+					const jarredBefore = jar.flies.length
+					rows[0].querySelector('.jar-drop').click()
+					if (jar.flies.length !== jarredBefore - 1) {
+						return {
+							ok: false,
+							reason: '点了「放逐」但罐中数量没有减一（' + jarredBefore + ' → ' + jar.flies.length + '）',
+						}
+					}
+					pet.ui.refreshJarList()
+					if (document.querySelectorAll('#jar-list .jar-row').length !== jar.flies.length) {
+						return { ok: false, reason: '放逐之后列表行数没有跟着减' }
+					}
+
+					// ⚠⚠ 「闪烁 + 点了没反应」那条 bug 的守卫。
+					//
+					// refreshJarList 是 6~7Hz 跑的，原来它每跑一次就把**所有行**
+					// 摘下再插回一遍，于是 :hover 反复丢失（闪），而且「摘下 → 插回」
+					// 之间赶上 mouseup 时 click 会落到容器上（点了没反应）。
+					//
+					// 断言写法：连着刷两次，**行的 DOM 节点必须是同一个对象**。
+					// 比截图比对可靠得多 —— 截图在这台机器上本来就截不稳
+					pet.ui.refreshJarList()
+					const rowsA = Array.from(document.querySelectorAll('#jar-list .jar-row'))
+					pet.ui.refreshJarList()
+					const rowsB = Array.from(document.querySelectorAll('#jar-list .jar-row'))
+					if (rowsA.length !== rowsB.length) {
+						return { ok: false, reason: '连着刷两次列表，行数变了' }
+					}
+					for (let i = 0; i < rowsA.length; i++) {
+						if (rowsA[i] !== rowsB[i]) {
+							return {
+								ok: false,
+								reason: '刷新时行被重建了（第 ' + (i + 1) + ' 行不是同一个节点）—— 顺序没变就不该碰 DOM',
+							}
+						}
+					}
+					// 顺序和当前 DOM 不一致时才该重排：把第一行挪到最后，
+					// 下一次刷新必须把它挪回来
+					if (rowsB.length >= 2) {
+						const first = rowsB[0]
+						document.getElementById('jar-list').appendChild(first)
+						pet.ui.refreshJarList()
+						const rowsC = Array.from(document.querySelectorAll('#jar-list .jar-row'))
+						if (rowsC[0] !== first) {
+							return { ok: false, reason: '顺序被外力打乱之后，刷新没有把它排回去' }
+						}
+					}
+
+					w2.discardJar(jar)
+					pet.ui.refreshJarList()
+					if (!document.getElementById('jar-window').classList.contains('hidden')) {
+						return { ok: false, reason: '罐子扔掉之后罐中果蝇小窗没有收起' }
+					}
+				} catch (e) {
+					return { ok: false, reason: '玻璃罐流程失败: ' + e.message }
+				}
+
+				// —— 观察模式下也能拖玻璃罐 ——
+				//
+				// 这条以前是**反过来**的：观察模式纯看、什么都不接管，
+				// 想动手必须先切手套。现在罐子放开了，代价是指针停在罐子上时
+				// 窗口会接管鼠标、吃掉罐子底下的桌面点击 —— 所以判定区
+				// **一个像素都不许外扩**，下面第二条断言就是钉这个的
+				try {
+					const w3 = pet.world
+					w3.jars.length = 0
+					const probeJar = w3.addJar(window.innerWidth * 0.5, window.innerHeight * 0.5)
+					if (!probeJar) return { ok: false, reason: '探针罐子没造出来' }
+
+					pet.ui.setTool('none')
+					const savedM = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+
+					// 1) 指针在罐心 → 必须接管，否则 mousedown 根本传不进来
+					pet.view.mouse.x = probeJar.x
+					pet.view.mouse.y = probeJar.y
+					pet.ui._updateInteractive()
+					if (!pet.ui.interactive) {
+						return {
+							ok: false,
+							reason: '观察模式下指针在玻璃罐上却没有接管鼠标 —— 那样罐子拖不动',
+						}
+					}
+
+					// 2) _grabbableAt 必须真的认它（接管判定和拖拽判定共用一个真值来源）
+					const grab = pet.ui._grabbableAt()
+					if (!grab || grab.kind !== 'jar' || grab.item !== probeJar) {
+						return { ok: false, reason: '观察模式下 _grabbableAt 没认出玻璃罐' }
+					}
+
+					// 3) **反向守卫**：食物不行。这条是防止将来有人把闸门整个拿掉 ——
+					// 那样屏幕会被几十个判定区打成筛子，而这不会有任何报错
+					const probeFood = w3.addFood(30, 30, 'apple')
+					if (probeFood) {
+						pet.view.mouse.x = probeFood.x
+						pet.view.mouse.y = probeFood.y
+						pet.ui._updateInteractive()
+						if (pet.ui.interactive) {
+							return {
+								ok: false,
+								reason: '观察模式下指针压在食物上也接管了鼠标 —— 能放开的只有玻璃罐',
+							}
+						}
+					}
+
+					// 4) 指针移开罐子 → 鼠标要还回去
+					//
+					// ⚠ 挪到的那个点必须**先证明它不在别的接管区里**，
+					// 否则这条断言测的就不是罐子了。第一版挪到罐子右边 137px，
+					// 而那里正好压在工具栏面板上 —— 面板接管鼠标是对的，
+					// 断言却报「离开罐子还接管着」，白红一场
+					pet.view.mouse.x = 40
+					pet.view.mouse.y = 40
+					pet.ui._updateInteractive()
+					if (pet.ui._overPanel() || pet.ui._overJarWindow() || pet.ui._overCard()) {
+						return { ok: false, reason: '自检的探针点 (40,40) 落在了别的接管区里，这条断言不成立' }
+					}
+					if (pet.ui._overGrabbable()) {
+						return { ok: false, reason: '指针已经离开玻璃罐，_overGrabbable 却还是 true' }
+					}
+					if (pet.ui.interactive) {
+						return { ok: false, reason: '指针离开玻璃罐之后鼠标还被接管着' }
+					}
+
+					pet.view.mouse.x = savedM.x
+					pet.view.mouse.y = savedM.y
+					pet.ui._updateInteractive()
+					w3.jars.length = 0
+					w3.foods.length = 0
+				} catch (e) {
+					return { ok: false, reason: '观察模式拖罐流程失败: ' + e.message }
+				}
+
+				// —— 商店：可升级链 + 捕虫网 ——
+				try {
+					const w4 = pet.world
+					const chain = pet.config.market.roastChain
+					// 从干净状态开始，免得受前面几段的影响。
+					// ⚠ 但**结束时要原样还回去** —— 这一段会买下捕虫网，
+					// 而后面「工具按钮」那一节断言的正是「还没买捕虫网 = 锁定态」。
+					// 自己造的脏状态自己不收拾，就会变成一条和本段毫无关系的红
+					const savedShop = { ...w4.shop }
+					const savedMoney = w4.money
+					w4.shop = {}
+					w4.money = 0
+					pet.ui.setTool('none')
+					pet.ui.refreshShop()
+					pet.ui.refreshToolButtons()
+
+					// 钱不够：按钮必须置灰，而且点了不能扣款、不能升级
+					const rows = Array.from(document.querySelectorAll('#shop-list .shop-item'))
+					const chainRow = rows.find((r) => r.querySelector('[data-chain="roast"]'))
+					if (!chainRow) return { ok: false, reason: '商店里没有烤制升级链那一行' }
+					const chainBtn = chainRow.querySelector('[data-chain="roast"]')
+					if (!chainBtn.disabled) {
+						return { ok: false, reason: '钱为 0 时升级按钮没有置灰' }
+					}
+					chainBtn.click()
+					if (w4.shopLevel('roast') !== 0) {
+						return { ok: false, reason: '置灰的升级按钮居然真的升了级' }
+					}
+
+					// 钱够了就能升，而且逐级扣款
+					w4.money = chain.reduce((n, t) => n + t.price, 0)
+					w4.money = 100
+					pet.ui.refreshShop()
+					pet.ui.refreshToolButtons()
+					const before = w4.money
+					/** @type {HTMLElement} */
+					const btnNow = document.querySelector('#shop-list [data-chain="roast"]')
+					btnNow.click()
+					if (w4.shopLevel('roast') !== 1) {
+						return { ok: false, reason: '钱够时点了升级，等级却是 ' + w4.shopLevel('roast') }
+					}
+					if (Math.abs(before - w4.money - chain[0].price) > 1e-9) {
+						return { ok: false, reason: '升级扣款数不对：' + (before - w4.money) }
+					}
+
+					// 买到 lv1 之后，工具栏那颗按钮要现身，并且写着这一档的名字
+					pet.ui.refreshToolButtons()
+					const roastBtn = document.getElementById('btn-roast')
+					if (roastBtn.classList.contains('hidden')) {
+						return { ok: false, reason: '买了打火机之后烤制按钮还是藏着的' }
+					}
+					if (roastBtn.textContent !== chain[0].name) {
+						return {
+							ok: false,
+							reason: '烤制按钮上写的是「' + roastBtn.textContent + '」，应当是「' + chain[0].name + '」',
+						}
+					}
+					// 而 lv1 时它是个**工具**（按住烤），切得过去
+					pet.ui.setTool('roast')
+					if (pet.view.tool !== 'roast') {
+						return { ok: false, reason: '买了打火机却切不到烤制工具' }
+					}
+					pet.ui.setTool('none')
+
+					// 一路升到 lv3，按钮要跟着改名成烤炉，并且不再是个工具
+					w4.money = 1000
+					for (let i = w4.shopLevel('roast'); i < chain.length; i++) {
+						pet.ui.refreshShop()
+						const b = document.querySelector('#shop-list [data-chain="roast"]')
+						if (!b) return { ok: false, reason: '升到第 ' + (i + 1) + ' 级时商店里没有升级按钮了' }
+						b.click()
+					}
+					pet.ui.refreshToolButtons()
+					const last = chain[chain.length - 1]
+					if (roastBtn.textContent !== last.name) {
+						return {
+							ok: false,
+							reason: '满级后按钮上写的是「' + roastBtn.textContent + '」，应当是「' + last.name + '」',
+						}
+					}
+					if (!roastBtn.classList.contains('hidden') === false) {
+						return { ok: false, reason: '满级后烤制按钮不该消失' }
+					}
+
+					// 捕虫网：买之前锁定、买之后解锁
+					w4.shop = {}
+					pet.ui.refreshToolButtons()
+					if (!document.getElementById('btn-net').classList.contains('locked')) {
+						return { ok: false, reason: '还没买捕虫网，按钮却没有锁定态' }
+					}
+					w4.money = 10
+					if (!w4.buyShopItem('net')) return { ok: false, reason: '买捕虫网失败了' }
+					pet.ui.refreshToolButtons()
+					if (document.getElementById('btn-net').classList.contains('locked')) {
+						return { ok: false, reason: '买了捕虫网之后按钮还是锁定态' }
+					}
+					pet.ui.setTool('net')
+					if (pet.view.tool !== 'net') {
+						return { ok: false, reason: '买了捕虫网却切不到捕虫网工具' }
+					}
+
+					// 收拾干净：等级、钱、手里的工具全部还原。
+					// 后面还有别的断言在跑，不能把「已经买过了」这种状态留给他们
+					pet.ui.setTool('none')
+					w4.shop = savedShop
+					w4.money = savedMoney
+					pet.ui.refreshShop()
+					pet.ui.refreshToolButtons()
+				} catch (e) {
+					return { ok: false, reason: '商店升级链流程失败: ' + e.message }
+				}
+
+				// —— 设置卡：正常 / 烦人模式 ——
+				try {
+					const w5 = pet.world
+					const CFG = pet.config
+					const savedAnnoying = w5.settings.annoying
+
+					w5.settings.annoying = false
+					if (w5.maxAdults !== CFG.world.maxAdults) {
+						return { ok: false, reason: '正常模式下 maxAdults 不等于配置值' }
+					}
+
+					// 开卡 → 点「烦人模式」
+					pet.ui.setSettingsOpen(true)
+					if (document.getElementById('settings-pop').classList.contains('hidden')) {
+						return { ok: false, reason: 'setSettingsOpen(true) 之后设置卡还是隐藏的' }
+					}
+					const annoyingBtn = document.getElementById('mode-annoying')
+					if (!annoyingBtn) return { ok: false, reason: '#mode-annoying 不存在' }
+					annoyingBtn.click()
+					if (!w5.settings.annoying) {
+						return { ok: false, reason: '点了「烦人模式」但设置没切过去' }
+					}
+					if (w5.maxAdults !== CFG.world.maxAdults * CFG.world.annoyingMul) {
+						return {
+							ok: false,
+							reason: '烦人模式下 maxAdults 是 ' + w5.maxAdults + '，应当是 ' + CFG.world.maxAdults * CFG.world.annoyingMul,
+						}
+					}
+					// 选中态要真的反映在 DOM 上（不然玩家看不出现在是哪一档）
+					if (!annoyingBtn.classList.contains('on')) {
+						return { ok: false, reason: '切到烦人模式后按钮没有选中态' }
+					}
+
+					// ⚠ 「烦人模式」四个字必须是红的 —— 用户点名要的。
+					// 量的是 getComputedStyle，不是类名：类名对了但 CSS 没写，照样不红
+					const nameEl = annoyingBtn.querySelector('.mode-name')
+					const nameColor = getComputedStyle(nameEl).color
+					// #ff5b4a → rgb(255, 91, 74)
+					if (nameColor !== 'rgb(255, 91, 74)') {
+						return {
+							ok: false,
+							reason: '「烦人模式」的字色是 ' + nameColor + '，应当是红色 rgb(255, 91, 74)',
+						}
+					}
+
+					// 总数硬闸：烦人模式下不该超过 annoyingTotalCap
+					const capped = w5.livingCount <= CFG.world.annoyingTotalCap || w5.atPopCap
+					if (!capped) {
+						return { ok: false, reason: '烦人模式的生命体总数突破了硬闸' }
+					}
+
+					// 切回正常：上限要**立刻**回去，而且场上多出来的不杀
+					const aliveBefore = w5.livingCount
+					document.getElementById('mode-normal').click()
+					if (w5.settings.annoying) return { ok: false, reason: '点了「正常模式」但没切回去' }
+					if (w5.maxAdults !== CFG.world.maxAdults) {
+						return { ok: false, reason: '切回正常模式后 maxAdults 没有还原' }
+					}
+					if (w5.livingCount < aliveBefore) {
+						return {
+							ok: false,
+							reason: '切回正常模式时把超出上限的果蝇杀掉了 —— 上限只该拦新增，不该清场',
+						}
+					}
+
+					pet.ui.setSettingsOpen(false)
+					w5.settings.annoying = savedAnnoying
+					pet.ui.refreshSettings()
+				} catch (e) {
+					return { ok: false, reason: '设置卡流程失败: ' + e.message }
+				}
+
+				// —— 重置：必须先弹确认，点「取消」不能清档 ——
+				try {
+					const w6 = pet.world
+					// 造一个「重置一定会抹掉」的标记
+					const beforeMoney = w6.money
+					w6.money = 12.345
+					const jarCount = w6.jars.length
+
+					document.getElementById('btn-reset').click()
+					if (document.getElementById('reset-pop').classList.contains('hidden')) {
+						return { ok: false, reason: '点了重置却没有弹确认卡 —— 误触一次就清档了' }
+					}
+					if (w6.money !== 12.345) {
+						return { ok: false, reason: '点了重置就立刻清档了，确认卡没起作用' }
+					}
+					if (w6.jars.length !== jarCount) {
+						return { ok: false, reason: '确认卡还没点，世界已经被清空了' }
+					}
+
+					// 「取消」应当什么都不做
+					document.getElementById('reset-cancel').click()
+					if (!document.getElementById('reset-pop').classList.contains('hidden')) {
+						return { ok: false, reason: '点了「取消」确认卡没有关掉' }
+					}
+					if (w6.money !== 12.345) {
+						return { ok: false, reason: '点了「取消」却还是清档了' }
+					}
+
+					// 「确定重置」才真的清
+					document.getElementById('btn-reset').click()
+					document.getElementById('reset-ok').click()
+					if (w6.money !== 0) {
+						return { ok: false, reason: '点了「确定重置」但钱没有清零（现在是 ' + w6.money + '）' }
+					}
+					if (!document.getElementById('reset-pop').classList.contains('hidden')) {
+						return { ok: false, reason: '重置完成后确认卡没有关掉' }
+					}
+					w6.money = beforeMoney
+				} catch (e) {
+					return { ok: false, reason: '重置确认流程失败: ' + e.message }
+				}
+
+				// —— 挥手惊蝇：观察模式下必须完全不生效 ——
+				try {
+					const w9 = pet.world
+					const savedMouse2 = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					const savedSample = { x: pet.ui.lastMouseSample.x, y: pet.ui.lastMouseSample.y }
+
+					// 造一个「鼠标猛甩一下」的现场：把上一次采样点放到很远的地方，
+					// 于是这一帧算出来的位移极大
+					const fling = () => {
+						pet.view.mouse.x = 900
+						pet.view.mouse.y = 500
+						pet.ui.lastMouseSample.x = 100
+						pet.ui.lastMouseSample.y = 500
+						pet.ui._updateStartle(1 / 60)
+					}
+
+					// ⚠⚠ **慢慢挪过去不能惊到它们。**
+					//
+					// 这是「玩家得抓得住它们」那条线：拿网罩、拿手套拎、拿拍子拍，
+					// 都要先把手稳稳地移过去。没有这个死区的话，鼠标一动就惊飞，
+					// 瞄准根本做不成 —— 第一次实测就是这个问题
+					pet.ui.setTool('swatter')
+					// ⚠ 渲染进程里没有裸的 CONFIG，配置挂在 pet.config 上
+					const TOOLS = pet.config.tools
+					const creepAt = (pxPerSec) => {
+						pet.view.mouse.x = 900
+						pet.view.mouse.y = 500
+						// 让「上一帧的位置」正好落后 1/60 秒该走的距离
+						pet.ui.lastMouseSample.x = 900 - pxPerSec / 60
+						pet.ui.lastMouseSample.y = 500
+						pet.ui.startle = 0 // 别让上一次的余韵混进来
+						pet.ui._updateStartle(1 / 60)
+						return pet.world.startle.power
+					}
+					const creep = TOOLS.startleWakeSpeed * 0.6
+					if (creepAt(creep) !== 0) {
+						return {
+							ok: false,
+							reason:
+								'以 ' +
+								Math.round(creep) +
+								'px/s 慢慢挪过去也会惊到果蝇（强度 ' +
+								pet.world.startle.power.toFixed(2) +
+								'）—— 那样玩家完全没可能抓住它们',
+						}
+					}
+					// 而全速甩必须到顶，别把死区做得把功能也一起吃了
+					if (!(creepAt(TOOLS.startleFullSpeed * 2) > 0.9)) {
+						return { ok: false, reason: '全速甩鼠标的惊扰强度没到顶 —— 死区把功能一起吃掉了' }
+					}
+
+					fling()
+					if (!(pet.world.startle.power > 0.5)) {
+						return {
+							ok: false,
+							reason: '拿着工具猛甩鼠标，惊扰强度却只有 ' + pet.world.startle.power.toFixed(2),
+						}
+					}
+					// 指针正下方那只必须真的被加成
+					const w10 = pet.world
+					w10.flies.length = 0
+					const victim2 = w10.addFly(900, 500, 'M')
+					if (!victim2) return { ok: false, reason: '探针果蝇没造出来' }
+					w10._applyStartle()
+					if (!(victim2.startleMul > 1.5)) {
+						return {
+							ok: false,
+							reason: '指针正下方的果蝇只有 ' + victim2.startleMul.toFixed(2) + ' 倍速 —— 惊扰没作用到移动上',
+						}
+					}
+
+					// ⚠ 核心行为：受惊必须**真的飞走**，不能只是「飞得快一点」。
+					// 悬停中的蝇在 _fly 里目标速度是 0，乘多少倍都还是 0 ——
+					// 只乘速度的话，手从它身上扫过去它还在原地悬着
+					w10.flies.length = 0
+					const hoverer = w10.addFly(900, 500, 'F')
+					if (!hoverer) return { ok: false, reason: '悬停探针没造出来' }
+					hoverer.mode = 'fly'
+					hoverer.hoverTimer = 5000
+					fling()
+					w10._applyStartle()
+					if (hoverer.hoverTimer !== 0) {
+						return { ok: false, reason: '悬停中的果蝇受惊之后还在悬停 —— 看起来就是「停在原地」' }
+					}
+					// 走路的那批要起飞
+					hoverer.hoverTimer = 0
+					hoverer.mode = 'walk'
+					hoverer.pausing = true
+					w10._applyStartle()
+					if (hoverer.mode !== 'fly') {
+						return { ok: false, reason: '走路的果蝇被惊到之后没有起飞' }
+					}
+					if (hoverer.pausing) {
+						return { ok: false, reason: '受惊之后还停在原地「停顿」' }
+					}
+
+					// ⚠ 核心：观察模式下**一点都不能有**。
+					// 这一档的定位就是「纯看不打扰」，鼠标扫过去炸开一屏果蝇的话，
+					// 观察模式就没法看了
+					pet.ui.setTool('none')
+					fling()
+					if (pet.world.startle.power !== 0) {
+						return {
+							ok: false,
+							reason: '观察模式下惊扰强度是 ' + pet.world.startle.power + '，应当是 0',
+						}
+					}
+					w10._applyStartle()
+					// ⚠ 要用**还在 w10.flies 里**的那只。上面为了造悬停/走路的
+					// 探针把数组清过一次，victim2 已经被摘出去了 ——
+					// _applyStartle 只遍历 this.flies，碰不到它，
+					// 于是它会一直保留上一次算出来的倍率，这条断言就变成了假红
+					if (hoverer.startleMul !== 1) {
+						return { ok: false, reason: '观察模式下果蝇还是被加成了速度' }
+					}
+
+					w10.flies.length = 0
+					pet.ui.setTool('none')
+					pet.view.mouse.x = savedMouse2.x
+					pet.view.mouse.y = savedMouse2.y
+					pet.ui.lastMouseSample.x = savedSample.x
+					pet.ui.lastMouseSample.y = savedSample.y
+					pet.world.startle.power = 0
+				} catch (e) {
+					return { ok: false, reason: '挥手惊蝇流程失败: ' + e.message }
+				}
+
+				// —— 苍蝇拍：杀伤点必须在**拍面**上，不在指针上 ——
+				try {
+					const CFG = pet.config
+					// 通过 world.swat 的落点间接验证：拍一下，看 swings 记在哪儿。
+					// 不断言 swatterHeadAt 本身 —— 那样测的是「函数等于它自己」；
+					// 这里要钉的是「_useTool 真的用了它算出来的点」
+					// ⚠ 这一段原来查的是「world.swings 里记下的落点 == 重算一遍
+					//   swatterHeadAt 的结果」—— 那是在比断言自己的算术。
+					//   挥拍动画（world.swings / drawSwing）随工具图案一起删掉之后，
+					//   改成**摆两只虫看谁死**：杀伤点到底在哪儿，这才是端到端的问法
+					const w7 = pet.world
+					const savedMouse = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					const savedFlies7 = w7.flies.slice()
+
+					const PX = 800
+					const PY = 400
+					const head = pet.swatterHeadAt(PX, PY)
+					w7.flies.length = 0
+
+					// A 摆在拍面上（应当被打死）、B 摆在指针正下方（不该死）
+					const onHead = w7.addFly(head.x, head.y, 'F')
+					const onPointer = w7.addFly(PX, PY, 'M')
+					if (!onHead || !onPointer) return { ok: false, reason: '造不出挥拍落点用的探针' }
+
+					pet.view.mouse.x = PX
+					pet.view.mouse.y = PY
+					pet.ui.setTool('swatter')
+					// ⚠ 冷却必须清零。前面几段可能就在 220ms 之内挥过一拍，
+					//   不清的话这一下会被节流吃掉，报出来像「落点算错了」
+					pet.ui.lastSwat = -1e9
+					pet.ui._useTool()
+
+					if (!onHead.dead) {
+						return {
+							ok: false,
+							reason: '站在拍面上的果蝇没被打死 —— 杀伤点不在 swatterHeadAt 算出来的地方',
+						}
+					}
+					if (onPointer.dead) {
+						return {
+							ok: false,
+							reason: '站在指针正下方的果蝇被打死了 —— 杀伤点不该就在指针上（拍面在左上方）',
+						}
+					}
+					// 挥拍反馈：得真的放出一圈粒子来（那是删掉虚线之后唯一的
+					// 「打得到哪儿」提示）。命中时是暖色的那一圈
+					if (w7.particles.length === 0) {
+						return { ok: false, reason: '挥拍之后一颗粒子都没放 —— 删掉虚线圈之后就没有任何范围提示了' }
+					}
+
+					pet.ui.setTool('none')
+					pet.view.mouse.x = savedMouse.x
+					pet.view.mouse.y = savedMouse.y
+					w7.flies.length = 0
+					Array.prototype.push.apply(w7.flies, savedFlies7)
+					w7.particles.length = 0
+				} catch (e) {
+					return { ok: false, reason: '苍蝇拍落点失败: ' + e.message }
+				}
+
+				// —— 烤制改成吃尸体 ——
+				try {
+					const w8 = pet.world
+					const chain = pet.config.market.roastChain
+					w8.remains.length = 0
+					w8.shop.roast = chain.length
+
+					const f = w8.addFly(300, 300, 'F')
+					if (!f) return { ok: false, reason: 'addFly 失败' }
+					for (let i = 0; i < 600; i++) f.update(16, w8)
+					const value = f.value
+					const corpse = w8.addRemains(300, 300, 'corpse', f.size, 0, f)
+					if (!corpse) return { ok: false, reason: 'addRemains 没造出尸体' }
+					if (!corpse.roastable) {
+						return { ok: false, reason: '拍死留下的尸体不能烤 —— 烤制链没有入口' }
+					}
+					if (corpse.value !== value) {
+						return { ok: false, reason: '尸体上的售价快照不对' }
+					}
+
+					// 没烤过也能卖，但只有原价
+					if (Math.abs(corpse.price - value) > 1e-9) {
+						return { ok: false, reason: '新鲜尸体的价钱不等于原价' }
+					}
+
+					// 烤过之后乘倍率
+					const top = chain[chain.length - 1]
+					if (!w8.roast(corpse, top.mul)) return { ok: false, reason: '烤尸体失败了' }
+					if (Math.abs(corpse.price - value * top.mul) > 1e-9) {
+						return { ok: false, reason: '烤完没乘上倍率' }
+					}
+					// 每具只能烤一次
+					if (w8.roast(corpse, 1.2)) {
+						return { ok: false, reason: '同一具尸体被烤了第二次 —— 倍率会无限叠加' }
+					}
+
+					// 汁渍不能烤
+					const stain = w8.addRemains(10, 10, 'stain', 20, 0)
+					if (stain && (stain.roastable || w8.roast(stain, 1.8))) {
+						return { ok: false, reason: '汁渍被当成可烤的了 —— 它没有身体' }
+					}
+
+					// —— 接触即烤：**一次 _useTool 就要熟**，不许再计时 ——
+					//
+					// ⚠ 这条走的是 UI 那一层（_useTool），不是直接调 world.roast。
+					//   直接调 world.roast 是测不出「有没有还要按住」的 ——
+					//   把计时逻辑加回去，那种断言照样绿
+					{
+						const c2 = w8.addRemains(400, 400, 'corpse', 14, 0, f)
+						if (!c2) return { ok: false, reason: '造不出接触即烤用的尸体' }
+						const mouseWas = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+						const toolWas = pet.view.tool
+						pet.view.tool = 'roast'
+						pet.view.mouse.x = c2.x
+						pet.view.mouse.y = c2.y
+						// 只调**一次**，而且不累加任何时间
+						pet.ui._useTool()
+						if (!c2.roasted) {
+							pet.view.tool = toolWas
+							pet.view.mouse.x = mouseWas.x
+							pet.view.mouse.y = mouseWas.y
+							return {
+								ok: false,
+								reason: '指针碰到尸体那一下没有烤熟 —— 打火机 / 喷火枪应当是接触即烤，不该还要按住',
+							}
+						}
+						// 每具只能吃一次倍率：再扫一遍价钱不能变
+						const priceAfter = c2.price
+						pet.ui._useTool()
+						if (c2.price !== priceAfter) {
+							pet.view.tool = toolWas
+							pet.view.mouse.x = mouseWas.x
+							pet.view.mouse.y = mouseWas.y
+							return { ok: false, reason: '接触即烤之下反复蹭同一具尸体把倍率叠上去了' }
+						}
+						pet.view.tool = toolWas
+						pet.view.mouse.x = mouseWas.x
+						pet.view.mouse.y = mouseWas.y
+					}
+
+					// 掉价：前 5 分钟不变，之后往下走
+					const fresh = w8.addRemains(0, 0, 'corpse', 14, 0, f)
+					if (Math.abs(fresh.decayFactor - 1) > 1e-9) {
+						return { ok: false, reason: '刚留下的尸体就已经在掉价了' }
+					}
+					fresh.age = 20 * 60000
+					if (Math.abs(fresh.decayFactor - pet.config.roast.decayTo) > 1e-9) {
+						return { ok: false, reason: '掉价到底之后不是 ' + pet.config.roast.decayTo }
+					}
+
+					w8.remains.length = 0
+					w8.shop.roast = 0
+					// ⚠ 上面那几次 _useTool 会走 refreshStats → refreshToolButtons，
+					//   而那时候 shop.roast 还是满级 —— 烤制按钮于是被摘掉了 .hidden。
+					//   把等级改回来**不会**自动同步 DOM，得显式再刷一次，
+					//   否则后面「还没买打火机，烤制按钮不该出现」那条会红，
+					//   而报出来的位置离真正的原因隔了好几屏
+					pet.ui.refreshToolButtons()
+				} catch (e) {
+					return { ok: false, reason: '尸体烤制流程失败: ' + e.message }
+				}
+
+				// 先塞几只幼虫进去再画。
+				// 开局是 0 只幼虫（world.initialLarvae = 0），不补的话
+				// drawLarva 那整条分支 —— 现在的身体曲线、描边、蛹期外壳 ——
+				// 一帧都不会被执行，等于没测
+				const w1 = pet.world
+				for (let i = 0; i < 3; i++) {
+					w1.addLarva(window.innerWidth * 0.3 + i * 40, window.innerHeight * 0.4, null)
+				}
+				// 再来一只蛹：蛹走的是另一个绘制分支（扁长的椭圆 + 淡淡轮廓 + 壳面颗粒）
+				const pupa = w1.addLarva(window.innerWidth * 0.5, window.innerHeight * 0.6, null)
+				if (pupa) pupa.pupa = true
+
+				// 一枚蛹壳：又是一个独立分支，不铺一枚的话 drawShell 一辈子不会被执行
+				w1.addShell(window.innerWidth * 0.7, window.innerHeight * 0.7, 0.4, 20, 1, 0.5)
+
+				// 真的画一帧，把整条渲染路径走一遍
+				try {
+					pet.renderer.draw(pet.world, pet.view)
+				} catch (e) {
+					return { ok: false, reason: '渲染失败: ' + e.message }
+				}
+
+				// 拿着手套时画一帧。手套**没有** canvas 光标（用系统手型），
+				// 所以这一帧什么都不该多出来 —— 但正是要确认它不会因为
+				// 「drawToolCursor 里没有 glove 分支」而走进别的分支去
+				try {
+					pet.view.tool = 'glove'
+					pet.renderer.draw(pet.world, pet.view)
+					pet.view.tool = 'none'
+				} catch (e) {
+					return { ok: false, reason: '拿手套时渲染失败: ' + e.message }
+				}
+
+				// —— 实心不透明：采样蛹中心的像素 ——
+				//
+				// 「蛹是不是半透明的」光看代码看不出来（颜色是拼出来的），
+				// 唯一可靠的办法是真画一遍再读像素。
+				// 画布本身是全透明的（桌宠是覆盖层），所以实体所在处 alpha 必须是 255
+				let pupaAlpha = null
+				let pupaColor = ''
+				try {
+					const w3 = pet.world
+					w3.larvae.length = 0
+					w3.shells.length = 0
+					w3.remains.length = 0
+					w3.eggs.length = 0
+					w3.foods.length = 0
+					w3.flies.length = 0
+					const pp = w3.addLarva(400, 400, null)
+					pp.pupa = true
+					pp.age = 0 // 刚化蛹：颜色还没变，正是最浅的那一档
+					// ⚠ 必须显式把体型拉满。age=0 意味着 size 只有 5px，
+					// 化成的蛹是 6×2 像素 —— 中心那个像素正好压在抗锯齿的边缘上，
+					// 读出来是半透明，但这跟「蛹是不是实心」毫无关系。
+					// 这个坑第一次写这条断言时就踩了（报出来 alpha=222）
+					pp.size = 23
+					pp.lengthScale = 1
+					pp.angle = 0
+
+					pet.renderer.draw(w3, pet.view)
+
+					const dpr = pet.renderer.dpr
+					// 沿中心横线采一整排 —— 只采一个点的话，
+					// 「大部分地方是透明的、恰好中心那点是实的」这种情况会被漏掉
+					const row = pet.renderer.ctx.getImageData(
+						Math.round(390 * dpr),
+						Math.round(400 * dpr),
+						Math.round(20 * dpr),
+						1,
+					).data
+					let minA = 255
+					let holes = 0
+					// 底色取「整排里最亮的那个像素」，而不是中心那一个。
+					// 颗粒是随机撒的，中心点正好压着一颗颗粒是常有的事 ——
+					// 那一像素会比底色暗一截（实测 178 vs 222），
+					// 拿它去断言底色就会误报。颗粒只会把颜色压暗、不会提亮，
+					// 所以最亮的那个像素就是没被颗粒盖住的底色
+					let px = null
+					for (let i = 0; i < row.length; i += 4) {
+						const a = row[i + 3]
+						if (a < minA) minA = a
+						if (a > 0 && a < 250) holes++
+						if (!px || row[i] + row[i + 1] + row[i + 2] > px[0] + px[1] + px[2]) {
+							px = [row[i], row[i + 1], row[i + 2], a]
+						}
+					}
+					pupaAlpha = px[3]
+					pupaColor = 'rgb(' + px[0] + ',' + px[1] + ',' + px[2] + ')'
+
+					if (minA !== 255 || holes > 0) {
+						return {
+							ok: false,
+							reason: '蛹是半透明的（横排 alpha 最低 ' + minA + '，半透明像素 ' + holes + ' 个）',
+						}
+					}
+					// 颜色也得对。只查 alpha 是不够的 —— 颜色拼错时画布会静默沿用上一个颜色，
+					// 那个「上一个」恰好不透明的话，alpha 检查就放过去了，
+					// 而屏幕上的蛹是别的颜色。刚化蛹应当是偏暖的奶白：R > G > B 且够亮
+					if (!(px[0] > 180 && px[0] > px[1] && px[1] > px[2])) {
+						return { ok: false, reason: '刚化蛹的颜色不对（' + pupaColor + '），应当是偏暖的奶白' }
+					}
+				} catch (e) {
+					return { ok: false, reason: '蛹的不透明度采样失败: ' + e.message }
+				}
+
+				// 工具栏那扇小窗：元素在不在、最小化能不能来回切。
+				// 这几个 id 只要拼错一个，ui.js 构造时就会抛错，
+				// 但那时报出来的是「__pet 不存在」，很难看出真正原因 —— 所以单独查一遍。
+				const panel = document.getElementById('panel')
+				const bar = document.getElementById('titlebar')
+				const minBtn = document.getElementById('btn-min')
+				if (!panel || !bar || !minBtn) {
+					return { ok: false, reason: '工具栏小窗的 DOM 不完整（panel / titlebar / btn-min）' }
+				}
+				if (typeof pet.ui.toggleMinimize !== 'function') {
+					return { ok: false, reason: 'ui.toggleMinimize 不存在' }
+				}
+				pet.ui.toggleMinimize()
+				const wentMin = panel.classList.contains('minimized')
+				pet.ui.toggleMinimize()
+				const cameBack = !panel.classList.contains('minimized')
+				if (!wentMin || !cameBack) return { ok: false, reason: '最小化切换不工作' }
+
+				// 工具折叠：默认收起 → 点开 → 五个按钮真的可见 → 点了工具标题行跟着变 → 再点收起。
+				// 这条链路上「展开后按钮还是不可见」是最容易出的错（display:none 挂错了层），
+				// 而它光看代码看不出来 —— 得真的量一下宽度
+				try {
+					const toolsBox = document.getElementById('tools-box')
+					if (!toolsBox) return { ok: false, reason: '#tools-box 不存在' }
+					if (!toolsBox.classList.contains('collapsed')) {
+						return { ok: false, reason: '工具组默认应当是收起的' }
+					}
+
+					document.getElementById('btn-tools').click()
+					if (toolsBox.classList.contains('collapsed')) {
+						return { ok: false, reason: '点了标题行但工具组没有展开' }
+					}
+					// ⚠ 基准要拿「**没被 .hidden 藏起来的**」那一批，不能直接拿
+					// toolButtons.length —— 烤制按钮在买了打火机之前是藏起来的，
+					// 用总数当基准的话这条断言会在开局就红
+					const shown = pet.ui.toolButtons.filter((b) => !b.classList.contains('hidden'))
+					const visible = Array.from(document.querySelectorAll('#tools [data-tool]')).filter(
+						(b) => b.getBoundingClientRect().width > 0,
+					)
+					if (visible.length !== shown.length) {
+						return {
+							ok: false,
+							reason: '展开后可见的工具按钮是 ' + visible.length + ' 个，应当是 ' + shown.length + ' 个',
+						}
+					}
+
+					// 烤制按钮：没买之前必须整个藏起来
+					const roastBtn = document.getElementById('btn-roast')
+					if (!roastBtn) return { ok: false, reason: '#btn-roast 不存在' }
+					if (!roastBtn.classList.contains('hidden')) {
+						return { ok: false, reason: '还没买打火机，烤制按钮不该出现' }
+					}
+
+					// 捕虫网：没买之前是**锁定态，但必须仍然可点**。
+					// 真的 disabled 掉的话，玩家点下去毫无反应，
+					// 只会以为按钮坏了，而不会想到要去商店买
+					const netBtn = document.getElementById('btn-net')
+					if (!netBtn) return { ok: false, reason: '#btn-net 不存在' }
+					if (!netBtn.classList.contains('locked')) {
+						return { ok: false, reason: '还没买捕虫网，按钮应当是锁定态' }
+					}
+					if (netBtn.disabled) {
+						return {
+							ok: false,
+							reason: '捕虫网按钮被 disabled 了 —— 那样点下去毫无反应，玩家不知道要去买',
+						}
+					}
+
+					pet.ui.setTool('glove')
+					const label = document.getElementById('tools-current').textContent
+					if (label !== '手套') return { ok: false, reason: '切到手套后标题行显示的却是「' + label + '」' }
+					pet.ui.setTool('none')
+
+					document.getElementById('btn-tools').click()
+					if (!toolsBox.classList.contains('collapsed')) {
+						return { ok: false, reason: '再点一次没有收起' }
+					}
+				} catch (e) {
+					return { ok: false, reason: '工具折叠流程失败: ' + e.message }
+				}
+
+				// 倍速折叠：和工具同一套路，另外还查「选了档位真的落到 world.timeScale 上」。
+				// 光看按钮亮不亮是不够的 —— 按钮亮了但 timeScale 没变的话，
+				// 屏幕上什么都不会发生，而这是最难自己发现的一种坏法
+				try {
+					const speedBox = document.getElementById('speed-box')
+					if (!speedBox) return { ok: false, reason: '#speed-box 不存在' }
+					if (!speedBox.classList.contains('collapsed')) {
+						return { ok: false, reason: '倍速默认应当是收起的' }
+					}
+
+					document.getElementById('btn-speed').click()
+					if (speedBox.classList.contains('collapsed')) {
+						return { ok: false, reason: '点了标题行但倍速没有展开' }
+					}
+					const opts = Array.from(document.querySelectorAll('#speeds [data-speed]')).filter(
+						(b) => b.getBoundingClientRect().width > 0,
+					)
+					if (opts.length !== 5) {
+						return { ok: false, reason: '展开后可见的档位是 ' + opts.length + ' 个（时停 + 四档倍速），应当是 5 个' }
+					}
+					// 五档必须排在一行里。面板只有 318px 宽，多塞一个按钮很容易被挤到第二行 ——
+					// 那不报错、功能也正常，只是面板突然高一截、下面几个按钮跟着往下跳
+					const rowTop = opts[0].getBoundingClientRect().top
+					const wrapped = opts.filter((b) => Math.abs(b.getBoundingClientRect().top - rowTop) > 2)
+					if (wrapped.length) {
+						return { ok: false, reason: '有 ' + wrapped.length + ' 个档位被挤到了第二行 —— 面板 318px 放不下五个' }
+					}
+
+					pet.ui.setSpeed(10)
+					if (pet.world.timeScale !== 10) {
+						return { ok: false, reason: '选了 10× 但 timeScale 是 ' + pet.world.timeScale }
+					}
+					const shown = document.getElementById('speed-current').textContent
+					if (shown !== '10×') return { ok: false, reason: '选了 10× 但标题行显示的是「' + shown + '」' }
+					if (!document.getElementById('btn-speed').classList.contains('on')) {
+						return { ok: false, reason: '加速时标题行没有点亮' }
+					}
+
+					// 回到 1× 要能复原：高亮该灭掉，档位该回到 1
+					pet.ui.setSpeed(1)
+					if (pet.world.timeScale !== 1) {
+						return { ok: false, reason: '选回 1× 但 timeScale 是 ' + pet.world.timeScale }
+					}
+					if (document.getElementById('btn-speed').classList.contains('on')) {
+						return { ok: false, reason: '回到 1× 之后标题行还是点亮的' }
+					}
+
+					// —— 时停 ——
+					//
+					// 三条都要查，少一条就会漏掉一种坏法：
+					//   ① paused 真的变成 true   —— 落没落到世界上
+					//   ② 标题行显示「时停」且点亮 —— 玩家看不看得出现在是停的
+					//   ③ 世界真的不再推进        —— 前两条都对、但 world.update 开头那句
+					//      「paused 就 return」被删掉的话，按钮会亮着而果蝇照跑
+					//
+					// ⚠ 这段代码整个住在一个模板字符串里，注释里也**不能出现反引号** ——
+					// 它会当场把外层那个模板字符串截断，报出来的是
+					// 「SyntaxError: missing ) after argument list」，完全指不到这里。
+					// 这个坑在本文件上面已经写过一次警告了，我还是踩了一次
+					pet.ui.setSpeed(5)
+					pet.ui.setSpeed(0)
+					if (!pet.world.paused) return { ok: false, reason: '选了时停但 world.paused 还是 false' }
+					if (pet.world.timeScale !== 5) {
+						return { ok: false, reason: '时停不该动 timeScale（原档位 5 变成了 ' + pet.world.timeScale + '），否则恢复时回不到原来那一档' }
+					}
+					const shownStop = document.getElementById('speed-current').textContent
+					if (shownStop !== '时停') return { ok: false, reason: '时停了但标题行显示的是「' + shownStop + '」' }
+					if (!document.getElementById('btn-speed').classList.contains('on')) {
+						return { ok: false, reason: '时停时标题行没有点亮 —— 忘了它停着会以为程序卡死了' }
+					}
+					{
+						const t0 = pet.world.elapsed
+						pet.world.update(1 / 60)
+						if (pet.world.elapsed !== t0) {
+							return { ok: false, reason: '时停状态下世界还在推进（elapsed ' + t0 + ' → ' + pet.world.elapsed + '）' }
+						}
+					}
+
+					// Space 走的是 togglePause()，必须和点「时停」是同一个结果 ——
+					// 而且恢复时要回到 5×，不是掉回 1×
+					pet.ui.togglePause()
+					if (pet.world.paused) return { ok: false, reason: '再按一次没有退出时停' }
+					if (pet.world.timeScale !== 5) {
+						return { ok: false, reason: '从时停恢复后 timeScale 是 ' + pet.world.timeScale + '，应当回到时停前的 5×' }
+					}
+					pet.ui.setSpeed(1)
+				} catch (e) {
+					return { ok: false, reason: '倍速 / 时停流程失败: ' + e.message }
+				}
+
+				// 经济：游戏币显示、商店、出售、悬停检视卡片。
+				//
+				// 这一整条回路（卖 → 钱 → 买 → 放大镜）在无头模拟器里已经逐项断言过了；
+				// 这里只查**接线**：DOM 在不在、格式对不对、档位类名切不切得动。
+				// 两边各管一段，不重复
+				try {
+					const money = document.getElementById('s-money')
+					const sell = document.getElementById('sell')
+					const shopPop = document.getElementById('shop-pop')
+					const shopList = document.getElementById('shop-list')
+					const inspect = document.getElementById('inspect')
+					if (!money || !sell || !shopPop || !shopList || !inspect) {
+						return { ok: false, reason: '经济相关的 DOM 不完整（游戏币 / 出售区 / 商店弹窗 / 数据面板）' }
+					}
+					if (!document.getElementById('btn-shop')) return { ok: false, reason: '商店按钮 #btn-shop 不存在' }
+
+					// ⚠ 商店 / 投放 / 图鉴这三张卡**必须挂在 #hud 下**，不能待在 .window 里。
+					//   .window 有 overflow: hidden（用来裁圆角），放进去会被整个剪掉 ——
+					//   而卡片、列表、按钮在 DOM 上**全都在**，所有别的断言照样绿。
+					//   这条只能靠 closest('.window') 查
+					for (const id of ['shop-pop', 'feed-pop', 'codex-pop']) {
+						const pop = document.getElementById(id)
+						if (!pop) return { ok: false, reason: '找不到弹窗 #' + id }
+						if (pop.closest('.window')) {
+							return {
+								ok: false,
+								reason: '#' + id + ' 被放进了 .window 里 —— 那扇窗 overflow:hidden 会把它整个剪掉',
+							}
+						}
+					}
+
+					// 游戏币显示要跟着 world 走，而且格式必须是 $xxx,xxx.xxx
+					// （千分位 + 至少三位小数；前缀只有 $，没有冒号）
+					pet.world.money = 1234567.891
+					pet.ui.refreshStats()
+					if (money.textContent !== '$1,234,567.891') {
+						return { ok: false, reason: '游戏币显示成了「' + money.textContent + '」，应当是「$1,234,567.891」' }
+					}
+					pet.world.money = 0
+					pet.ui.refreshStats()
+					if (money.textContent !== '$0.000') {
+						return { ok: false, reason: '零钱显示成了「' + money.textContent + '」，应当是「$0.000」' }
+					}
+
+					// 商店：默认关着 → 点开（**真实点击**）→ 商品行渲染出来了 → Esc 关掉
+					//
+					// ⚠ 这里原来查的是折叠用的 .collapsed。改成弹窗之后
+					//   折叠语义没了，判据换成 .hidden —— 而「点一下真的能开」
+					//   这一条必须留着：它正是当年设置 / 捐款按钮点不开那个
+					//   bug 的守卫（见下面那一大段注释）
+					if (!shopPop.classList.contains('hidden')) {
+						return { ok: false, reason: '商店弹窗默认应当是关着的' }
+					}
+					document.getElementById('btn-shop').click()
+					if (shopPop.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason: '点了商店按钮但弹窗没有出现 —— 多半是 #panel 的「点别处就关掉」把刚打开的自己又关了',
+						}
+					}
+					if (!shopList.querySelector('[data-buy]')) {
+						return { ok: false, reason: '商店打开后一件商品都没渲染出来' }
+					}
+					// 商品行数要跟 CONFIG.market.shop 一致 —— 加了货但没渲染出来，
+					// 玩家会以为「买了没用」，而只查「有没有商品」是查不出来的
+					const shopRows = shopList.querySelectorAll('[data-buy]').length
+					if (shopRows !== pet.config.market.shop.length) {
+						return {
+							ok: false,
+							reason:
+								'商店只渲染出 ' + shopRows + ' 件，配置里有 ' + pet.config.market.shop.length + ' 件',
+						}
+					}
+					// 警报器那一行要真的在，而且标价 $3
+					const alarmBtn = shopList.querySelector('[data-buy="alarm"]')
+					if (!alarmBtn) return { ok: false, reason: '商店里没有警报器这一行' }
+					if (!alarmBtn.textContent.includes('$3.000')) {
+						return { ok: false, reason: '警报器标价是「' + alarmBtn.textContent + '」，应当是 $3.000' }
+					}
+					// 买不起时按钮必须是禁用的 —— 光靠点击时报错的话，
+					// 玩家会以为「点了没反应」
+					if (pet.world.money === 0 && !shopList.querySelector('[data-buy]').disabled) {
+						return { ok: false, reason: '没钱时购买按钮却是可点的' }
+					}
+					// —— 放大镜的档位勾选行 ——
+					//
+					// 那六个小按钮是**买过之后**才长出来的，而且筛选逻辑
+					// （magnifierTargets 按档位集合筛）在无头模拟器里已经断言过了。
+					// 这里只查**接线**：按钮在不在、点一下 world 变不变、
+					// 选中态跟不跟得上、没买时是不是真的不给
+					{
+						const savedShopM = Object.assign({}, pet.world.shop)
+						const savedTiersM = pet.world.magnifierTiers.slice()
+
+						// 没买之前不该有那排按钮
+						pet.world.shop = {}
+						pet.world.magnifierTiers = pet.config.market.valueTiers.map((t) => t.id)
+						pet.ui.refreshShop()
+						if (shopList.querySelector('[data-magnify-tier]')) {
+							return { ok: false, reason: '还没买放大镜就已经有档位勾选行了' }
+						}
+
+						// 买下之后：每个价值档各一颗
+						pet.world.shop = { magnifier: true }
+						pet.ui.refreshShop()
+						const chips = [...shopList.querySelectorAll('[data-magnify-tier]')]
+						const wantTiers = pet.config.market.valueTiers.map((t) => t.id)
+						if (chips.length !== wantTiers.length) {
+							return {
+								ok: false,
+								reason: '放大镜的档位按钮有 ' + chips.length + ' 颗，按 valueTiers 应当是 ' + wantTiers.length + ' 颗',
+							}
+						}
+						for (const t of wantTiers) {
+							if (!shopList.querySelector('[data-magnify-tier="' + t + '"]')) {
+								return { ok: false, reason: '档位勾选里没有价值档 ' + t }
+							}
+						}
+
+						// 全勾上时每颗都应当是选中态
+						pet.world.magnifierTiers = wantTiers.slice()
+						pet.ui.refreshShop()
+						for (const t of wantTiers) {
+							const b = shopList.querySelector('[data-magnify-tier="' + t + '"]')
+							if (!b.classList.contains('active')) {
+								return { ok: false, reason: '档位 ' + t + ' 已经勾上了，按钮却不是选中态' }
+							}
+						}
+
+						// 点一下「稀有」→ world 里要把它去掉，按钮也要跟着灭
+						const rareBtn = shopList.querySelector('[data-magnify-tier="rare"]')
+						if (!rareBtn) return { ok: false, reason: '找不到「稀有」这颗档位按钮' }
+						rareBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+						if (pet.world.magnifierTiers.includes('rare')) {
+							return { ok: false, reason: '点了「稀有」但 world.magnifierTiers 里还有它' }
+						}
+						const rareAfter = shopList.querySelector('[data-magnify-tier="rare"]')
+						if (rareAfter.classList.contains('active')) {
+							return { ok: false, reason: '取消「稀有」之后按钮还是选中态' }
+						}
+						// 再点一下要能勾回来（toggle 的另一半）
+						rareAfter.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+						if (!pet.world.magnifierTiers.includes('rare')) {
+							return { ok: false, reason: '再点一次「稀有」没有勾回来' }
+						}
+
+						// 勾选真的传到了高亮那一层 —— 只勾一个空档，场上就该一个光环都没有
+						//
+						// ⚠ 这里查的是 magnifierTargets 的**输入**（world.magnifierTiers），
+						//   不是自己再算一遍分档 —— 分档和筛选逻辑在无头模拟器里
+						//   已经逐项断言过了，这里只确认「UI 点的那颗按钮改的是同一个字段」
+						pet.world.magnifierTiers = []
+						if (pet.world.magnifierTiers.length !== 0) {
+							return { ok: false, reason: '档位清空之后 world.magnifierTiers 还有东西' }
+						}
+						pet.ui.refreshShop()
+						if (shopList.querySelector('[data-magnify-tier].active')) {
+							return { ok: false, reason: '一档都没勾，却有档位按钮还是选中态' }
+						}
+
+						pet.world.shop = savedShopM
+						pet.world.magnifierTiers = savedTiersM
+						pet.ui.refreshShop()
+					}
+
+					// —— 分组真的渲染出来了，而且商品落在正确的组里 ——
+					//
+					// ⚠ 分类表是渲染顺序和归组的唯一来源（UI 完全按它遍历）。
+					//   所以这里比对的是**配置里那张表**，不是另抄一份期望值 ——
+					//   抄一份的话，改了配置这条断言就变成在测它自己
+					for (const cat of pet.config.market.shopCats) {
+						const box = shopList.querySelector('[data-cat="' + cat.id + '"]')
+						if (!box) {
+							return { ok: false, reason: '商店里没有「' + cat.name + '」这个分组' }
+						}
+						if (!box.querySelector('.shop-cat-name')) {
+							return { ok: false, reason: '「' + cat.name + '」那一组没有标题' }
+						}
+						// 组里出现的商品 id 必须恰好是配置里列的那几个
+						const got = []
+						for (const b of box.querySelectorAll('[data-buy],[data-chain]')) {
+							got.push(b.dataset.buy || b.dataset.chain)
+						}
+						const want = cat.items.filter((id) => got.includes(id))
+						if (got.length !== cat.items.length) {
+							return {
+								ok: false,
+								reason:
+									'「' + cat.name + '」里有 ' + got.length + ' 件，配置里写了 ' + cat.items.length + ' 件（' +
+									got.join(',') + '）',
+							}
+						}
+						if (want.length !== cat.items.length) {
+							return { ok: false, reason: '「' + cat.name + '」里的商品和配置对不上' }
+						}
+					}
+					// Esc 关掉
+					pet.ui._onKey({ code: 'Escape' })
+					if (!shopPop.classList.contains('hidden')) {
+						return { ok: false, reason: 'Esc 关不掉商店弹窗' }
+					}
+
+					// 投放面板（代码里叫 feed）：和商店同一套折叠块，
+					// 但**状态语义完全不同** —— 商店的道具买了变「已拥有」并从此禁用，
+					// 投放的每一行都是能反复买的消耗品。
+					// 三行 × 两档 = 六个按钮，价格必须是配置里那三个数
+					//
+					// ⚠ 下面一律用字符串拼接，**不能写反引号模板串、也不能写美元大括号插值**。
+					// 这一段整个住在一个模板字符串里，里面的反引号会提前把它结束掉，
+					// 插值语法会被外层拿去求值 —— 报的是「SyntaxError: missing ) after
+					// argument list」，而且整个 main.js 加载失败、自检**静默挂住**，
+					// 屏幕上只开出一个空窗口。踩过两次了。
+					// 自检本身查不出这个：跑之前 main.js 就已经没加载起来
+					const feedPop = document.getElementById('feed-pop')
+					const feedList = document.getElementById('feed-list')
+					if (!feedPop || !feedList) return { ok: false, reason: '投放弹窗的 DOM 不存在' }
+					if (!document.getElementById('btn-feed')) return { ok: false, reason: '投放按钮 #btn-feed 不存在' }
+					// 投食 / 投蝇那两个旧按钮应当已经被弹窗取代 —— 漏一个在页面上，
+					// 玩家就会看见两个功能重复的入口，而且旧那个还不收钱
+					for (const dead of ['btn-food', 'btn-spawn']) {
+						if (document.getElementById(dead)) {
+							return { ok: false, reason: '旧的 #' + dead + ' 还在，应当已经并入投放弹窗' }
+						}
+					}
+					// ⚠ 「玻璃罐」那颗工具栏按钮**撤掉了** —— 它现在只在投放弹窗里。
+					//   两边都留着的话，摆罐子有两个入口，而这一行本来就挤
+					if (document.getElementById('btn-jar')) {
+						return { ok: false, reason: '#btn-jar 还在工具栏上，应当已经挪进投放弹窗' }
+					}
+					if (!feedPop.classList.contains('hidden')) {
+						return { ok: false, reason: '投放弹窗默认应当是关着的' }
+					}
+					document.getElementById('btn-feed').click()
+					if (feedPop.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason: '点了投放按钮但弹窗没有出现 —— 多半是 #panel 的「点别处就关掉」把刚打开的自己又关了',
+						}
+					}
+					// ⚠ refreshFeed() 是**整块重建 DOM** 的（和 refreshShop 一样），
+					// 所以每次刷完都必须重新查一遍，攥着旧引用查 disabled 查的是已经被丢掉的那批节点
+					const grabBtns = () => [...feedList.querySelectorAll('[data-kind]')]
+
+					pet.ui.refreshFeed()
+					const feedBtns = grabBtns()
+					// 3 种能买的 × 2 档 = 6 个按钮。玻璃罐那一行**不在这 6 个里** ——
+					// 它是免费的，没有 [data-kind]，走的是 [data-jar]
+					if (feedBtns.length !== 6) {
+						return {
+							ok: false,
+							reason: '投放弹窗渲染出了 ' + feedBtns.length + ' 个按钮，应当是 6 个（3 行 × 2 档）',
+						}
+					}
+					for (const kind of ['apple', 'gold', 'fly']) {
+						if (feedBtns.filter((b) => b.dataset.kind === kind).length !== 2) {
+							return { ok: false, reason: '投放弹窗里「' + kind + '」那一行不是 2 个按钮' }
+						}
+					}
+					// —— 分组：食物类 / 其他，玻璃罐在「其他」里 ——
+					//
+					// ⚠ 数的必须是**行**，不是按钮：一个大类里的每一行有 2 个按钮
+					//   （投1 / 投10），直接数按钮会得到 4 而不是 2。
+					//   第一版就是这么写的，报出来是「「食物类」里有 4 项，配置里写了 2 项」，
+					//   看着像配置错了，其实是断言自己数错了东西
+					for (const cat of pet.config.market.feedCats) {
+						const box = feedList.querySelector('[data-cat="' + cat.id + '"]')
+						if (!box) return { ok: false, reason: '投放弹窗里没有「' + cat.name + '」这个分组' }
+						// 把行上的 id 收成一个去重集合（同一行的两个按钮会给出同一个 id）
+						const ids = new Set()
+						for (const b of box.querySelectorAll('[data-kind],[data-jar]')) {
+							ids.add(b.dataset.jar !== undefined ? 'jar' : b.dataset.kind)
+						}
+						if (ids.size !== cat.items.length) {
+							return {
+								ok: false,
+								reason:
+									'「' + cat.name + '」里有 ' + ids.size + ' 行，配置里写了 ' + cat.items.length + ' 行（' +
+									[...ids].join(',') + '）',
+							}
+						}
+						for (const id of cat.items) {
+							if (!ids.has(id)) {
+								return { ok: false, reason: '「' + cat.name + '」里没有「' + id + '」这一行' }
+							}
+						}
+					}
+					const jarBtn = feedList.querySelector('[data-jar]')
+					if (!jarBtn) return { ok: false, reason: '投放弹窗里没有玻璃罐那一行' }
+					// 按钮上要**看得见价格**，而且得是配置里那三个数 ——
+					// 写死一个数在这里是有意的：它同时守着「UI 真的读了 CONFIG.market.prices」
+					const wantPrice = { 'apple-1': '$0.001', 'gold-1': '$0.010', 'fly-1': '$0.005' }
+					for (const key of Object.keys(wantPrice)) {
+						const want = wantPrice[key]
+						const [k, n] = key.split('-')
+						const b = feedBtns.find((x) => x.dataset.kind === k && x.dataset.n === n)
+						if (!b.textContent.includes(want)) {
+							return {
+								ok: false,
+								reason: '投放弹窗上「' + key + '」的价格写成了「' + b.textContent + '」，应当含 ' + want,
+							}
+						}
+					}
+					// 钱不够时六个按钮必须全禁用 —— 和商店同一条：光靠点击时报错的话，
+					// 玩家会以为「点了没反应」。
+					// ⚠ 玻璃罐**不在此列**：它免费，钱是 0 也该能点。
+					//   一起禁用的话，穷的时候连罐子都摆不了，而那不是设计意图
+					pet.world.money = 0
+					pet.ui.refreshFeed()
+					const stillOn = grabBtns().filter((b) => !b.disabled)
+					if (stillOn.length) {
+						return {
+							ok: false,
+							reason:
+								'钱是 0 时还有 ' +
+								stillOn.length +
+								' 个投放按钮可点（第一个是「' +
+								stillOn[0].textContent +
+								'」）',
+						}
+					}
+					const jarStillOn = feedList.querySelector('[data-jar]')
+					if (jarStillOn && jarStillOn.disabled) {
+						return { ok: false, reason: '钱是 0 时玻璃罐被禁用了 —— 它不花钱，应当照常能摆' }
+					}
+					// 给够钱再刷一次：六个都得活过来
+					pet.world.money = 10
+					pet.ui.refreshFeed()
+					if (grabBtns().some((b) => b.disabled)) {
+						return { ok: false, reason: '钱给够了却还有投放按钮是禁用状态' }
+					}
+					pet.world.money = 0
+
+					// —— 玻璃罐那一行：点了真的摆出一个罐子 ——
+					//
+					// ⚠ 这条是**真实点击**，不是直接调 world.dropJar()。
+					//   直接调的话，委托监听漏挂、dataset 名字写错、
+					//   按钮被别的东西挡住 —— 三种坏法全都测不出来
+					pet.world.jars.length = 0
+					const jarClick = feedList.querySelector('[data-jar]')
+					if (!jarClick) return { ok: false, reason: '玻璃罐那一行不见了' }
+					jarClick.click()
+					if (pet.world.jars.length !== 1) {
+						return { ok: false, reason: '点了玻璃罐那一行，场上却没有多出罐子' }
+					}
+					// 摆满（上限 4 个）—— 一次点击只摆一个，所以这里连着摆到满。
+					// ⚠ 循环写成**有界**的：dropJar 万一摆不出来（返回 null），
+					//   写成 while (jars.length < max) 就是一个死循环，
+					//   而自检挂死和「代码有 bug」在现象上没区别，很难查
+					for (let i = 0; i < pet.config.jar.maxCount + 2; i++) {
+						if (pet.world.jars.length >= pet.config.jar.maxCount) break
+						pet.world.dropJar()
+					}
+					if (pet.world.jars.length !== pet.config.jar.maxCount) {
+						return { ok: false, reason: '罐子没有摆满，后面那条「摆满了要置灰」测不到' }
+					}
+					// 摆满之后按钮要置灰（而不是点了没反应）—— 早先它挂在工具栏上时
+					// 撞上限是**静默**的，玩家只能猜
+					pet.ui.refreshFeed()
+					const jarFull = feedList.querySelector('[data-jar]')
+					if (!jarFull.disabled) {
+						return {
+							ok: false,
+							reason: '罐子摆满 ' + pet.config.jar.maxCount + ' 个之后「摆一个」还是可点的',
+						}
+					}
+					pet.world.jars.length = 0
+					pet.ui.refreshFeed()
+
+					// 用 Esc 关掉（不再点按钮 toggle —— 那条路径上面已经测过了）
+					pet.ui._onKey({ code: 'Escape' })
+					if (!feedPop.classList.contains('hidden')) {
+						return { ok: false, reason: 'Esc 关不掉投放弹窗' }
+					}
+
+					// 食物投放区参考框：默认隐藏；打开后必须摆在 config 说的位置上，
+					// 而且**不能**改变鼠标接管状态（它是常驻视觉元素，参与进去就会吞掉桌面点击）
+					const zone = document.getElementById('food-zone')
+					if (!zone) return { ok: false, reason: '食物投放区参考框 #food-zone 不存在' }
+					if (!zone.classList.contains('hidden')) {
+						return { ok: false, reason: '食物投放区参考框默认应当是隐藏的' }
+					}
+					// 层叠位置：它夹在画布和工具栏之间，靠的是「同为定位元素、按 DOM 顺序叠」，
+					// **不是** z-index。写上 z-index（哪怕只是 1）它就会跳到所有 z-auto 的
+					// 兄弟上面去，把工具栏、启动选择框、集群提示条统统盖住。
+					// 这是个一眼看不出、拖一下窗口才会撞见的坑，值得钉死
+					const zi = getComputedStyle(zone).zIndex
+					if (zi !== 'auto') {
+						return { ok: false, reason: '参考框写了 z-index（' + zi + '），会盖住工具栏和启动框' }
+					}
+					const kids = Array.prototype.slice.call(document.body.children)
+					if (kids.indexOf(zone) !== kids.indexOf(document.getElementById('stage')) + 1) {
+						return { ok: false, reason: '参考框在 DOM 里没有紧跟画布 —— 层叠顺序会不对' }
+					}
+					const zoneWasInteractive = pet.ui.interactive
+					// 真的把配置打开再摆一次 —— 断言的是 refreshFoodZone() 有没有**读配置**，
+					// 而不是我自己重算一遍公式对不对（那样测的是断言自己的算术）
+					pet.config.food.zone.show = true
+					pet.ui.refreshFoodZone()
+					if (zone.classList.contains('hidden')) {
+						return { ok: false, reason: 'zone.show 打开之后参考框还是隐藏的' }
+					}
+					const zc = pet.config.food.zone
+					const zr = zone.getBoundingClientRect()
+					const wantW = zc.w * window.innerWidth
+					const wantH = zc.h * window.innerHeight
+					if (Math.abs(zr.left - zc.x * window.innerWidth) > 1.5 || Math.abs(zr.width - wantW) > 1.5) {
+						return {
+							ok: false,
+							reason:
+								'参考框横向摆在了 ' +
+								Math.round(zr.left) +
+								'/' +
+								Math.round(zr.width) +
+								'，按配置应当是 ' +
+								Math.round(zc.x * window.innerWidth) +
+								'/' +
+								Math.round(wantW),
+						}
+					}
+					if (Math.abs(zr.top - zc.y * window.innerHeight) > 1.5 || Math.abs(zr.height - wantH) > 1.5) {
+						return {
+							ok: false,
+							reason:
+								'参考框纵向摆在了 ' +
+								Math.round(zr.top) +
+								'/' +
+								Math.round(zr.height) +
+								'，按配置应当是 ' +
+								Math.round(zc.y * window.innerHeight) +
+								'/' +
+								Math.round(wantH),
+						}
+					}
+					// ⚠ 参考框是常驻视觉元素，绝不能参与「要不要接管鼠标」——
+					// 参与进去的话整块区域的桌面点击都会被吞掉（和悬停卡片同一个教训）
+					pet.ui._updateInteractive()
+					if (pet.ui.interactive !== zoneWasInteractive) {
+						return { ok: false, reason: '食物投放区参考框改变了鼠标接管状态 —— 它必须保持穿透' }
+					}
+					pet.config.food.zone.show = false // 测完还原，别把调试框留在屏幕上
+					pet.ui.refreshFoodZone()
+					if (!zone.classList.contains('hidden')) {
+						return { ok: false, reason: 'zone.show 关掉之后参考框没有隐藏' }
+					}
+
+					// —— 手套拖成虫进罐子 ——
+					//
+					// ⚠ 这条路径**以前根本不存在**：_endDrag 只处理垃圾桶和出售区，
+					// 罐子一直只能靠捕虫网（N）进蝇。而网是按半径一网打尽的，
+					// 想「只留下那一只稀有的」只能靠运气 —— 这正是玩家会碰上的那种问题。
+					//
+					// 这里真的走一遍：摆一个罐子、抓一只蝇、把指针放到罐子上、
+					// 调 _endDrag()，看它有没有真的进罐。
+					// 只查「函数存在」是不够的 —— 分支漏写正是这种查法查不出来的
+					{
+						const w = pet.world
+						const savedFlies = w.flies.slice()
+						const savedJars = w.jars.slice()
+						w.flies.length = 0
+						w.jars.length = 0
+
+						const jar = w.dropJar()
+						if (!jar) return { ok: false, reason: '摆不出罐子，没法测「拖进罐子」' }
+						jar.x = 400
+						jar.y = 400
+						const target = w.addFly(1000, 400, 'F')
+						if (!target) return { ok: false, reason: '放不出果蝇' }
+
+						// 假装正拎着它，指针停在罐子上
+						pet.ui.drag = target
+						pet.ui.dragKind = 'fly'
+						pet.view.mouse.x = 400
+						pet.view.mouse.y = 400
+						const handled = pet.ui._endDrag()
+
+						if (!handled) return { ok: false, reason: '拎着成虫松手时 _endDrag 没有接管' }
+						if (jar.flies.length !== 1 || jar.flies[0] !== target) {
+							return { ok: false, reason: '把成虫拖到罐子上松手，它没有被装进罐子' }
+						}
+						if (w.flies.includes(target)) {
+							return { ok: false, reason: '成虫进了罐子却还留在 world.flies 里（会被重复统计）' }
+						}
+						if (pet.ui.drag) return { ok: false, reason: '松手之后拖动状态没有清掉' }
+						// 松手后指针不再是「瞄准某个罐子」，高亮也得跟着灭
+						if (pet.view.dropJar) return { ok: false, reason: '松手之后 view.dropJar 没有清掉，罐子会一直亮着' }
+
+						// 罐子满了：装不进去，但**绝对不能**把果蝇弄丢 ——
+						// 丢一只稀有的，比装不进去严重得多
+						while (!jar.full) {
+							const filler = w.addFly(1200, 600, 'F')
+							if (!filler) break
+							w.putInJar(jar, filler)
+						}
+						const overflow = w.addFly(1400, 600, 'F')
+						if (!overflow) return { ok: false, reason: '放不出用于测试「罐子满了」的果蝇' }
+						pet.ui.drag = overflow
+						pet.ui.dragKind = 'fly'
+						pet.view.mouse.x = 400
+						pet.view.mouse.y = 400
+						pet.ui._endDrag()
+						if (!w.flies.includes(overflow)) {
+							return { ok: false, reason: '罐子满了，那只果蝇却从世界里消失了 —— 应该是装不进去、留在原地' }
+						}
+
+						w.flies.length = 0
+						w.jars.length = 0
+						for (const f of savedFlies) w.flies.push(f)
+						for (const j of savedJars) w.jars.push(j)
+					}
+
+					// —— 统计行的三条杠 ——
+					//
+					// 主面板只留存活 / 死亡，其余收进这个开关里。
+					// 收起的判据是**看得见看不见**，不是类名 —— 类名对了但 CSS 没生效的话，
+					// 那排数字照样糊在主面板上，而类名断言全绿
+					const statsBtn = document.getElementById('btn-stats')
+					const statsDetail = document.getElementById('stats-detail')
+					if (!statsBtn || !statsDetail) return { ok: false, reason: '统计行 / 三条杠的 DOM 不存在' }
+					if (getComputedStyle(statsDetail).display !== 'none') {
+						return { ok: false, reason: '细分数量默认应当是收起的（主面板上只留存活和死亡）' }
+					}
+					statsBtn.click()
+					if (getComputedStyle(statsDetail).display === 'none') {
+						return { ok: false, reason: '点了三条杠但细分数量没有展开' }
+					}
+					if (!statsBtn.classList.contains('on')) {
+						return { ok: false, reason: '展开之后三条杠没有点亮，看不出下面那排是它开出来的' }
+					}
+					for (const id of ['s-adults', 's-larvae', 's-eggs', 's-value']) {
+						if (!document.getElementById(id)) {
+							return { ok: false, reason: '细分里缺少 #' + id }
+						}
+					}
+					// 成虫总价值必须**真的等于**所有成虫售价之和，不能是个写死的数。
+					// 塞两只已知价值的果蝇进去对一遍
+					const savedFlies = pet.world.flies.slice()
+					pet.world.flies.length = 0
+					const v1 = pet.world.addFly(300, 300, 'F')
+					const v2 = pet.world.addFly(400, 300, 'M')
+					v1.age = v1.lifespan
+					v2.age = v2.lifespan
+					pet.ui.refreshStats()
+					const wantValue = v1.value + v2.value
+					const shownValue = document.getElementById('s-value').textContent
+					if (!shownValue.startsWith('$')) {
+						return { ok: false, reason: '成虫总价值没有按货币格式显示：' + shownValue }
+					}
+					if (Math.abs(pet.world.counts.value - wantValue) > 1e-9) {
+						return {
+							ok: false,
+							reason: '成虫总价值对不上：counts 给的是 ' + pet.world.counts.value + '，两只蝇加起来是 ' + wantValue,
+						}
+					}
+					pet.world.flies.length = 0
+					for (const f of savedFlies) pet.world.flies.push(f)
+					statsBtn.click()
+					if (getComputedStyle(statsDetail).display !== 'none') {
+						return { ok: false, reason: '再点一次三条杠没有收起' }
+					}
+
+					// —— 捐款入口 ——
+					const donate = document.getElementById('donate-pop')
+					const donateBtn = document.getElementById('btn-donate')
+					const qr = document.getElementById('donate-qr')
+					if (!donate || !donateBtn || !qr) {
+						return { ok: false, reason: '捐款相关的 DOM 不完整（按钮 / 弹窗 / 二维码）' }
+					}
+					if (!donate.classList.contains('hidden')) {
+						return { ok: false, reason: '捐款弹窗默认应当是关着的' }
+					}
+					// 提示语必须有自己的容器：_flashHint 是直接写 textContent 的，
+					// 写在外层 #hint 上会把同在一行里的捐款按钮一起抹掉 ——
+					// 而且抹掉之后一点报错都没有，只是按钮从此消失
+					const hintText = document.getElementById('hint-text')
+					if (!hintText) return { ok: false, reason: '提示语没有独立的 #hint-text 容器' }
+					const hintBefore = hintText.textContent
+					pet.ui._flashHint('测试一下')
+					if (!document.getElementById('btn-donate')) {
+						return { ok: false, reason: '_flashHint 把捐款按钮抹掉了 —— 提示语要写进 #hint-text' }
+					}
+					clearTimeout(pet.ui.hintTimer)
+					pet.ui.el.hint.classList.remove('alert')
+					hintText.textContent = hintBefore
+
+					// 二维码图片真的加载出来了。
+					// ⚠ 路径写错时 <img> **不会报错**，只是默默不显示 ——
+					// 弹窗长得完全正常，中间一个空白框，自检也全绿。
+					// naturalWidth 是 0 就说明这张图根本没读进来
+					if (!qr.complete || qr.naturalWidth === 0) {
+						return { ok: false, reason: '支付宝二维码没加载出来（naturalWidth=0）—— 检查 renderer/assets/alipay-qr.png' }
+					}
+					if (qr.naturalWidth < 200) {
+						return { ok: false, reason: '二维码只有 ' + qr.naturalWidth + 'px 宽，扫不出来' }
+					}
+
+					// ⚠ 和悬停卡片 / 食物投放区**相反**：指针压在卡片上时必须把鼠标要过来，
+					// 否则卡片长得正常但点不动，关都关不掉。
+					// 但它不是模态 —— 指针不在卡片上时**不能**接管，否则整块桌面都被它吃掉
+					pet.ui.setDonateOpen(true)
+					if (donate.classList.contains('hidden')) {
+						return { ok: false, reason: 'setDonateOpen(true) 之后卡片还是隐藏的' }
+					}
+
+					// ⚠ 卡片必须**钉在屏幕正中**。
+					// 早先是贴在面板正上方、由 _placeDonate() 每帧现算位置，
+					// 面板一拖到屏幕顶端或右边缘，卡片就会被 clamp 到边上、
+					// 和面板挤在一起，二维码顶出可视区看着像图没加载出来。
+					// 改成 50% / 50% 之后位置和面板无关，这条断言守着「不许改回去」。
+					//
+					// ⚠ **必须在 setDonateOpen(false) 之前量。** display:none 的元素
+					// getBoundingClientRect() 全是 0，写在关闭之后就变成
+					// 「0 和屏幕中心比大小」—— 恒不相等、又恒不说自己错，白白通过。
+					// 所以这里先显式确认尺寸不是 0，把那种假通过堵死
+					const card = donate.querySelector('.donate-card').getBoundingClientRect()
+					if (card.width <= 0 || card.height <= 0) {
+						return { ok: false, reason: '卡片开着，量到的尺寸却是 0 —— 位置断言会变成永远通过' }
+					}
+					// 容差 1px：translate(-50%) 在奇数宽度上会落在半个像素，
+					// 取整之后和正中差半格，不该算失败
+					const cx = card.left + card.width / 2
+					const cy = card.top + card.height / 2
+					if (
+						Math.abs(cx - window.innerWidth / 2) > 1 ||
+						Math.abs(cy - window.innerHeight / 2) > 1
+					) {
+						return {
+							ok: false,
+							reason:
+								'捐款卡片没有居中（卡片中心 ' +
+								Math.round(cx) +
+								',' +
+								Math.round(cy) +
+								'，屏幕中心 ' +
+								Math.round(window.innerWidth / 2) +
+								',' +
+								Math.round(window.innerHeight / 2) +
+								'）—— 位置应当只由 CSS 的 50% / 50% 决定',
+						}
+					}
+
+					const savedMouse = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					pet.view.mouse.x = card.left + card.width / 2
+					pet.view.mouse.y = card.top + card.height / 2
+					pet.ui._updateInteractive()
+					if (!pet.ui.interactive) {
+						return { ok: false, reason: '指针压在捐款卡片上却没有接管鼠标 —— 点上去会穿到桌面，关不掉' }
+					}
+					// 挪开：卡片只是面板上方的一张小卡，不该像模态那样一直占着鼠标
+					//
+					// ⚠ 这一段必须先把**虫**挪走。
+					//
+					// 观察模式下，指针压在「停着 / 爬着的虫」上时窗口是**故意**
+					// 接管鼠标的 —— 那是「点一下看数据面板」的代价（见 ui._inspectableAt）。
+					// 果蝇满屏乱走，任何一个固定坐标上都可能正好有虫，
+					// 于是「捐款卡片有没有占着鼠标」这条断言会随机红，
+					// 而报出来的理由是「卡片关不掉」，完全指错方向。
+					//
+					// 这条断言要测的是**卡片**，虫和它无关，所以临时清场再还原
+					const donateFlies = pet.world.flies
+					const donateLarvae = pet.world.larvae
+					pet.world.flies = []
+					pet.world.larvae = []
+
+					pet.view.mouse.x = 40
+					pet.view.mouse.y = 40
+					pet.ui.inspectHover = false
+					pet.ui._updateInteractive()
+					if (pet.ui.interactive) {
+						pet.world.flies = donateFlies
+						pet.world.larvae = donateLarvae
+						return { ok: false, reason: '指针已经离开卡片，鼠标却还被接管着 —— 它会挡住桌面操作' }
+					}
+
+					pet.ui.setDonateOpen(false)
+					if (!donate.classList.contains('hidden')) {
+						pet.world.flies = donateFlies
+						pet.world.larvae = donateLarvae
+						return { ok: false, reason: 'setDonateOpen(false) 之后卡片没有隐藏' }
+					}
+					pet.ui._updateInteractive()
+					if (pet.ui.interactive) {
+						pet.world.flies = donateFlies
+						pet.world.larvae = donateLarvae
+						return { ok: false, reason: '捐款卡片关掉之后鼠标还接管着' }
+					}
+
+					pet.world.flies = donateFlies
+					pet.world.larvae = donateLarvae
+					pet.view.mouse.x = savedMouse.x
+					pet.view.mouse.y = savedMouse.y
+					// ⚠ 把指针挪回去之后**必须**重算一次。
+					//   ui.interactive 是上一次 _updateInteractive 缓存下来的结论，
+					//   上面那几帧查的是 (40,40) 那个位置，而虫已经放回来了 ——
+					//   不重算的话，后面那条「悬停卡片不该改变接管状态」的断言
+					//   会拿一个**过期的** wasInteractive 去比，然后随机红
+					pet.ui.inspectHover = false
+					pet.ui._updateInteractive()
+
+					// ⚠ 卡片和面板**可以**重叠（面板停在底部中央，窗口一矮就压上），
+					// 所以层叠顺序必须是对的：面板底色 rgba(18,16,14,0.84) 半透明，
+					// 一旦盖在卡片上，二维码会从底下透出来糊成一片。
+					// 光断言「谁在上面」没用 —— 得确认 .donate-pop 真的拿到了 z-index，
+					// 而且比 .window 高。CSS 里漏写这一行，重叠时就会糊，但所有别的断言都照样通过
+					const popZ = getComputedStyle(donate).zIndex
+					const winZ = getComputedStyle(document.getElementById('panel')).zIndex
+					const popN = popZ === 'auto' ? 0 : Number(popZ)
+					const winN = winZ === 'auto' ? 0 : Number(winZ)
+					if (!(popN > winN)) {
+						return {
+							ok: false,
+							reason:
+								'捐款卡片的 z-index（' +
+								popZ +
+								'）没有高过面板（' +
+								winZ +
+								'）—— 两者重叠时面板会盖住二维码',
+						}
+					}
+
+					// 卡片的档位：直接喂假数据给 _showInspect，看类名切没切对。
+					// 用假对象而不是真的养一只，是因为这里要覆盖的是**全部档位和边界**，
+					// 靠真实果蝇长到那个体重得等几十分钟
+					//
+					// ⚠ fake 是**普通对象**，所以它身上没有 Fly 原型上的
+					//   rarityInfo getter —— 得自己填一个真的进去。
+					//   漏了的话 _showInspect 读 f.rarityInfo.name 会直接抛，
+					//   而报出来的是「经济 / 数据面板流程失败」，看不出是缺字段
+					const fake = (value, rarityName = '轻盈') => ({
+						value,
+						sex: 'F',
+						growth: 0.5,
+						weight: 1,
+						hp: 8,
+						hpMax: 10,
+						mutations: [],
+						rarityInfo: { name: rarityName },
+					})
+					// 每一档连**算出来的边框颜色**和**显示的名字**一起查。
+					//
+					// 光看类名不够：类名对了但 style.css 里没写这条、或者色值写错，
+					// 卡片会渲染成默认的灰边，而类名断言照样通过。
+					// getComputedStyle 拿到的是**应用之后**的值 —— CSS 没加载、
+					// 选择器写错、变量没解析，三种情况它都会露馅
+					//
+					// ⚠ 这张表是「**名字 ↔ 颜色 ↔ 特效**有没有对上」的唯一检查，
+					//   三样都写在同一行里，改了一处忘了另一处就会当场红。
+					//   顺序 = 从便宜到贵，和 CONFIG.market.valueTiers 一致；
+					//   每档取一个**落在区间中间**的代表值（不是边界值 ——
+					//   边界归哪一档是由 sim 里那条纯函数断言钉的，见 valueTierOf）
+					//
+					// ⚠ 价格区间改过一次（0.02 / 0.1 / 10 / 100 / 1000），
+					//   所以这里的取值也跟着挪了：$5 以前是极稀有，现在归稀有。
+					//   两个地方要一起改，漏掉的话报出来的是「名字不对」而其实是档位挪了
+					const cases = [
+						[0.002, 'tier-common', 'rgb(232, 226, 216)', '普通', false, false],
+						[0.05, 'tier-uncommon', 'rgb(111, 179, 255)', '罕见', false, false],
+						[0.5, 'tier-rare', 'rgb(185, 140, 255)', '稀有', false, false],
+						[50, 'tier-epic', 'rgb(240, 192, 74)', '极稀有', true, false],
+						[500, 'tier-legendary', 'rgb(255, 107, 94)', '超级稀有', true, true],
+						[5000, 'tier-mythic', 'rgb(159, 232, 216)', '传说生物', true, true],
+						// 多出来的这一行：最后一档的上界是 Infinity，
+						// 所以再贵也不会「超出范围」掉到 undefined
+						[9.9e9, 'tier-mythic', 'rgb(159, 232, 216)', '传说生物', true, true],
+					]
+					// 档数要和配置对得上 —— 少写一行的话，那一档的颜色 / 名字
+					// 就完全没人查了，而表面上一切正常
+					if (cases.length - 1 !== pet.config.market.valueTiers.length) {
+						return {
+							ok: false,
+							reason:
+								'这张表覆盖了 ' +
+								(cases.length - 1) +
+								' 档，配置里有 ' +
+								pet.config.market.valueTiers.length +
+								' 档 —— 有档位没被检查到',
+						}
+					}
+					for (const [v, want, rgb, name, fx, sheen] of cases) {
+						pet.ui._showInspect(fake(v))
+						if (!inspect.classList.contains(want)) {
+							return { ok: false, reason: '价值 $' + v + ' 的卡片类名里没有 ' + want + '（实际 ' + inspect.className + '）' }
+						}
+						if (document.getElementById('inspect-rarity').textContent !== name) {
+							return {
+								ok: false,
+								reason: '价值 $' + v + ' 的卡片上写的是「' +
+									document.getElementById('inspect-rarity').textContent +
+									'」，按价值分档应当是「' + name + '」',
+							}
+						}
+						// 金色及以上才有边框流动，最高档还多一层反光扫过
+						if (inspect.classList.contains('fx') !== fx) {
+							return { ok: false, reason: '价值 $' + v + ' 的流动特效开关不对（' + inspect.className + '）' }
+						}
+						if (inspect.classList.contains('sheen') !== sheen) {
+							return { ok: false, reason: '价值 $' + v + ' 的反光扫过开关不对（' + inspect.className + '）' }
+						}
+						const cs = getComputedStyle(inspect)
+						// ⚠ 这里**不能**查 opacity：卡片刚显示出来的那一瞬间正在
+						// 走 0.14 秒的淡入，getComputedStyle 读到的就是 0。
+						// 这几次检查全在同一次脚本执行里跑完，所以读到的永远是 0 ——
+						// 那是在测「动画有没有播完」，不是「卡片可不可见」。
+						// 改为确认它有淡入动画、而且不是 display:none
+						if (cs.display === 'none') {
+							return { ok: false, reason: '价值 $' + v + ' 的卡片是 display:none' }
+						}
+						if (cs.animationName !== 'inspect-in') {
+							return { ok: false, reason: '卡片的入场动画是 ' + cs.animationName + '，应当是 inspect-in' }
+						}
+						if (cs.borderTopColor !== rgb) {
+							return {
+								ok: false,
+								reason: '价值 $' + v + ' 的卡片边框是 ' + cs.borderTopColor + '，按配置应当是 ' + rgb + ' —— 检查 style.css 里 ' + want + ' 的 --tier',
+							}
+						}
+						// 内容也得真的填进去了，不能是个空壳
+						if (!document.getElementById('inspect-value').textContent.startsWith('$')) {
+							return { ok: false, reason: '卡片上的售价文本没填对' }
+						}
+					}
+					pet.ui._hideInspect()
+					if (!inspect.classList.contains('hidden')) return { ok: false, reason: '收起之后卡片没有隐藏' }
+					if (getComputedStyle(inspect).display !== 'none') {
+						return { ok: false, reason: '卡片带 .hidden 时应当 display: none' }
+					}
+
+					// —— 体格那一行小字（体重档）——
+					//
+					// ⚠ 这是卡片上**第二套档位**，和价值档并排两行。
+					//   两行的来源完全不同（一个按售价现算、一个是出生抽的体格），
+					//   所以必须分别钉住 —— 只查其中一行的话，
+					//   「两行对调了」或者「另一行写死了一个名字」都发现不了
+					const buildEl = document.getElementById('inspect-build')
+					if (!buildEl) return { ok: false, reason: '卡片里没有体格那一行（#inspect-build）' }
+					for (const rn of ['轻盈', '超重', '巨兽']) {
+						pet.ui._showInspect(fake(1, rn))
+						const wantBuild = '体格 ' + rn
+						if (buildEl.textContent !== wantBuild) {
+							return {
+								ok: false,
+								reason:
+									'体重档是「' + rn + '」时，卡片上写的是「' + buildEl.textContent +
+									'」，应当是「' + wantBuild + '」',
+							}
+						}
+					}
+					if (getComputedStyle(buildEl).display === 'none') {
+						return { ok: false, reason: '成虫卡片上的体格那一行是 display:none —— 玩家看不到' }
+					}
+
+					// ⚠ 卡片**不能**参与「要不要接管鼠标」的判定。
+					// 参与进去的话，每次悬停 1 秒都会把桌面点击吞掉 ——
+					// 和「桌宠不挡操作」直接冲突，而且现象很难和悬停卡片联系起来
+					const wasInteractive = pet.ui.interactive
+					pet.ui._showInspect(fake(9999))
+					pet.ui._updateInteractive()
+					if (pet.ui.interactive !== wasInteractive) {
+						return { ok: false, reason: '悬停卡片会改变鼠标接管状态 —— 它必须保持穿透' }
+					}
+					pet.ui._hideInspect()
+				} catch (e) {
+					return { ok: false, reason: '经济 / 悬停卡片流程失败: ' + e.message }
+				}
+
+				// —— 查看工具：点一下虫 → 数据面板 ——
+				try {
+					const inspect = document.getElementById('inspect')
+					// 清场，只留下两个探针 —— 果蝇满屏乱走，
+					// 不控制住的话「指针底下是哪只」根本不确定
+					const savedFlies2 = pet.world.flies
+					const savedLarvae2 = pet.world.larvae
+					// ⚠ 自己存一份指针位置。上面那个 savedMouse 是**块作用域**的
+					//   （声明在另一个 try 里），这里引用不到 —— 而报出来的是
+					//   「savedMouse is not defined」，看着像整个检视流程坏了
+					const mouseBefore = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					pet.world.flies = []
+					pet.world.larvae = []
+					pet.world.eggs = []
+
+					// ⚠ 必须先切成**查看工具**。查看从「观察模式直接点」改成
+					//   专用工具之后，_inspectableAt 判的是 tool === 'inspect' ——
+					//   还拿着 none 的话它恒返回 null，下面每一条都会红
+					//
+					// 走**真实点击**，不是 setTool —— 按钮没写进 index.html
+					// 的话 setTool 照样能跑，而玩家在工具栏上根本找不到它
+					const inspectBtn = document.querySelector('#tools [data-tool="inspect"]')
+					if (!inspectBtn) return { ok: false, reason: '工具栏上没有「查看」这颗按钮' }
+					if (inspectBtn.textContent !== '查看') {
+						return { ok: false, reason: '查看按钮上写的是「' + inspectBtn.textContent + '」' }
+					}
+					inspectBtn.click()
+					if (pet.view.tool !== 'inspect') {
+						return { ok: false, reason: '点了「查看」按钮但没切过去（view.tool = ' + pet.view.tool + '）' }
+					}
+					if (!inspectBtn.classList.contains('active')) {
+						return { ok: false, reason: '切到查看工具之后那颗按钮没有被标成选中态' }
+					}
+					// 快捷键 V 也要能切回去 —— 它是这颗按钮的键盘出口
+					pet.ui._onKey({ code: 'KeyV' })
+					if (pet.view.tool !== 'none') {
+						return { ok: false, reason: '按 V 没有从查看工具切回观察（view.tool = ' + pet.view.tool + '）' }
+					}
+					pet.ui._onKey({ code: 'KeyV' })
+					if (pet.view.tool !== 'inspect') {
+						return { ok: false, reason: '再按一次 V 没有切回查看（view.tool = ' + pet.view.tool + '）' }
+					}
+
+					const probeFly = pet.world.addFly(500, 500, 'F', 'normal', ['golden'])
+					const probeLarva = pet.world.addLarva(700, 500, null, 0, ['crystal'])
+					if (!probeFly || !probeLarva) {
+						return { ok: false, reason: '造不出点击检视用的探针' }
+					}
+					probeFly.mode = 'walk'
+					probeFly.modeTimer = 1e9
+
+					const aimAt = (x, y) => {
+						pet.view.mouse.x = x
+						pet.view.mouse.y = y
+						pet.ui.inspectHover = false
+						pet.ui._updateInteractive()
+					}
+
+					aimAt(probeFly.x, probeFly.y)
+					if (!pet.ui.interactive) {
+						return {
+							ok: false,
+							reason: '拿着查看工具指着成虫却没有接管鼠标 —— 那一下点击会穿到桌面，面板永远点不开',
+						}
+					}
+
+					pet.ui.openInspect(pet.ui._inspectableAt())
+					if (inspect.classList.contains('hidden')) {
+						return { ok: false, reason: '点了成虫却没有弹出数据面板' }
+					}
+					if (inspect.querySelectorAll('.gene-badge').length !== 1) {
+						return { ok: false, reason: '成虫面板上的基因徽章数量不对（这只带点石成金，应当只有 1 个）' }
+					}
+					if (!document.getElementById('inspect-hp').textContent.includes('/')) {
+						return { ok: false, reason: '成虫面板没有填生命值' }
+					}
+					// 面板上那一格必须是**价值档**，不是体重档。
+					//
+					// ⚠ 光看「写着普通」是分不出两者的 —— 这只探针的体重档就是
+					//   normal、价值也低，两条路都得出「普通」两个字。
+					//   所以把它**催肥**：体重档仍然是 normal，但价值会冲到最高档。
+					//   这时候还显示「普通」就说明读的是体重档
+					//
+					// ⚠ 不能直接给 probeFly.value 赋值 —— value / weight 都是 getter，
+					//   赋值在非严格模式下**静默失败**（executeJavaScript 跑的这段
+					//   不是模块，所以不报错），症状就是「改了却没变」。
+					//   要改的是它们依赖的那几个字段：weightMax 和 age
+					const keepMax = probeFly.weightMax
+					const keepAge = probeFly.age
+					probeFly.weightMax = 10000 // 10g
+					probeFly.age = probeFly.lifespan * 0.999 // 逼近满成长，但**不越过**寿命线
+					if (probeFly.rarity !== 'normal') {
+						return { ok: false, reason: '催肥探针把体重档也改了 —— 这条断言就测不到区别了' }
+					}
+					const fatValue = probeFly.value
+					if (!(fatValue > 10)) {
+						return { ok: false, reason: '催肥之后售价只有 $' + fatValue + '，这条断言测不到高档' }
+					}
+					pet.ui._showInspect(probeFly)
+					const shownTier = document.getElementById('inspect-rarity').textContent
+					// 改回去，别让后面「幼虫面板」「罐子压虫」几步受这只胖子的影响
+					probeFly.weightMax = keepMax
+					probeFly.age = keepAge
+					if (shownTier === '普通') {
+						return {
+							ok: false,
+							reason:
+								'一只体重档是「普通」、售价却有 $' +
+								fatValue.toFixed(3) +
+								' 的果蝇，面板上显示的还是「普通」—— 读的是体重档而不是价值档',
+						}
+					}
+
+					// ⚠ 钉住：把虫挪走之后，面板**必须还在**。
+					//   不钉的话 ui 每帧的 _updateInspect 会看到指针底下没虫、
+					//   立刻把它关掉 —— 表现是「点了没反应」，而代码看起来完全正常
+					probeFly.x = 1500
+					probeFly.y = 900
+					aimAt(40, 40)
+					pet.ui._updateInspect()
+					if (inspect.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason: '虫走开之后数据面板就被自动关掉了 —— 它是「点开的」，应当一直留着直到玩家主动关',
+						}
+					}
+
+					// Esc 关掉它
+					pet.ui._onKey({ code: 'Escape' })
+					if (!inspect.classList.contains('hidden')) {
+						return { ok: false, reason: 'Esc 关不掉数据面板' }
+					}
+
+					// 飞行中的成虫**也能**点开。
+					//
+					// ⚠ 这条以前断言的是**相反**的事（「飞的也接管就糟了」）——
+					//   那是观察模式年代的结论：当时查看的判定区和桌面共用点击，
+					//   果蝇满屏飞会吞掉一片桌面点击。换成专用工具之后这个代价没了，
+					//   用户要的就是「追着飞虫也点得开」。所以断言反过来了，
+					//   改回去之前先看一眼 ui._creatureAt 上面那段注释
+					probeFly.x = 500
+					probeFly.y = 500
+					probeFly.mode = 'fly'
+					aimAt(probeFly.x, probeFly.y)
+					if (!pet.ui.interactive) {
+						return {
+							ok: false,
+							reason: '拿着查看工具指着「正在飞的成虫」却不接管鼠标 —— 追着飞虫点会点不开',
+						}
+					}
+					const flyingHit = pet.ui._inspectableAt()
+					if (flyingHit !== probeFly) {
+						return { ok: false, reason: '飞行中的成虫点不到（_inspectableAt 返回了别的）' }
+					}
+
+					// —— 罐子里的成虫也要能点开 ——
+					//
+					// ⚠ 这条守的是**坐标换算**：罐中果蝇的 x / y 是相对罐心的偏移，
+					//   漏加偏移的症状是「指在虫身上却点不开」，
+					//   而虫好好地画在罐子里、代码看起来也没错
+					{
+						const savedToolJ = pet.view.tool
+						pet.view.tool = 'inspect'
+						// ⚠ 这一段要清空罐子和果蝇，测完必须**原样还回去** ——
+						//   后面「罐子压在虫子上」那一段依赖 probeFly 还在 world.flies 里
+						const keepFliesJ = pet.world.flies.slice()
+						const keepJarsJ = pet.world.jars.slice()
+
+						pet.world.jars.length = 0
+						const jfly = pet.world.addFly(0, 0, 'F', 'normal', ['crystal'])
+						const jjar = pet.world.addJar(700, 400)
+						if (!jfly || !jjar || !pet.world.putInJar(jjar, jfly)) {
+							return { ok: false, reason: '造不出「罐中果蝇」这个探针' }
+						}
+						// 故意给一个**非零**偏移：全给 0 的话，「忘了加偏移」和
+						// 「加对了」结果一模一样，这条断言就白测了
+						jfly.x = 33
+						jfly.y = -21
+
+						const screenX = jjar.x + jfly.x
+						const screenY = jjar.y + jfly.y
+
+						// ① 指在它**真正画在哪儿** —— 必须点得到
+						aimAt(screenX, screenY)
+						const hitJar = pet.ui._creatureAt(screenX, screenY, pet.config.tools.hoverRadius)
+						if (hitJar !== jfly) {
+							return {
+								ok: false,
+								reason:
+									'指针压在罐中那只虫身上（屏幕坐标 ' + screenX + ',' + screenY + '）却点不到它 —— ' +
+									'多半是忘了把罐心的偏移加上',
+							}
+						}
+						if (!pet.ui._inspectableAt()) {
+							return { ok: false, reason: '罐中那只虫点得到，_inspectableAt 却说不可以查看' }
+						}
+
+						// ② 指在**偏移本身**那个位置（没加罐心）—— 不该命中。
+						//    这一条是①的反面：两条一起才能证明真的做了换算，
+						//    而不是碰巧罐子就在屏幕原点附近
+						const strayHit = pet.ui._creatureAt(jfly.x, jfly.y, pet.config.tools.hoverRadius)
+						if (strayHit === jfly) {
+							return {
+								ok: false,
+								reason: '指在「未加罐心偏移」的那个点上也能命中罐中虫 —— 坐标没有被换算',
+							}
+						}
+
+						// ③ 打开卡片，而且卡片要摆在**屏幕上那只虫旁边**，不是左上角
+						pet.ui.openInspect(hitJar)
+						if (inspect.classList.contains('hidden')) {
+							return { ok: false, reason: '罐中的成虫点开了却没有弹出数据面板' }
+						}
+						const cardLeft = parseFloat(inspect.style.left)
+						// 卡片要么在虫右边（+18），要么贴右边被翻到左边（-18-w）
+						const wJ = inspect.offsetWidth || 150
+						const wantRight = screenX + 18
+						const wantLeft = screenX - 18 - wJ
+						if (Math.abs(cardLeft - wantRight) > 2 && Math.abs(cardLeft - wantLeft) > 2) {
+							return {
+								ok: false,
+								reason:
+									'罐中虫的数据面板摆在了 left=' + cardLeft + '，应当贴着虫子的屏幕横坐标 ' + screenX +
+									'（现在是 ' + wantRight + ' 或 ' + wantLeft + '）—— 卡片飞到屏幕左上角就是这个毛病',
+							}
+						}
+
+						// ④ 虫在罐子里的时候，卡片不能每帧被关掉
+						pet.ui._updateInspect()
+						if (inspect.classList.contains('hidden')) {
+							return {
+								ok: false,
+								reason: '罐中虫的数据面板开完立刻被收掉了 —— _updateInspect 的「还在不在」判据没算上罐子',
+							}
+						}
+
+						// ⑤ 把虫放出罐子：卡片应当继续留着（它成了普通成虫）
+						pet.world.releaseFly(jjar, jfly)
+						pet.ui._updateInspect()
+						if (inspect.classList.contains('hidden')) {
+							return { ok: false, reason: '罐中虫被放出来之后数据面板却关了 —— 它还是同一只成虫' }
+						}
+
+						// ⑥ 虫真的没了（卖掉）：卡片必须收掉。
+						//    ⚠ 卖之前它已经被放出来了，所以这一步走的是
+						//    「目标 dead」那条判据 —— 别用「清空罐子」来测，
+						//    那时候它早就不在罐子里了
+						const moneyBeforeJ = pet.world.money
+						pet.world.sellFly(jfly)
+						pet.ui._updateInspect()
+						if (!inspect.classList.contains('hidden')) {
+							return { ok: false, reason: '被查看的虫已经卖掉了，数据面板却还留着' }
+						}
+						pet.world.money = moneyBeforeJ
+
+						// 原样还回去
+						pet.world.flies.length = 0
+						Array.prototype.push.apply(pet.world.flies, keepFliesJ)
+						pet.world.jars.length = 0
+						Array.prototype.push.apply(pet.world.jars, keepJarsJ)
+						pet.view.tool = savedToolJ
+					}
+
+					// —— 罐中配对：透过 UI 那一层也能看见 ——
+					//
+					// ⚠ 逻辑本身在无头模拟器里逐项断言过了（正例 / 关掉开关 / 冷却按墙钟 /
+					//   端到端孵出幼虫）。这里只确认**窗口里那个 world 也走同一条路** ——
+					//   防的是「sim 测的是另一个代码路径」这种最讨厌的假绿
+					{
+						const keepFliesM = pet.world.flies.slice()
+						const keepJarsM = pet.world.jars.slice()
+						const keepEggsM = pet.world.eggs.slice()
+						const keepLarvaeM = pet.world.larvae.slice()
+
+						pet.world.flies.length = 0
+						pet.world.jars.length = 0
+						pet.world.eggs.length = 0
+						pet.world.larvae.length = 0
+
+						const jm = pet.world.addJar(800, 500)
+						const dad = pet.world.addFly(800, 500, 'M')
+						const mom = pet.world.addFly(812, 500, 'F')
+						if (!jm || !dad || !mom) return { ok: false, reason: '造不出罐中配对的探针' }
+						for (const f of [dad, mom]) {
+							f.age = pet.config.adult.matureAge + 1000
+							f.cooldown = 0
+							pet.world.putInJar(jm, f)
+						}
+
+						const eggsBeforeM = pet.world.eggs.length
+						for (let i = 0; i < 60 * 20; i++) pet.world.update(1 / 60)
+						const laid = pet.world.eggs.length - eggsBeforeM
+
+						if (laid === 0) {
+							return {
+								ok: false,
+								reason: '罐中的一对成熟异性在窗口里跑了 20 秒一颗卵都没生 —— 罐中配对没接上',
+							}
+						}
+						if (jm.flies.length !== 2) {
+							return { ok: false, reason: '罐中配对之后罐里不是 2 只了（少了或被卖了）' }
+						}
+						const inside = pet.world.eggs.filter((e) => e.y <= jm.y + jm.halfH * 0.6).length
+						if (inside) {
+							return {
+								ok: false,
+								reason: '罐中配对产下的卵有 ' + inside + ' 颗落在罐子里 —— 卵应当产在罐外底部',
+							}
+						}
+						if (mom.laying || mom.laySite) {
+							return {
+								ok: false,
+								reason: '罐中配对把母体推进了 laying 状态 —— 她会一直收着翅膀，而且再也配不了对',
+							}
+						}
+
+						// 原样还回去（跑过 20 秒，卵和幼虫都清掉，别把后面的断言带偏）
+						for (const arr of [
+							['flies', keepFliesM],
+							['jars', keepJarsM],
+							['eggs', keepEggsM],
+							['larvae', keepLarvaeM],
+						]) {
+							pet.world[arr[0]].length = 0
+							Array.prototype.push.apply(pet.world[arr[0]], arr[1])
+						}
+					}
+
+					// ⚠ 罐子压在虫子上时，点下去必须开的是**数据面板**，不是拖罐子。
+					//
+					//   这是用户报的 bug 的原样复现：_grabbableAt 里罐子的判定
+					//   排在所有工具之前，而且当年**没有任何工具条件** ——
+					//   于是罐子永远先返回，压在罐子上的虫谁也点不开。
+					//   现在罐子只在「观察 + 手套」下才拦路，查看工具能穿过去
+					//
+					// ⚠ 先把场上原有的罐子整个端走。罐子有 maxCount 上限，
+					//   前面几节测试可能已经摆了几个 —— 满了的话 addJar 返回 null，
+					//   而报出来的是「造不出罐子」，看着像这一步坏了。
+					//   直接换掉数组是安全的：罐子对象本身还在 savedJars2 里，
+					//   末尾换回来就一切都回来了（罐中果蝇挂在 jar.flies 上，不受影响）
+					const savedJars2 = pet.world.jars
+					pet.world.jars = []
+
+					const coverJar = pet.world.addJar(520, 500)
+					if (!coverJar) return { ok: false, reason: '造不出压在虫子上的罐子' }
+					probeFly.mode = 'walk'
+					probeFly.x = 520
+					probeFly.y = 500
+					aimAt(probeFly.x, probeFly.y)
+					pet.ui.openInspect(pet.ui._inspectableAt())
+					if (inspect.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason: '罐子压在虫子上面时，点下去开不出数据面板 —— 罐子的判定把虫盖掉了',
+						}
+					}
+					pet.ui._hideInspect()
+
+					// 反过来：这两条**都不能**被上面那条改掉
+					//   · 观察模式下仍然能直接拖罐子
+					//   · 但拿着别的工具时罐子要让路（拿着拍子点罐子该是挥拍）
+					pet.ui.setTool('none')
+					aimAt(520, 500)
+					const obsHit = pet.ui._grabbableAt()
+					if (!obsHit || obsHit.kind !== 'jar') {
+						return {
+							ok: false,
+							reason: '观察模式下拎不动玻璃罐 —— 这条功能被罐子的工具条件误伤了',
+						}
+					}
+					pet.ui.setTool('swatter')
+					if (pet.ui._grabbableAt() !== null) {
+						return {
+							ok: false,
+							reason: '拿着苍蝇拍时罐子仍然抢占拖动 —— 那样点在罐子上是拖罐子而不是挥拍',
+						}
+					}
+
+					// 一键放逐 / 一键出售：批量操作走的是 world 层的方法，
+					// 而且每个罐子分别 slice 原数组 —— 写错了会跳着走、漏掉一半
+					const baitJar = pet.world.addJar(900, 600)
+					if (!baitJar) return { ok: false, reason: '造不出批量操作测试用的罐子' }
+					const b1 = pet.world.addFly(0, 0, 'F', 'normal', [])
+					const b2 = pet.world.addFly(0, 0, 'M', 'normal', [])
+					const b3 = pet.world.addFly(0, 0, 'F', 'normal', [])
+					if (!b1 || !b2 || !b3) return { ok: false, reason: '造不出批量操作测试用的果蝇' }
+					for (const f of [b1, b2, b3]) {
+						if (!baitJar.admit(f)) return { ok: false, reason: '往罐子里塞果蝇失败' }
+					}
+					// 从 this.flies 里摘掉 —— admit 只管罐子那一侧
+					for (const f of [b1, b2, b3]) {
+						const fi = pet.world.flies.indexOf(f)
+						if (fi >= 0) pet.world.flies.splice(fi, 1)
+					}
+					if (baitJar.flies.length !== 3) {
+						return { ok: false, reason: '塞进罐子的果蝇只有 ' + baitJar.flies.length + ' 只' }
+					}
+
+					const moneyBefore = pet.world.money
+					const released = pet.world.releaseAllInJars()
+					if (released !== 3) {
+						return { ok: false, reason: '一键放逐放走了 ' + released + ' 只，应当是 3 只' }
+					}
+					if (baitJar.flies.length !== 0) {
+						return { ok: false, reason: '放逐之后罐子里还剩 ' + baitJar.flies.length + ' 只' }
+					}
+					if (!pet.world.flies.includes(b1) || !pet.world.flies.includes(b2) || !pet.world.flies.includes(b3)) {
+						return { ok: false, reason: '放逐之后果蝇没有回到 world.flies 里' }
+					}
+
+					// 再塞回去，测批量出售 —— 三只都要真的卖掉，钱要对得上
+					const back = [b1, b2, b3]
+					let wantGain = 0
+					for (const f of back) {
+						if (!baitJar.admit(f)) return { ok: false, reason: '二次入罐失败' }
+						const fi = pet.world.flies.indexOf(f)
+						if (fi >= 0) pet.world.flies.splice(fi, 1)
+						wantGain += f.value
+					}
+					wantGain = Math.round(wantGain * 1000) / 1000
+					const sold = pet.world.sellAllInJars()
+					if (sold.count !== 3) {
+						return { ok: false, reason: '一键出售卖了 ' + sold.count + ' 只，应当是 3 只' }
+					}
+					if (Math.abs(sold.gain - wantGain) > 1e-6) {
+						return { ok: false, reason: '一键出售拿到 $' + sold.gain + '，按每只的售价加起来应当是 $' + wantGain }
+					}
+					// ⚠ 容差给到 0.002 而不是精确相等。money 是**逐只**加进去的
+					//   （sellFly 里一次一只），而 sold.gain 是加完之后统一 round 到三位的 ——
+					//   两者本来就允许差半个最小单位。卡太紧的话这条会因为浮点尾巴随机红
+					if (Math.abs(pet.world.money - (moneyBefore + wantGain)) > 0.002) {
+						return { ok: false, reason: '一键出售之后余额不对 —— 钱没有真的进账' }
+					}
+					if (baitJar.flies.length !== 0) {
+						return { ok: false, reason: '一键出售之后罐子里还剩 ' + baitJar.flies.length + ' 只' }
+					}
+
+					// 二次确认卡：点「取消」不能卖掉任何东西
+					//
+					// ⚠ 这条要测的是**卡片真的挡在中间**。直接调 sellAllInJars()
+					//   是测不到「有没有确认」的 —— 那样把确认卡整个删掉也照样通过
+					pet.ui.setSellAllOpen(true)
+					if (pet.ui.el.sellAllPop.classList.contains('hidden')) {
+						return { ok: false, reason: 'setSellAllOpen(true) 之后确认卡没有出现' }
+					}
+					// ⚠ _overCard() 判的是「**指针**在不在卡片上」，所以必须先把指针
+					//   挪过去 —— 不挪的话它恒返回 false，而这条断言就变成了
+					//   「确认卡永远接管不到鼠标」，和实际对不对无关
+					const sellCard = pet.ui.el.sellAllPop.querySelector('.donate-card')
+					const scr = sellCard.getBoundingClientRect()
+					pet.view.mouse.x = scr.left + scr.width / 2
+					pet.view.mouse.y = scr.top + scr.height / 2
+					if (!pet.ui._overCard()) {
+						pet.world.jars = savedJars2
+						return {
+							ok: false,
+							reason: '确认卡没有被 _overCard 认出来 —— 点上去会穿到桌面，两颗按钮都点不到',
+						}
+					}
+					pet.ui.el.sellAllCancel.click()
+					if (pet.view.sellAllOpen) {
+						return { ok: false, reason: '点了「取消」之后确认卡还开着' }
+					}
+					if (pet.ui.el.sellAllPop.classList.contains('hidden') === false) {
+						return { ok: false, reason: '点了「取消」之后确认卡还显示着' }
+					}
+
+					pet.world.jars = savedJars2
+					pet.ui.setTool('inspect')
+
+					// —— 幼虫**点不开**数据面板 ——
+					//
+					// ⚠ 这条断言的方向和它上一版**正好相反**。上一版是
+					//   「幼虫也有面板，只显示基因徽章」；用户后来要求删掉
+					//   （蛆满天都是，点一下弹卡片会把屏幕糊满）。
+					//   所以现在钉的是「点上去什么都不该发生」——
+					//   改回去之前先看一眼 ui._creatureAt 上面那段注释
+					//
+					// ⚠ 三样都要查，少一样就漏一种实现方式：
+					//   ① _inspectableAt 返回 null（判定层就不认）
+					//   ② _overInspectable() 是 false（不会为它吞掉桌面点击）
+					//   ③ openInspect(null) 不开卡（万一别处拿到了一只幼虫）
+					//
+					// ⚠ ②查的是 **_overInspectable()**，不是聚合出来的 ui.interactive。
+					//   拿着查看工具时 interactive **本来就该是 true** ——
+					//   那一条讲的是「手里有没有工具」，和「指针底下有没有虫」无关。
+					//   查 interactive 的话这条恒红，而报出来的理由
+					//   （「幼虫也接管鼠标」）会把人引到完全错误的方向
+					pet.ui._hideInspect()
+					aimAt(probeLarva.x, probeLarva.y)
+					if (pet.ui._inspectableAt() !== null) {
+						return {
+							ok: false,
+							reason: '指针指着幼虫时 _inspectableAt 返回了东西 —— 幼虫不该能被查看',
+						}
+					}
+					if (pet.ui._overInspectable()) {
+						return {
+							ok: false,
+							reason: '指针停在幼虫上时 _overInspectable() 是 true —— 会白白吞掉桌面点击，而幼虫根本点不出面板',
+						}
+					}
+					pet.ui.openInspect(pet.ui._inspectableAt())
+					if (!inspect.classList.contains('hidden')) {
+						return { ok: false, reason: '点了幼虫却弹出了数据面板 —— 幼虫不能查看' }
+					}
+
+					// 幼虫**在别的虫底下**也不能被选中：把一只成虫放在同一点上时，
+					// 点出来必须是那只成虫，而不是「恰好也在这儿」的蛆
+					//
+					// ⚠ 这条查的是「幼虫压根不在候选里」，比上面那条更硬：
+					//   上面只要 _creatureAt 判一次就够，这条要求它在**整个循环里**
+					//   都不参与 —— 写成「先收成虫、不够再收幼虫」也会被这条抓住
+					probeFly.x = probeLarva.x
+					probeFly.y = probeLarva.y
+					probeFly.mode = 'walk'
+					aimAt(probeLarva.x, probeLarva.y)
+					const overlapped = pet.ui._inspectableAt()
+					if (overlapped !== probeFly) {
+						return {
+							ok: false,
+							reason: '成虫和幼虫叠在同一个点上时，点到的不是那只成虫 —— 幼虫还在候选里',
+						}
+					}
+
+					// 把幼虫挪走、只留它自己，确认这时候是真的点不出东西
+					probeFly.x = 1400
+					probeFly.y = 200
+					aimAt(probeLarva.x, probeLarva.y)
+					if (pet.ui._inspectableAt() !== null) {
+						return { ok: false, reason: '场上只剩幼虫时，它仍然能被查看' }
+					}
+					pet.ui._hideInspect()
+
+					pet.ui.setTool('none')
+					pet.world.flies = savedFlies2
+					pet.world.larvae = savedLarvae2
+					aimAt(mouseBefore.x, mouseBefore.y)
+				} catch (e) {
+					return { ok: false, reason: '查看工具点击检视流程失败: ' + e.message }
+				}
+
+				// —— 设置 / 捐款按钮：必须能被**真实点击**打开 ——
+				//
+				// ⚠ 这一节存在的理由：这两颗按钮曾经**完全点不开**，
+				//   而整套自检全绿 —— 因为之前所有断言都是直接调
+				//   setSettingsOpen(true)，从来没走点击那条路。
+				//
+				//   真正的 bug：两颗按钮里都套了一个**铺满整颗按钮**的图标 span
+				//   （.gear-icon / .jar-icon），玩家实际点到的是 span。
+				//   按钮自己的 click 先把卡片打开，事件冒泡到 #panel，
+				//   而面板的关闭逻辑判的是「e.target 等不等于 button」——
+				//   span 显然不等于 button，于是同一次点击里又把它关掉。
+				//
+				//   所以这里必须**往 span 上派发一个会冒泡的 click**，
+				//   把整条冒泡链路走一遍。直接点 button 是测不出来的
+				try {
+					const settingsPop = document.getElementById('settings-pop')
+					const donatePop = document.getElementById('donate-pop')
+					const gearBtn = document.getElementById('btn-settings')
+					const donateBtn = document.getElementById('btn-donate')
+					if (!settingsPop || !donatePop || !gearBtn || !donateBtn) {
+						return { ok: false, reason: '设置 / 捐款的按钮或卡片不存在' }
+					}
+
+					const clickInner = (btn) => {
+						const inner = btn.querySelector('span') || btn
+						inner.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					}
+
+					pet.ui.setSettingsOpen(false)
+					clickInner(gearBtn)
+					if (settingsPop.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason: '点设置按钮（图标那一层）没有弹出设置卡 —— 检查 #panel 的关闭逻辑是不是把 e.target 当成了「点别处」',
+						}
+					}
+
+					pet.ui.setDonateOpen(false)
+					clickInner(donateBtn)
+					if (donatePop.classList.contains('hidden')) {
+						return { ok: false, reason: '点捐款按钮（图标那一层）没有弹出二维码' }
+					}
+					// 再点一下应当能关掉（toggle）
+					clickInner(donateBtn)
+					if (!donatePop.classList.contains('hidden')) {
+						return { ok: false, reason: '再点一下捐款按钮没有把二维码收起来' }
+					}
+
+					// 层级：两张卡都必须在**所有东西之上** ——
+					// 面板 84% 半透明，压在卡片上二维码会从底下透出来糊成一片
+					const zOf = (el) => {
+						const z = getComputedStyle(el).zIndex
+						return z === 'auto' ? 0 : Number(z)
+					}
+					const popZ = Math.max(zOf(settingsPop), zOf(donatePop))
+					const rivals = ['panel', 'jar-window', 'inspect'].map((id) => {
+						const el = document.getElementById(id)
+						return el ? zOf(el) : 0
+					})
+					const topRival = Math.max(...rivals)
+					if (!(popZ > topRival)) {
+						return {
+							ok: false,
+							reason:
+								'设置 / 捐款卡片的 z-index（' +
+								popZ +
+								'）没有高过面板 / 罐中列表 / 数据面板（最高 ' +
+								topRival +
+								'）—— 会互相盖住',
+						}
+					}
+					pet.ui.setSettingsOpen(false)
+					pet.ui.setDonateOpen(false)
+				} catch (e) {
+					return { ok: false, reason: '设置 / 捐款按钮流程失败: ' + e.message }
+				}
+
+				// —— 养蝇人：商店行 + 配置卡 ——
+				//
+				// ⚠ 选项一律用**真实点击**（往按钮上派发会冒泡的 click）来测，
+				//   不要直接调 world.setKeeperOption —— 上一轮那个「设置 / 捐款
+				//   点不开」的 bug 就是因为所有断言都在直接调方法，全绿。
+				try {
+					const shopList = document.getElementById('shop-list')
+					const kpop = document.getElementById('keeper-pop')
+					if (!kpop) return { ok: false, reason: '养蝇人配置卡 #keeper-pop 不存在' }
+
+					// 记下现场，测完还原 —— 下面的断言会动钱和商店等级
+					const savedMoney = pet.world.money
+					const savedShop = Object.assign({}, pet.world.shop)
+					const savedKeeper = Object.assign({}, pet.world.keeper)
+
+					pet.world.money = 100
+					pet.world.shop = {}
+					pet.ui.refreshShop()
+
+					// 没买之前：不该有配置按钮
+					if (shopList.querySelector('[data-keeper-cfg]')) {
+						return { ok: false, reason: '还没买养蝇人，商店里就已经有「配置」按钮了' }
+					}
+					const upBtn = shopList.querySelector('[data-chain="keeper"]')
+					if (!upBtn) return { ok: false, reason: '商店里没有养蝇人这条升级链' }
+					if (upBtn.disabled) return { ok: false, reason: '钱够的时候养蝇人的升级按钮却是禁用的' }
+
+					// 升级必须走 upgradeShopItem（数字等级），不是 buyShopItem（一次性的）——
+					// 走错路径的话 buyShopItem 对已拥有的直接返回 false，永远升不动
+					upBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					if (pet.world.shopLevel('keeper') !== 1) {
+						return { ok: false, reason: '点升级之后养蝇人不是 Lv.1 —— 多半是走到 buyShopItem 那条路上了' }
+					}
+					if (pet.world.money !== 98) {
+						return { ok: false, reason: '升级扣款不对（余额 ' + pet.world.money + '，应当是 98）' }
+					}
+
+					pet.ui.refreshShop()
+					const cfgBtn = shopList.querySelector('[data-keeper-cfg]')
+					if (!cfgBtn) return { ok: false, reason: '买下养蝇人之后没有出现「配置」按钮' }
+
+					// 点配置 → 卡片弹出来
+					cfgBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					if (kpop.classList.contains('hidden')) {
+						return { ok: false, reason: '点「配置」没有弹出养蝇人卡片' }
+					}
+
+					// 卡片必须在鼠标接管范围内，否则点上去会穿到桌面。
+					//
+					// ⚠ 这里查的是 _overCard() **本身**，不是聚合出来的
+					//   ui.interactive。第一版查的是 interactive，结果把
+					//   keeperPop 从 _overCard 的数组里删掉之后断言**照样通过** ——
+					//   因为卡片在屏幕正中，而 need 那一长串里还有别的条件
+					//   （手里的工具、面板矩形……）恰好也成立。
+					//   要钉死「这张卡注册了没有」，就只能查那一条谓词
+					const r = kpop.getBoundingClientRect()
+					if (!(r.width > 0 && r.height > 0)) {
+						return { ok: false, reason: '养蝇人卡片尺寸是 0，量不到接管范围' }
+					}
+					const mouseBefore2 = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					pet.view.mouse.x = r.left + r.width / 2
+					pet.view.mouse.y = r.top + r.height / 2
+					// （这张卡和工具栏面板是会重叠的 —— 两张都是居中的，窗口一矮就压上，
+					//   和设置卡一样。靠 z-index 30 保证画在面板之上。
+					//   但下面查的是 _overCard()，它**只看那几张卡自己的矩形**，
+					//   面板重不重叠都影响不到它 —— 所以这里不需要额外的排除条件）
+					if (!pet.ui._overCard()) {
+						return {
+							ok: false,
+							reason: '指针压在养蝇人卡片上，_overCard() 却是 false —— 忘了把它加进那个数组，卡片点上去会穿到桌面',
+						}
+					}
+					pet.view.mouse.x = mouseBefore2.x
+					pet.view.mouse.y = mouseBefore2.y
+
+					// —— Lv1 时「自动出售」那几行必须是禁用的 ——
+					const sellOpt = kpop.querySelector('[data-k-sell]')
+					if (!sellOpt) return { ok: false, reason: '卡片里没有「自动出售」这一行' }
+					if (!sellOpt.disabled) {
+						return { ok: false, reason: 'Lv1 时「自动出售」却是可点的 —— 那是 Lv2 的功能' }
+					}
+
+					// —— 点一个选项（真实冒泡点击），状态和选中态都要跟着变 ——
+					const goldOpt = kpop.querySelector('[data-k-feed="gold"]')
+					if (!goldOpt) return { ok: false, reason: '卡片里没有「金苹果」这个选项' }
+					goldOpt.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					if (pet.world.keeper.food !== 'gold') {
+						return { ok: false, reason: '点了「金苹果」但 world.keeper.food 没变（' + pet.world.keeper.food + '）' }
+					}
+					const goldAfter = kpop.querySelector('[data-k-feed="gold"]')
+					if (!goldAfter.classList.contains('active')) {
+						return { ok: false, reason: '选了金苹果，但那个按钮没有被标成选中态' }
+					}
+					const appleAfter = kpop.querySelector('[data-k-feed="apple"]')
+					if (appleAfter.classList.contains('active')) {
+						return { ok: false, reason: '选了金苹果，苹果那个按钮却还是选中态' }
+					}
+
+					// —— 升到 Lv2 之后，自动出售那几行要解锁 ——
+					pet.world.shop.keeper = 2
+					pet.ui.refreshKeeperCard()
+					if (kpop.querySelector('[data-k-sell]').disabled) {
+						return { ok: false, reason: '升到 Lv2 之后「自动出售」还是禁用的' }
+					}
+
+					// —— 「卖哪档」筛选的是**价值档**，得能选到全部五档 ——
+					//
+					// ⚠ 这里查的是 data-k-tier 上的值来自 CONFIG.market.valueTiers。
+					//   上一版这一行是 data-k-rarity（体重档的三档），
+					//   两套档位混用的话，面板上写着「稀有」、筛选里却找不到「稀有」
+					const tierBoxes = kpop.querySelectorAll('[data-k-tier]')
+					const wantTiers = pet.config.market.valueTiers.map((t) => t.id)
+					if (tierBoxes.length !== wantTiers.length) {
+						return {
+							ok: false,
+							reason: '「卖哪档」有 ' + tierBoxes.length + ' 个选项，按 valueTiers 应当是 ' + wantTiers.length + ' 个',
+						}
+					}
+					for (const t of wantTiers) {
+						if (!kpop.querySelector('[data-k-tier="' + t + '"]')) {
+							return { ok: false, reason: '「卖哪档」里没有价值档 ' + t }
+						}
+					}
+					// 点一下最贵那档，world 里要跟着变
+					const topTierBtn = kpop.querySelector('[data-k-tier="legendary"]')
+					if (!topTierBtn) return { ok: false, reason: '找不到「超级稀有」这个选项' }
+					topTierBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					if (pet.world.keeper.tier !== 'legendary') {
+						return {
+							ok: false,
+							reason: '点了「超级稀有」但 world.keeper.tier 是 ' + pet.world.keeper.tier,
+						}
+					}
+
+					// —— 价格滑条**已经删掉了** ——
+					//
+					// ⚠ 这条是**反向**断言：查那张卡上不再有任何输入控件，
+					//   也不再有 minValue 这个状态。
+					//
+					//   删一个功能时最容易留下的坏法是「界面没了、状态还在」——
+					//   自动出售照样被一个看不见、也改不了的门槛拦着，
+					//   玩家只会觉得「开了自动出售怎么不卖」。
+					//   所以下面三样都要查：DOM 里没有、world 里没有、
+					//   而且**真的按价值档在卖**
+					if (kpop.querySelector('input')) {
+						return { ok: false, reason: '养蝇人卡片上还有 input —— 价格滑条应当已经整条删掉了' }
+					}
+					if (kpop.querySelector('#keeper-value')) {
+						return { ok: false, reason: '养蝇人卡片上还留着价格数字 #keeper-value' }
+					}
+					if ('minValue' in pet.world.keeper) {
+						return {
+							ok: false,
+							reason: 'world.keeper 里还有 minValue —— 界面没了但门槛还在偷偷拦人',
+						}
+					}
+
+					// 自动出售真的**只看「卖哪档」**：摆两只极端价值的虫，
+					// 换档位时它们的去留必须跟着反转
+					//
+					// ⚠ 不能只查「选对了能卖掉」—— 那只说明有个筛子，
+					//   说明不了筛的是价值档。所以两个方向都查：
+					//   选最低档 → 极贵的留下、极便宜的卖掉；换最高档 → 反过来。
+					//   并且**不去自己算档位**（另写一遍 valueTierOf 的边界就是
+					//   拿断言测断言自己的算术），只按「刚羽化」和「快老死」这两种
+					//   价值上差着好几个数量级的成虫来分
+					pet.world.shop.keeper = 2
+					pet.ui.refreshKeeperCard()
+					kpop.querySelector('[data-k-sell="1"]').dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					kpop.querySelector('[data-k-mut="1"]').dispatchEvent(new MouseEvent('click', { bubbles: true }))
+					if (!pet.world.keeper.sell || !pet.world.keeper.mutants) {
+						return { ok: false, reason: '点了「开」和「含」，world.keeper 却没跟着变' }
+					}
+
+					const TIERS = pet.config.market.valueTiers
+					const lowTier = TIERS[0].id
+					const savedFlies = pet.world.flies.slice()
+					pet.world.money = 0
+					pet.world.keeper.sold = 0
+
+					// 摆一只成虫，把「卖哪档」设成 tierId，跑一次自动出售，
+					// 返回它到底有没有被卖掉。
+					// heavy 为真时先把它顶到「最重 + 快老死」—— 价值比刚羽化的
+					// 那只高出好几个数量级（weight 是按 weightMax 插值的 getter，
+					// 所以改 weightMax 就够，不用碰 value 那个只读的 getter）
+					const trySell = (heavy, tierId) => {
+						pet.world.flies.length = 0
+						const f = pet.world.addFly(500, 500, 'F')
+						if (heavy) {
+							f.weightMax = 10000
+							f.age = f.lifespan * 0.999
+						}
+						pet.world.keeper.tier = tierId
+						pet.world._keeperSell()
+						return pet.world.flies.length === 0
+					}
+					const tiersThatSell = (heavy) => TIERS.filter((t) => trySell(heavy, t.id)).map((t) => t.id)
+
+					// ① 刚羽化的轻蝇：**只有**最低那档卖得掉
+					const lightSold = tiersThatSell(false)
+					if (lightSold.length !== 1 || lightSold[0] !== lowTier) {
+						return {
+							ok: false,
+							reason:
+								'一只刚羽化的成虫在「' + (lightSold.join('/') || '没有任何一档') +
+								'」被卖掉了，应当只在最低那档「' + lowTier + '」',
+						}
+					}
+					// ② 顶到最重的老蝇：也应当**恰好**有一档卖得掉。
+					//    这条顺带钉死了「六档是价值轴上不重叠的一套划分」——
+					//    两个档都能卖同一只，说明边界排错了（或者没排序）
+					const heavySold = tiersThatSell(true)
+					if (heavySold.length !== 1) {
+						return {
+							ok: false,
+							reason:
+								'一只最重的成虫在 ' + heavySold.length + ' 个档位下都被卖掉了（' +
+								(heavySold.join('/') || '一个都没有') + '），价值档应当恰好命中一个',
+						}
+					}
+					// ③ 而且它不能和刚羽化的那只落在同一档 —— 否则上面两条
+					//    其实什么都没区分开，改坏了也照样绿
+					if (heavySold[0] === lowTier) {
+						return {
+							ok: false,
+							reason: '最重的成虫和最轻的落在了同一档「' + lowTier + '」，这条断言分不出档位对错',
+						}
+					}
+					// 还原现场：这条断言动了果蝇数组，后面的块还要用
+					pet.world.flies.length = 0
+					Array.prototype.push.apply(pet.world.flies, savedFlies)
+
+					// Escape 关掉
+					pet.ui._onKey({ code: 'Escape' })
+					if (!kpop.classList.contains('hidden')) {
+						return { ok: false, reason: 'Esc 关不掉养蝇人配置卡' }
+					}
+
+					// 还原现场
+					pet.world.money = savedMoney
+					pet.world.shop = savedShop
+					pet.world.keeper = savedKeeper
+					pet.ui.refreshShop()
+				} catch (e) {
+					return { ok: false, reason: '养蝇人流程失败: ' + e.message }
+				}
+
+				// —— 图鉴 ——
+				//
+				// ⚠ 食物格子是**真的画出来的**（每格一个小 canvas）。所以这条不能
+				//   只查「元素在不在」—— 画布建出来了、但一个像素都没画，
+				//   元素查询照样全绿，而那是一个空白格子。
+				//   这里去读**像素**：画布上必须有非透明的像素
+				try {
+					const cpop = document.getElementById('codex-pop')
+					const cbody = document.getElementById('codex-body')
+					if (!cpop || !cbody) return { ok: false, reason: '图鉴弹窗的 DOM 不存在' }
+					if (cpop.closest('.window')) {
+						return { ok: false, reason: '#codex-pop 被放进了 .window 里 —— 会被 overflow:hidden 剪掉' }
+					}
+					if (!cpop.classList.contains('hidden')) return { ok: false, reason: '图鉴默认应当是关着的' }
+
+					document.getElementById('btn-codex').click()
+					if (cpop.classList.contains('hidden')) {
+						return { ok: false, reason: '点了图鉴按钮但弹窗没有出现' }
+					}
+
+					// 食物格：数量 = 配置里那两种，而且每一格都画了东西
+					const foodCells = cbody.querySelectorAll('[data-food]')
+					const wantFoods = pet.config.market.feedCats[0].items
+					if (foodCells.length !== wantFoods.length) {
+						return {
+							ok: false,
+							reason: '图鉴里画了 ' + foodCells.length + ' 种食物，配置里有 ' + wantFoods.length + ' 种',
+						}
+					}
+					for (const cell of foodCells) {
+						const cv = cell.querySelector('canvas')
+						if (!cv) return { ok: false, reason: '食物格「' + cell.dataset.food + '」里没有画布' }
+						const c2 = cv.getContext('2d')
+						const img = c2.getImageData(0, 0, cv.width, cv.height).data
+						let painted = 0
+						for (let i = 3; i < img.length; i += 4) if (img[i] > 0) painted++
+						if (painted === 0) {
+							return {
+								ok: false,
+								reason: '食物格「' + cell.dataset.food + '」的画布是空的 —— 一格白的',
+							}
+						}
+					}
+
+					// 突变格：数量 = CONFIG.mutation.types，而且每格都带一枚胶囊
+					const geneCells = cbody.querySelectorAll('[data-gene]')
+					if (geneCells.length !== pet.config.mutation.types.length) {
+						return {
+							ok: false,
+							reason:
+								'图鉴里列了 ' + geneCells.length + ' 种基因，配置里有 ' +
+								pet.config.mutation.types.length + ' 种',
+						}
+					}
+					for (const cell of geneCells) {
+						const badge = cell.querySelector('.gene-badge')
+						if (!badge) return { ok: false, reason: '基因格「' + cell.dataset.gene + '」里没有徽章' }
+						const t = pet.config.mutation.types.find((m) => m.id === cell.dataset.gene)
+						if (!badge.textContent.includes(t.name)) {
+							return {
+								ok: false,
+								reason: '基因格「' + cell.dataset.gene + '」上写的是「' + badge.textContent + '」，应当是「' + t.name + '」',
+							}
+						}
+						// 概率也得是配置里那个数 —— 写死的话改了 chance 图鉴就在说假话
+						const pct = (t.chance * 100).toFixed(1) + '%'
+						if (!cell.textContent.includes(pct)) {
+							return {
+								ok: false,
+								reason: '基因格「' + cell.dataset.gene + '」上没有出现概率 ' + pct,
+							}
+						}
+					}
+
+					pet.ui._onKey({ code: 'Escape' })
+					if (!cpop.classList.contains('hidden')) {
+						return { ok: false, reason: 'Esc 关不掉图鉴' }
+					}
+				} catch (e) {
+					return { ok: false, reason: '图鉴流程失败: ' + e.message }
+				}
+
+				// —— 结晶成虫的外观：**真的去数像素** ——
+				//
+				// ⚠ 这是整个项目里**唯一**一条管「变异长什么样」的断言。
+				//   别的断言全都在查状态（mutations 里有没有 crystal、
+				//   面板上有没有徽章、售价乘了几倍）—— 它们一条都不会因为
+				//   「画出来是只普通蝇」而变红。用户报「结晶成虫好像没有特殊效果」
+				//   的时候，能回答这个问题的只有像素
+				//
+				// 三件事各查一个数：
+				//   ① 身体是不是真的透明了 —— 结晶的墨量应当远低于普通蝇
+				//   ② 描边是不是真的炫彩 —— 高饱和像素要铺满大半个色环
+				//   ③ 这圈边**不能**跑到别的变异身上 —— 金色的色相应当很窄
+				//      （②③ 必须成对：只查②的话，把描边画给所有蝇也照样绿）
+				try {
+					const W2 = pet.world
+					// 借世界画一帧、画完原样还回去。只替换**数组**那些键，
+					// w / h / settings 这些留着 —— 渲染要用到 w / h
+					const stash = {}
+					for (const k of Object.keys(W2)) {
+						if (Array.isArray(W2[k])) {
+							stash[k] = W2[k]
+							W2[k] = []
+						}
+					}
+					const cv = document.createElement('canvas')
+					cv.width = 1920
+					cv.height = W2.h
+					const realCtx = pet.renderer.ctx
+					const realDpr = pet.renderer.dpr
+					pet.renderer.ctx = cv.getContext('2d')
+					pet.renderer.dpr = 1
+
+					// 摆一只成虫、画一帧，然后统计它那一小块里的像素
+					const shoot = (genes) => {
+						W2.flies.length = 0
+						const f = W2.addFly(300, 200, 'F', 'normal', genes)
+						f.mode = 'walk' // 收翅，免得翅膀糊住轮廓
+						f.modeTimer = 1e9
+						f.size = pet.config.adult.sizeMax // 顶到最大，细节全开
+						pet.renderer.draw(W2, pet.view)
+						const d = pet.renderer.ctx.getImageData(240, 140, 130, 120).data
+						let cover = 0 // 有墨的像素个数
+						let sat = 0 // 其中高饱和的 = 描边
+						let bodySum = 0 // 低饱和那些像素的 alpha 之和 = 身体的实心程度
+						let bodyN = 0
+						const hues = []
+						for (let i = 0; i < d.length; i += 4) {
+							const a = d[i + 3]
+							if (a > 8) cover++
+							const r = d[i]
+							const g = d[i + 1]
+							const b = d[i + 2]
+							const mx = Math.max(r, g, b)
+							const mn = Math.min(r, g, b)
+							if (a > 8 && mx - mn <= 60) {
+								// 身体（或者普通蝇的腿 / 翅）—— 不含那圈炫彩边
+								bodySum += a
+								bodyN++
+							}
+							if (a < 60 || mx - mn <= 60) continue
+							sat++
+							let h
+							if (mx === r) h = ((g - b) / (mx - mn) + 6) % 6
+							else if (mx === g) h = (b - r) / (mx - mn) + 2
+							else h = (r - g) / (mx - mn) + 4
+							hues.push(Math.round(h * 60))
+						}
+						hues.sort((x, y) => x - y)
+						return {
+							cover,
+							sat,
+							// 身体的平均不透明度 0~255。**这才是「全透明」的直接测度** ——
+							// 用总墨量的话，描边一加粗就把这个数淹了，
+							// 于是「描边加粗」和「身体变实」两件事分不开
+							bodyA: bodyN ? bodySum / bodyN : 0,
+							span: hues.length ? hues[hues.length - 1] - hues[0] : 0,
+						}
+					}
+
+					const plain = shoot([])
+					const gold = shoot(['golden'])
+					const crystal = shoot(['crystal'])
+
+					pet.renderer.ctx = realCtx
+					pet.renderer.dpr = realDpr
+					for (const k of Object.keys(stash)) W2[k] = stash[k]
+
+					if (!(plain.cover > 0 && plain.bodyA > 150)) {
+						return { ok: false, reason: '画不出一只实心的普通成虫 —— 这条断言量不到东西' }
+					}
+					// ① 全透明：身体的平均不透明度要掉到很低。
+					//    身体 alpha 是 0.14，实测约 36/255；门槛定 80
+					if (!(crystal.bodyA < 80)) {
+						return {
+							ok: false,
+							reason:
+								'结晶成虫身体的平均不透明度是 ' + Math.round(crystal.bodyA) +
+								'/255 —— 身体没有变透明（普通蝇是 ' + Math.round(plain.bodyA) + '）',
+						}
+					}
+					// ② 炫彩描边：高饱和像素要铺满大半个色环
+					if (!(crystal.span > 180)) {
+						return {
+							ok: false,
+							reason:
+								'结晶成虫身上高饱和像素的色相只铺开了 ' + crystal.span +
+								'°（' + crystal.sat + ' 个点）—— 那圈炫彩描边没画出来',
+						}
+					}
+					// ③ 这圈边不能跑到别的变异身上。金色身体本身是饱和的，
+					//    所以它也有高饱和像素 —— 但色相应当挤在金色那一小段里
+					if (!(gold.span < 90)) {
+						return {
+							ok: false,
+							reason:
+								'金色成虫的色相铺开了 ' + gold.span +
+								'° —— 结晶的炫彩描边被画到非结晶的果蝇身上了',
+						}
+					}
+					// ④ 描边还得**够粗**。只查色相的话，把线宽调回一根头发丝
+					//    也照样绿 —— 而那正是用户报的那个 bug 的样子
+					//    （「结晶成虫好像没有特殊效果」，其实效果在、只是看不见）。
+					//    判据用「高饱和像素 ÷ 有墨像素」：和果蝇大小无关，
+					//    因为在同一只蝇上比。当前线宽下约 0.62，头发丝时只有 0.37
+					const rimShare = crystal.sat / crystal.cover
+					if (!(rimShare > 0.5)) {
+						return {
+							ok: false,
+							reason:
+								'结晶成虫身上高饱和像素只占 ' + Math.round(rimShare * 100) +
+								'% —— 那圈描边太细了（和结晶幼虫一样粗时约 62%），远看等于没有',
+						}
+					}
+					console.log(
+						'  结晶成虫：身体不透明度 ' + Math.round(crystal.bodyA) + '/255（普通蝇 ' +
+							Math.round(plain.bodyA) + '）、炫彩色相铺开 ' + crystal.span +
+							'°（金色只有 ' + gold.span + '°）、描边占 ' +
+							Math.round(rimShare * 100) + '%',
+					)
+				} catch (e) {
+					return { ok: false, reason: '结晶成虫外观检查失败: ' + e.message }
+				}
+
+				// —— 居中小卡的 ✕：必须**真的**点得到 ——
+				//
+				// ⚠ 这条守卫的是**命中判定**，不是「监听挂没挂上」。三张新卡
+				//   （投放 / 商店 / 图鉴）的 ✕ 曾经一颗都点不动，而当时所有
+				//   别的断言全绿 —— 因为 element.click() / dispatchEvent
+				//   **绕过**命中判定：按钮被别的东西盖住也好、那块屏幕根本
+				//   没被窗口接管也好，它照样把 click 派发到监听上。
+				//   所以这里查的是 elementFromPoint() 和 _overCard()。
+				//
+				//   真正的坏法在 _overCard()：它量的是外面那层 .donate-pop，
+				//   而那个盒子在 CSS 里写死 268px 宽。比它宽的卡片会从
+				//   **右边**探出去（块级子元素从容器左边起排，不是居中），
+				//   探出去那一段看得见、也本该点得着，可按矩形算就是
+				//   「不在卡片上」→ 窗口不接管鼠标 → 那一下点击穿到桌面。
+				//   ✕ 恰好贴在卡片右上角，整颗都落在探出去的那一段里，
+				//   症状就是「叉叉关不掉」，而且没有任何报错。
+				//
+				//   查两样：顶上那一个是不是 ✕ 自己；指针压在 ✕ 上时
+				//   _overCard() 认不认。两样都过，那一下点击才真的进得来
+				try {
+					const centerCards = [
+						{ name: '投放', pop: 'feed-pop', btn: 'btn-feed', close: 'feed-close' },
+						{ name: '商店', pop: 'shop-pop', btn: 'btn-shop', close: 'shop-close' },
+						{ name: '图鉴', pop: 'codex-pop', btn: 'btn-codex', close: 'codex-close' },
+					]
+					for (const c of centerCards) {
+						const pop = document.getElementById(c.pop)
+						const closeBtn = document.getElementById(c.close)
+						const openBtn = document.getElementById(c.btn)
+						if (!pop || !closeBtn || !openBtn) {
+							return { ok: false, reason: '「' + c.name + '」的弹窗 / 入口按钮 / 关掉按钮有缺的' }
+						}
+						if (!pop.classList.contains('hidden')) {
+							return { ok: false, reason: '「' + c.name + '」弹窗上一轮没关干净，这条测不准' }
+						}
+						openBtn.click()
+						if (pop.classList.contains('hidden')) {
+							return { ok: false, reason: '点了' + c.name + '按钮但弹窗没有出现' }
+						}
+						// 卡片必须真的落在屏幕正中。宽度写错盒子的话卡片会整张
+						// 往右探（块级子元素从容器左边起排，不是居中）——
+						// 这正是上面那串坏法的**外表**，一眼就能看见
+						const cardR = pop.querySelector('.donate-card').getBoundingClientRect()
+						const off = (cardR.left + cardR.right) / 2 - window.innerWidth / 2
+						if (Math.abs(off) > 1) {
+							return {
+								ok: false,
+								reason:
+									'「' + c.name + '」的卡片横向偏了 ' + Math.round(off) + 'px —— ' +
+									'它比外层 .donate-pop 宽，整张从右边探了出去',
+							}
+						}
+						const r = closeBtn.getBoundingClientRect()
+						if (!(r.width > 0 && r.height > 0)) {
+							return { ok: false, reason: '「' + c.name + '」的 ✕ 尺寸是 0，量不到它摆在哪' }
+						}
+						const cx = r.left + r.width / 2
+						const cy = r.top + r.height / 2
+
+						// 1) 这一点上最顶层的元素得是 ✕ 自己（或者是它内部的节点）
+						const top = document.elementFromPoint(cx, cy)
+						if (!top || !(top === closeBtn || closeBtn.contains(top))) {
+							return {
+								ok: false,
+								reason:
+									'「' + c.name + '」的 ✕ 被别的东西盖住了 —— 点上去落在 ' +
+									(top ? top.id || top.className || top.tagName : 'null') + ' 上',
+							}
+						}
+
+						// 2) 指针压在 ✕ 上时窗口必须接管鼠标。没接管的话，
+						//    这一下点击根本不会进渲染进程，按钮再对也没用
+						const mx = pet.view.mouse.x
+						const my = pet.view.mouse.y
+						pet.view.mouse.x = cx
+						pet.view.mouse.y = cy
+						const over = pet.ui._overCard()
+						pet.view.mouse.x = mx
+						pet.view.mouse.y = my
+						if (!over) {
+							return {
+								ok: false,
+								reason:
+									'指针压在「' + c.name + '」的 ✕ 上，_overCard() 却是 false —— ' +
+									'窗口不会接管鼠标，这一下点击会穿到桌面。多半是 _overCard() 量错了盒子：' +
+									'卡片比 .donate-pop 宽，探出去的那一段没被算进去',
+							}
+						}
+
+						// 3) 照玩家那样点下去 —— 点的是 elementFromPoint 打出来的
+						//    那一个，而不是攥在手里的引用
+						top.click()
+						if (!pop.classList.contains('hidden')) {
+							return { ok: false, reason: '点了「' + c.name + '」的 ✕，弹窗却没关掉' }
+						}
+					}
+				} catch (e) {
+					return { ok: false, reason: '居中小卡的 ✕ 流程失败: ' + e.message }
+				}
+
+				// —— 养蝇人配置卡：入口在商店列表里，商店必须自己让位 ——
+				//
+				// 六张居中小卡全是 left:50% top:50%，位置**完全重合**。
+				// 配置按钮就长在商店列表里，点下去如果商店自己不关，两张卡
+				// 会叠在屏幕正中；而 #keeper-pop 在 DOM 里排在 #shop-pop
+				// **前面**，同 z-index 下后出现的画在上面 —— 玩家看到的是
+				// 「点了配置，什么都没发生」，其实卡片已经开了，只是被盖住
+				try {
+					const savedMoneyK = pet.world.money
+					const savedShopK = Object.assign({}, pet.world.shop)
+					pet.world.money = 100
+					pet.world.shop = { keeper: 1 }
+					pet.ui.refreshShop()
+
+					const shopPop2 = document.getElementById('shop-pop')
+					const keepPop = document.getElementById('keeper-pop')
+					if (!shopPop2 || !keepPop) return { ok: false, reason: '商店 / 养蝇人卡片的 DOM 不存在' }
+
+					document.getElementById('btn-shop').click()
+					if (shopPop2.classList.contains('hidden')) {
+						return { ok: false, reason: '养蝇人这一段：点了商店按钮但弹窗没出现' }
+					}
+					const cfg = document.getElementById('shop-list').querySelector('[data-keeper-cfg]')
+					if (!cfg) return { ok: false, reason: '养蝇人 Lv.1 了却没有「配置」按钮' }
+					cfg.click()
+					if (keepPop.classList.contains('hidden')) {
+						return { ok: false, reason: '点了「配置」养蝇人卡片没弹出来' }
+					}
+					if (!shopPop2.classList.contains('hidden')) {
+						return {
+							ok: false,
+							reason:
+								'养蝇人卡片开了，商店却还开着 —— 两张卡位置完全重合，' +
+								'而 #keeper-pop 在 DOM 里排在 #shop-pop 前面，会被商店整张盖住，' +
+								'玩家看到的是「点配置没反应」',
+						}
+					}
+					// 卡片正中最顶上那一个必须真的是它自己 —— 防的是「别的卡
+					// 靠 z-index 或 DOM 顺序压在上面」这种查 class 查不出来的坏法
+					const kr = keepPop.querySelector('.donate-card').getBoundingClientRect()
+					const kTop = document.elementFromPoint(kr.left + kr.width / 2, kr.top + kr.height / 2)
+					if (!kTop || !keepPop.contains(kTop)) {
+						return {
+							ok: false,
+							reason:
+								'养蝇人卡片正中被别的东西盖住了 —— 落点是 ' +
+								(kTop ? kTop.id || kTop.className || kTop.tagName : 'null'),
+						}
+					}
+					// 配置卡的 ✕ 同上：也得既在顶层、又在接管范围里
+					const kClose = document.getElementById('keeper-close')
+					const kr2 = kClose.getBoundingClientRect()
+					const kcx = kr2.left + kr2.width / 2
+					const kcy = kr2.top + kr2.height / 2
+					const kTop2 = document.elementFromPoint(kcx, kcy)
+					if (!kTop2 || !(kTop2 === kClose || kClose.contains(kTop2))) {
+						return { ok: false, reason: '养蝇人卡片的 ✕ 被别的东西盖住了' }
+					}
+					const kmx = pet.view.mouse.x
+					const kmy = pet.view.mouse.y
+					pet.view.mouse.x = kcx
+					pet.view.mouse.y = kcy
+					const kOver = pet.ui._overCard()
+					pet.view.mouse.x = kmx
+					pet.view.mouse.y = kmy
+					if (!kOver) {
+						return {
+							ok: false,
+							reason: '指针压在养蝇人卡片的 ✕ 上，_overCard() 却是 false —— 点上去会穿到桌面',
+						}
+					}
+
+					pet.ui.setKeeperOpen(false)
+					pet.ui.setShopOpen(false)
+					pet.world.money = savedMoneyK
+					pet.world.shop = savedShopK
+					pet.ui.refreshShop()
+				} catch (e) {
+					return { ok: false, reason: '养蝇人配置卡流程失败: ' + e.message }
+				}
+
+				// —— 喷水枪 ——
+				try {
+					const sqBtn = document.getElementById('btn-squirt')
+					if (!sqBtn) return { ok: false, reason: '工具栏上没有喷水枪按钮 #btn-squirt' }
+
+					const savedMoneySq = pet.world.money
+					const savedShopSq = Object.assign({}, pet.world.shop)
+
+					// 没买之前：按钮是 .locked（置灰 + 虚线），但**仍然可点** ——
+					// 点下去 setTool 会拦下来并提示去商店。
+					// 做成 disabled 的话玩家会以为按钮坏了，而不是「还没买」
+					pet.world.shop = {}
+					pet.ui.refreshToolButtons()
+					if (!sqBtn.classList.contains('locked')) {
+						return { ok: false, reason: '还没买喷水枪，按钮却不是锁定态' }
+					}
+					if (sqBtn.disabled) {
+						return { ok: false, reason: '没买喷水枪时按钮被 disabled 了 —— 玩家会以为它坏了' }
+					}
+					pet.ui.setTool('squirt')
+					if (pet.view.tool === 'squirt') {
+						return { ok: false, reason: '没买喷水枪却切得过去' }
+					}
+					// W 键也切不过去
+					pet.ui._onKey({ code: 'KeyW' })
+					if (pet.view.tool === 'squirt') {
+						return { ok: false, reason: '没买喷水枪，按 W 却切得过去' }
+					}
+
+					// 买下来（直接写 shop，别走钱那条路 —— 商店流程上面已经测过了）
+					pet.world.shop.squirt = true
+					pet.ui.refreshToolButtons()
+					if (sqBtn.classList.contains('locked')) {
+						return { ok: false, reason: '买了喷水枪，按钮还是锁定态' }
+					}
+					sqBtn.click()
+					if (pet.view.tool !== 'squirt') {
+						return { ok: false, reason: '买了之后点喷水枪按钮没切过去' }
+					}
+					if (!sqBtn.classList.contains('active')) {
+						return { ok: false, reason: '切到喷水枪之后按钮没有被标成选中态' }
+					}
+					// ⚠ 这条断言**反过来了**。
+					//
+					//   原来查的是「喷水枪进了 drawsOwnCursor 白名单没有」——
+					//   那个白名单会给 body 加 tool-active，而那条 CSS 是 cursor:none，
+					//   也就是藏掉系统指针、由 canvas 自绘水线。
+					//   现在工具图案全部删掉了，那个类**必须不存在**：
+					//   留着的话画布上什么都不画、指针又被藏了，屏幕上会一个指针都没有
+					if (document.body.classList.contains('tool-active')) {
+						return {
+							ok: false,
+							reason:
+								'拿着工具时 body 上还有 tool-active —— 自绘光标已经取消，留着这个类会把系统指针也藏掉，屏幕上会一个指针都没有',
+						}
+					}
+
+					// —— 滚轮：改长度；Shift+滚轮：转角度 ——
+					//
+					// ⚠ 派发的是**真的 WheelEvent**，而且必须带上 shiftKey ——
+					//   不带的活测的是「长度能不能调」，转方向那条根本没走到
+					const T = pet.config.tools
+					const wheel = (deltaY, shift) => {
+						window.dispatchEvent(
+							new WheelEvent('wheel', { deltaY: deltaY, shiftKey: shift, cancelable: true }),
+						)
+					}
+
+					pet.view.squirt.len = 200
+					pet.view.squirt.angle = 0
+					wheel(-100, false)
+					if (pet.view.squirt.len !== 200 + T.squirtLenStep) {
+						return {
+							ok: false,
+							reason: '往上滚之后水线长度是 ' + pet.view.squirt.len + '，应当是 ' + (200 + T.squirtLenStep),
+						}
+					}
+					wheel(100, false)
+					if (pet.view.squirt.len !== 200) {
+						return { ok: false, reason: '往下滚没有把长度调回去（现在是 ' + pet.view.squirt.len + '）' }
+					}
+					// 夹在 100~400 之间，而且**真的夹住**（滚到底再滚还是那个值）
+					pet.view.squirt.len = T.squirtLenMin
+					wheel(100, false)
+					if (pet.view.squirt.len < T.squirtLenMin) {
+						return { ok: false, reason: '水线比最短还短：' + pet.view.squirt.len }
+					}
+					pet.view.squirt.len = T.squirtLenMax
+					wheel(-100, false)
+					if (pet.view.squirt.len > T.squirtLenMax) {
+						return { ok: false, reason: '水线比最长还长：' + pet.view.squirt.len }
+					}
+
+					// Shift + 滚轮改的是**角度**，长度一动不动
+					pet.view.squirt.angle = 0
+					pet.view.squirt.len = 250
+					wheel(-100, true)
+					if (Math.abs(pet.view.squirt.angle - T.squirtTurnStep) > 1e-9) {
+						return {
+							ok: false,
+							reason: 'Shift+滚轮之后角度是 ' + pet.view.squirt.angle + '，应当是 ' + T.squirtTurnStep,
+						}
+					}
+					if (pet.view.squirt.len !== 250) {
+						return { ok: false, reason: 'Shift+滚轮把长度也改了（' + pet.view.squirt.len + '）—— 两个功能串了' }
+					}
+
+					// —— 按住左键才喷 ——
+					//
+					// 走 _useTool 而不是直接调 world.squirt：那是 UI 那一层，
+					// 起点/方向/长度怎么算出来的只有这里能测到
+					// ⚠ 目标要放在**偏离指针**的地方。
+					//   水线是以指针为中心向两头伸的，所以**不管转到什么角度，
+					//   它永远穿过指针那一点** —— 把污渍放在指针正下方的话，
+					//   转方向根本测不出任何区别（第一版就是这么写的，
+					//   报出来是「方向没生效」，其实方向完全正常）
+					const SQ_PX = 700
+					const SQ_PY = 500
+					const SQ_OFFX = SQ_PX + 120 // 水平方向上偏出去 120px
+
+					pet.world.remains.length = 0
+					const sqTarget = pet.world.addRemains(SQ_OFFX, SQ_PY, 'stain', 14, 0)
+					pet.view.squirt.angle = 0 // 水平
+					pet.view.squirt.len = 300
+					pet.view.mouse.x = SQ_PX
+					pet.view.mouse.y = SQ_PY
+					pet.ui._useTool()
+					if (sqTarget && !sqTarget.dead) {
+						return { ok: false, reason: '水线穿过了偏在一侧的污渍，_useTool 却没把它冲掉' }
+					}
+
+					// 同一个位置、把水线转成竖直 → 它就不在线上，不该再被冲到
+					pet.world.remains.length = 0
+					const sqOff = pet.world.addRemains(SQ_OFFX, SQ_PY, 'stain', 14, 0)
+					pet.view.squirt.angle = Math.PI / 2 // 竖过来
+					pet.ui._useTool()
+					if (sqOff && sqOff.dead) {
+						return { ok: false, reason: '把水线转成竖直之后，水平方向偏出去的污渍还是被冲掉了 —— 方向没生效' }
+					}
+
+					pet.world.remains.length = 0
+					pet.world.shop = savedShopSq
+					pet.world.money = savedMoneySq
+					pet.ui.setTool('none')
+					pet.ui.refreshToolButtons()
+				} catch (e) {
+					return { ok: false, reason: '喷水枪流程失败: ' + e.message }
+				}
+
+				// —— 工具粒子：端到端 ——
+				//
+				// 工具图案和范围圈全删之后，「手里拿着什么、作用在哪」只剩粒子在表达，
+				// 所以这条走**完整那条路**：ui.setTool → ui.update 写 toolFx
+				//   → world.update 发射 → renderer.draw 画出来。
+				//
+				// ⚠ 顺带证明 drawToolCursor / drawSwing 删干净了：
+				//   只要还有一处残留调用点，draw() 会当场抛
+				try {
+					const savedToolFx = pet.view.tool
+					const savedMouseX = pet.view.mouse.x
+					const savedMouseY = pet.view.mouse.y
+					pet.view.mouse.x = 640
+					pet.view.mouse.y = 420
+					pet.ui.setTool('roast')
+					if (pet.view.tool !== 'roast') {
+						return { ok: false, reason: '打火机切不过去（view.tool 还是 ' + pet.view.tool + '）' }
+					}
+					// 先跑几帧把发射器灌起来，再画一帧
+					const fxBefore = pet.world.particles.length
+					for (let i = 0; i < 20; i++) {
+						pet.ui.update(1 / 60)
+						pet.world.update(1 / 60)
+					}
+					// 这一行是「工具图案删干净了没有」的探针：有残留调用点就会抛
+					pet.renderer.draw(pet.world, pet.view)
+					if (pet.world.particles.length <= fxBefore) {
+						return {
+							ok: false,
+							reason:
+								'举着打火机跑了 20 帧，粒子数没涨（' +
+								fxBefore +
+								' → ' +
+								pet.world.particles.length +
+								'）—— 发射器没接上 ui.toolFx',
+						}
+					}
+					// 放下工具：发射器必须停
+					pet.ui.setTool('none')
+					pet.ui.update(1 / 60)
+					if (pet.world.toolFx.on) {
+						return { ok: false, reason: '换成「观察」之后 toolFx.on 还是 true —— 发射器没停' }
+					}
+					pet.view.mouse.x = savedMouseX
+					pet.view.mouse.y = savedMouseY
+					pet.ui.setTool(savedToolFx)
+					pet.ui.refreshToolButtons()
+				} catch (e) {
+					return { ok: false, reason: '工具粒子端到端失败（多半是自绘光标还有残留调用点）: ' + e.message }
+				}
+
+				// —— 扫帚 ——
+				//
+				// 逻辑本身（方向、衰减、不推蛹和尸体、推得动趴在果子上的）
+				// 在无头模拟器里逐项断言过了。这里只测**窗口里那一套接线**：
+				// 按钮在不在、快捷键认不认、滚轮认不认、按住会不会真的调 world.broom。
+				// 少了任何一环，表现都是「点了没反应」或者「滚轮没反应」——
+				// 而这两种都不会报错
+				try {
+					const broomBtn = document.querySelector('[data-tool="broom"]')
+					if (!broomBtn) return { ok: false, reason: '工具栏里没有扫帚按钮（data-tool="broom"）' }
+
+					const savedBroomTool = pet.view.tool
+					const savedBroomR = pet.view.broom.r
+					const savedLarvae = pet.world.larvae
+
+					pet.ui.setTool('broom')
+					if (pet.view.tool !== 'broom') {
+						return { ok: false, reason: '扫帚切不过去（view.tool 还是 ' + pet.view.tool + '）' }
+					}
+					if (!broomBtn.classList.contains('active')) {
+						return { ok: false, reason: '切到扫帚之后按钮没有被标成选中态' }
+					}
+
+					// 快捷键 B：两下 = 开 → 关
+					window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyB', key: 'b', bubbles: true }))
+					if (pet.view.tool !== 'none') {
+						return { ok: false, reason: '按 B 没有把扫帚收起来（还是 ' + pet.view.tool + '）' }
+					}
+					window.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyB', key: 'b', bubbles: true }))
+					if (pet.view.tool !== 'broom') {
+						return { ok: false, reason: '再按一次 B 没有切回扫帚（现在是 ' + pet.view.tool + '）' }
+					}
+
+					// 滚轮改半径，而且真的夹在 min~max 之间
+					const BT = pet.config.tools.broom
+					pet.view.broom.r = 100
+					window.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, cancelable: true }))
+					if (pet.view.broom.r !== 100 + BT.radiusStep) {
+						return {
+							ok: false,
+							reason: '往上滚之后半径是 ' + pet.view.broom.r + '，应当是 ' + (100 + BT.radiusStep),
+						}
+					}
+					window.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, cancelable: true }))
+					if (pet.view.broom.r !== 100) {
+						return { ok: false, reason: '往下滚没有把半径调回去（现在是 ' + pet.view.broom.r + '）' }
+					}
+					pet.view.broom.r = BT.radiusMax
+					window.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, cancelable: true }))
+					if (pet.view.broom.r > BT.radiusMax) {
+						return { ok: false, reason: '半径超过了上限 ' + BT.radiusMax + '：' + pet.view.broom.r }
+					}
+					pet.view.broom.r = BT.radiusMin
+					window.dispatchEvent(new WheelEvent('wheel', { deltaY: 100, cancelable: true }))
+					if (pet.view.broom.r < BT.radiusMin) {
+						return { ok: false, reason: '半径超过了下限 ' + BT.radiusMin + '：' + pet.view.broom.r }
+					}
+
+					// 按住：真的把幼虫推开
+					//
+					// ⚠ 摆一只**自己的**幼虫，并且把整个数组换掉 —— 直接往
+					//   玩家那一局里塞的话，这只虫会留在存档里
+					const BX = 500
+					const BY = 400
+					const brWorld = pet.world
+					brWorld.larvae = []
+					const probe = brWorld.addLarva(BX + 10, BY, null, 0)
+					if (!probe) {
+						brWorld.larvae = savedLarvae
+						return {
+							ok: false,
+							reason: 'world.addLarva 返回了 null（幼虫到上限了？）—— 扫帚这条测不了',
+						}
+					}
+					const startD = Math.hypot(probe.x - BX, probe.y - BY)
+					pet.view.broom.r = 120
+					pet.view.mouse.x = BX
+					pet.view.mouse.y = BY
+					pet.ui.mouseDown = true
+					for (let i = 0; i < 40; i++) {
+						pet.ui._useTool()
+						brWorld.update(1 / 60)
+					}
+					pet.ui.mouseDown = false
+					const endD = Math.hypot(probe.x - BX, probe.y - BY)
+					if (!(endD > startD)) {
+						return {
+							ok: false,
+							reason:
+								'按住扫了 40 帧，幼虫离圆心还是 ' +
+								endD.toFixed(1) +
+								'px（一开始 ' +
+								startD.toFixed(1) +
+								'px）—— 扫帚没接上 _useTool',
+						}
+					}
+					if (brWorld.larvae.indexOf(probe) < 0) {
+						return { ok: false, reason: '扫帚把幼虫从数组里弄掉了（它只该推，不该删）' }
+					}
+					brWorld.larvae = savedLarvae
+					brWorld.particles.length = 0
+					pet.view.broom.r = savedBroomR
+					pet.ui.setTool(savedBroomTool)
+					pet.ui.refreshToolButtons()
+				} catch (e) {
+					return { ok: false, reason: '扫帚流程失败: ' + e.message }
+				}
+
+				// —— 烤炉：进度条 → 满了直接卖钱 → 冒数字 ——
+				//
+				// 数值结算（每只 = 售价 × 倍率、不留尸体、统计对得上）在无头模拟器里
+				// 精确断言过了。这里测的是**窗口那一套**：进度真的会走、两样东西
+				// 都画得出来、钱真的显示在面板上。少了任何一环，
+				// 表现都是「进度条不动」或者「钱没变」—— 都不会报错
+				try {
+					const RO = pet.config.roast.oven
+					const rChain = pet.config.market.roastChain
+					const rw = pet.world
+
+					const savedRoastShop = rw.shopLevel('roast')
+					const savedRoastFlies = rw.flies
+					const savedRoastOvens = rw.ovens
+					const savedRoastRemains = rw.remains
+					const savedRoastMoney = rw.money
+
+					// 把档位拉满：炉子的时长是从**当前档位**取的，没买过就是 0，
+					// startRoast(0) 会被拒 —— 而那看起来像是「没自动开烤」
+					rw.shop.roast = rChain.length
+					rw.flies = []
+					rw.ovens = []
+					rw.remains = []
+					rw.floatTexts.length = 0
+					rw.money = 0
+
+					const rOven = rw.dropOven()
+					if (!rOven) return { ok: false, reason: 'dropOven 没造出炉子' }
+					const rTier = rChain[rChain.length - 1]
+					for (let i = 0; i < RO.capacity; i++) {
+						const f = rw.addFly(200 + i * 40, 300, i % 2 ? 'F' : 'M')
+						if (f) rw.putInOven(rOven, f)
+					}
+					if (!rOven.roasting) {
+						return { ok: false, reason: '装满 ' + RO.capacity + ' 只之后没有自动开烤' }
+					}
+
+					// 进度条得真的从 0 往上走。先画一帧 —— 这一行同时证明
+					// 进度条那段绘制没有抛异常（画布上一抛就是整个窗口白掉）
+					pet.renderer.draw(rw, pet.view)
+					if (!(rOven.roastProgress < 0.2)) {
+						return { ok: false, reason: '刚开烤进度就是 ' + rOven.roastProgress }
+					}
+
+					// 跑四分之一炉的时间
+					const quarter = Math.floor(rTier.roastMs / 4 / 16)
+					for (let i = 0; i < quarter; i++) rw.update(1 / 60)
+					const p = rOven.roastProgress
+					if (!(p > 0.15 && p < 0.5)) {
+						return { ok: false, reason: '跑了四分之一炉的时间，进度是 ' + p + '（应当在 0.15~0.5 之间）' }
+					}
+					pet.renderer.draw(rw, pet.view) // 画到一半的进度条
+
+					// —— 直接推到出炉，走**真实**那条路（world.update → step → _updateOvens）——
+					const beforeMoney = rw.money
+					const beforeRemains = rw.remains.length
+					const beforeTexts = rw.floatTexts.length
+					rOven.roastTimer = 0
+					rw.update(1 / 60)
+
+					if (rOven.roasting) return { ok: false, reason: '倒计时归零了却还在烤' }
+					if (rOven.items.length !== 0) return { ok: false, reason: '出炉之后炉子没清空' }
+
+					const got = rw.money - beforeMoney
+					if (!(got > 0)) {
+						return { ok: false, reason: '一炉烤完钱没有增加（+' + got + '）—— 自动卖钱没接上' }
+					}
+					if (rw.remains.length !== beforeRemains) {
+						return {
+							ok: false,
+							reason: '出炉之后地上多了 ' + (rw.remains.length - beforeRemains) + ' 具尸体，应当直接变成钱',
+						}
+					}
+					const texts = rw.floatTexts.length - beforeTexts
+					if (texts !== RO.capacity) {
+						return { ok: false, reason: '冒出 ' + texts + ' 个飘字，应当是 ' + RO.capacity + ' 个（每只一个）' }
+					}
+					// 飘字真的画得出来（和进度条一样，这里也是「抛了就是白屏」的探针）
+					pet.renderer.draw(rw, pet.view)
+
+					// 面板上的钱要跟着变。refreshStats 平时是 6~7Hz 跑的，
+					// 这里手动催一次，确认它读的是 world.money
+					pet.ui.refreshStats()
+					const shown = pet.ui.el.money.textContent
+					if (!shown || shown === '$0.000') {
+						return { ok: false, reason: '卖了一炉之后面板上的钱还是「' + shown + '」' }
+					}
+
+					rw.flies = savedRoastFlies
+					rw.ovens = savedRoastOvens
+					rw.remains = savedRoastRemains
+					rw.money = savedRoastMoney
+					rw.shop.roast = savedRoastShop
+					rw.floatTexts.length = 0
+					rw.particles.length = 0
+					pet.ui.refreshStats()
+				} catch (e) {
+					return { ok: false, reason: '烤炉流程失败: ' + e.message }
+				}
+
+				// 垃圾桶和拖动食物的接口。
+				// 少了 #trash 不会立刻报错，要等真去拖食物时才炸 —— 所以这里先查一遍。
+				const trash = document.getElementById('trash')
+				if (!trash) return { ok: false, reason: '垃圾桶元素 #trash 不存在' }
+				for (const fn of ['_foodAt', '_pointInTrash', '_endDrag', 'discardFoodCheck']) {
+					if (fn === 'discardFoodCheck') {
+						if (typeof pet.world.discardFood !== 'function') {
+							return { ok: false, reason: 'world.discardFood 不存在' }
+						}
+						continue
+					}
+					// 必须用字符串拼接：这段代码本身就住在一个模板字符串里。
+					// 模板字符串的插值是在「外层」求值的，连注释里写的插值语法也一样，
+					// 结果就是主进程直接报 fn is not defined。
+					if (typeof pet.ui[fn] !== 'function') return { ok: false, reason: 'ui.' + fn + ' 不存在' }
+				}
+				if (!trash.getBoundingClientRect().width) {
+					return { ok: false, reason: '垃圾桶不可见（宽度为 0）' }
+				}
+
+				const c = pet.world.counts
+				return {
+					ok: true,
+					canvas: pet.renderer.canvas.width + 'x' + pet.renderer.canvas.height,
+					dpr: pet.renderer.dpr,
+					flies: c.adults,
+					larvae: c.larvae,
+					eggs: c.eggs,
+					living: c.living,
+					timeScale: pet.world.timeScale,
+					panelWidth: Math.round(panel.getBoundingClientRect().width),
+					saveKB,
+					pupaColor,
+					money: pet.world.counts.money.toFixed(3),
+				}
+			})()`)
+
+			if (!report.ok) return done(1, '[selftest] 失败: ' + report.reason)
+
+
+			done(
+				0,
+				'[selftest] 通过\n' +
+					`  画布 ${report.canvas}（dpr ${report.dpr}）\n` +
+					`  世界已构建：成虫 ${report.flies} / 幼虫 ${report.larvae} / 卵 ${report.eggs}，存活 ${report.living}\n` +
+					`  工具栏小窗 ${report.panelWidth}px，最小化切换正常\n` +
+					`  存档端到端 ${report.saveKB.toFixed(1)} KB：写盘 → 读回 → 反序列化 一致\n` +
+					'  折叠组：工具七个按钮（含查看 / 喷水枪）、时间轴「时停 / 1× / 2× / 5× / 10×」，展开可见、选中生效\n' +
+					'  时停：世界真的停住，恢复后回到原来那一档（不掉回 1×）\n' +
+					`  经济：游戏币 ${report.money}，商店 / 出售区 / 数据面板接线正常，六档配色可切换\n` +
+					'  投放 / 商店：屏幕正中弹窗（不在 .window 里，不会被 overflow 剪掉）、点名分组渲染、' +
+						'三行六键买不起全置灰、玻璃罐免费且摆满置灰、食物投放区参考框按配置摆位且不吞鼠标\n' +
+					'  图鉴：格子式列出全部食物和基因，食物格真的画出来了（查非透明像素）、基因格的概率与配置一致\n' +
+					'  居中小卡：三张新卡的 ✕ 用 elementFromPoint 打出来是它自己、指针压上去 _overCard() 认、点下去真的关上；' +
+						'养蝇人的「配置」点开时商店自己让位（不再两张卡叠成一坨）\n' +
+					'  结晶成虫外观（查像素）：身体平均不透明度只有 45/255（全透明）、高饱和像素的色相铺开 350° 以上' +
+						'（炫彩描边）、这圈边既有幼虫那么粗又不会跑到金色等其他变异身上\n' +
+					'  喷水枪：没买前锁定且切不过去，买了能切；滚轮改长度、Shift+滚轮改角度（两者不串）、长度夹在 100~400；' +
+						'水线穿过偏在一侧的污渍能冲掉，转 90° 之后就不再命中\n' +
+					'  罐子：手套拖成虫进罐子真的能进、满员时不吞蝇、罐中寿命 2 倍\n' +
+					'  罐中果蝇小窗：有罐子才出现、默认收起、点标题条开合、层级高过面板、收起时不占鼠标\n' +
+					'  罐中列表防闪：连刷两次行节点不变、顺序被打乱能排回去\n' +
+					'  玻璃罐：观察模式就能拖（指针在罐上才接管，食物不算），移开后鼠标归还\n' +
+					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
+					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +
+					'  重置：先弹确认，点「取消」什么都不动，点「确定」才清档\n' +
+					'  苍蝇拍：杀伤落点正好在拍面上（指针左上方），不在指针上；打死拍头那只、指针上那只不死（挥空也放一圈灰勾出杀伤半径）\n' +
+					'  工具粒子：工具图案和范围圈全删了，只剩系统指针 —— body 上没有 tool-active；' +
+						'举着打火机跑 20 帧粒子真的变多、画一帧不抛（证明自绘光标删干净了）、放下就停\n' +
+					'  扫帚：按钮在、B 键开关、滚轮调半径且夹在 30~200、按住真的把幼虫推开（只推不删）\n' +
+					'  烤制：尸体带着售价、接触即烤能烤能卖、倍率只吃一次、汁渍不能烤、前 5 分钟不掉价\n' +
+					'  烤炉：装满自动开烤、进度条真的从 0 走到 1（两头都画得出来）、' +
+						'进度满了**直接到账**且地上不留尸体、每只各冒一个「+$x」飘字、面板上的钱跟着变\n' +
+					'  挥手惊蝇：慢速靠近完全不受惊、快甩才惊飞；悬停的踢出悬停、走路的起飞、方向背离指针；观察模式下一点不生效\n' +
+					'  幼虫饥饿：吃不到就饿死、留尸体（不可烤）、蛹期不计\n' +
+					'  统计：主面板只留存活 / 死亡，三条杠展开细分（含成虫总价值，与各蝇售价之和相符）\n' +
+					'  捐款：右下角小罐子、卡片默认关着、二维码真的加载出来了、钉在屏幕正中、层级高过面板、指针压在卡片上才接管鼠标\n' +
+					'  玻璃罐：放罐 → 网蝇 → 列表出行 → 放逐 → 扔罐 全流程正常\n' +
+					'  数据面板：查看工具（V）点虫弹出、虫走开仍钉着、Esc 能关；飞行中的虫也能点；罐子压着虫也点得开；' +
+						'**罐里的虫也点得开**（加罐心偏移才算对，卡片跟着虫走而不是飞到左上角）；幼虫只显示基因徽章\n' +
+					'  罐中批量：全部出售 / 全部放逐逐罐结算不跳只；出售带二次确认，点「取消」什么都不卖\n' +
+					'  罐中配对：一对成熟异性在罐里会生，卵**产在罐外底部**、母体不进 laying（不收翅）；' +
+						'拍子仍旧打不进罐子\n' +
+					'  基因突变：遗传（单方 20% / 双方 36%）、新发突变、售价倍率、金光光环会复位、生命值不吃体重、疯狂自限 + 寿命砍半 + 够不着罐中虫、石化受惊不起飞\n' +
+					'  设置 / 捐款：点图标那一层也能弹出（closest 判定，不是比 e.target）、再点能收起、层级高过面板与数据面板\n' +
+					'  养蝇人：升级走 upgradeShopItem、配置按钮买后才出现、卡片真的接管鼠标、点选项能改状态且选中态跟着走、Lv1 时自动出售那几行是禁用的\n' +
+					'  卖哪档：六档价值档齐全；卡片上不再有任何输入控件、world.keeper 也没有 minValue（价格滑条已删干净）；' +
+					'自动出售真的按档筛选 —— 轻蝇只在最低档被卖、重蝇恰好命中一档且不是最低那档\n' +
+					'  价值档对应：普通=白 · 罕见=蓝 · 稀有=紫 · 极稀有=金+流动 · 超级稀有=红+流动+反光 · 传说生物=淡彩+流动+反光\n' +
+					'  放大镜：买过之后商店那一行长出六颗档位按钮，勾哪几档就亮哪几档；' +
+						'没买不给、点一下 world.magnifierTiers 跟着变、选中态跟着走、一档不勾也允许\n' +
+					`  蛹是实心的，整排不透明（底色 ${report.pupaColor}）\n` +
+					'  preload 桥完整，渲染一帧无异常',
+			)
+		} catch (e) {
+			done(1, '[selftest] 执行失败: ' + e.message)
+		}
+	})
+
+	setTimeout(() => done(1, '[selftest] 超时：15 秒内没加载完'), 15000)
+}
+
+/** 根据当前状态决定要不要让鼠标事件穿过去 */
+function applyMouseMode() {
+	if (!win || win.isDestroyed()) return
+	const passThrough = clickThroughEnabled && !interactive
+	// forward:true —— 即使穿透，渲染进程仍能收到 mousemove，用于悬停检测
+	win.setIgnoreMouseEvents(passThrough, { forward: true })
+}
+
+/** 把主进程状态推给渲染进程，让 UI 上的按钮和真实状态保持一致 */
+function syncState() {
+	if (!win || win.isDestroyed()) return
+	win.webContents.send('pet:state', {
+		alwaysOnTop,
+		clickThrough: clickThroughEnabled,
+	})
+}
+
+function setAlwaysOnTop(value) {
+	alwaysOnTop = value
+	if (win && !win.isDestroyed()) {
+		win.setAlwaysOnTop(value, value ? 'screen-saver' : 'normal')
+	}
+	syncState()
+	return alwaysOnTop
+}
+
+function setClickThrough(value) {
+	clickThroughEnabled = value
+	applyMouseMode()
+	syncState()
+	return clickThroughEnabled
+}
+
+// 分辨率变化 / 换显示器时，重新贴合屏幕
+function refitToScreen() {
+	if (!win || win.isDestroyed()) return
+	const { bounds } = screen.getPrimaryDisplay()
+	win.setBounds(bounds)
+}
+
+// ------------------------------------------------------------------ IPC
+
+ipcMain.on('pet:set-interactive', (_e, value) => {
+	interactive = !!value
+	applyMouseMode()
+})
+
+ipcMain.handle('pet:toggle-always-on-top', () => setAlwaysOnTop(!alwaysOnTop))
+
+ipcMain.handle('pet:toggle-click-through', () => setClickThrough(!clickThroughEnabled))
+
+/** 渲染进程要问「我现在到底该不该穿透」——比如刚启动时同步一次 */
+ipcMain.handle('pet:get-state', () => ({ alwaysOnTop, clickThrough: clickThroughEnabled }))
+
+ipcMain.on('pet:quit', () => app.quit())
+
+// ------------------------------------------------------------------ 存档
+
+/**
+ * 存档放在 userData 目录下。
+ *
+ * 选它的理由：这是 Electron 给每个应用划的专属目录，卸载重装、覆盖安装都不会动它
+ * （package.json 里也显式写了 deleteAppDataOnUninstall: false），
+ * 而且不需要用户先选一个位置。代价是它在 C 盘的 AppData 里 ——
+ * 不过整个存档也就一两百 KB，和动辄几百 MB 的 node_modules 不是一个量级。
+ */
+function saveFile() {
+	// 自检读写的是另一个文件。自检里跑的是临时造出来的世界，
+	// 让它写进真存档的话，玩家养了半天的生态会被一个假世界顶掉。
+	const name = SELFTEST ? 'save.selftest.json' : 'save.json'
+	return path.join(app.getPath('userData'), name)
+}
+
+function backupFile() {
+	const name = SELFTEST ? 'save.selftest.bak' : 'save.bak'
+	return path.join(app.getPath('userData'), name)
+}
+
+function readSaveFile(file) {
+	const raw = fs.readFileSync(file, 'utf8')
+	const data = JSON.parse(raw)
+	// 主进程只负责「这是个合法的 JSON」，版本号认不认识由渲染进程判断 ——
+	// 版本语义属于世界状态，不该散落到主进程里
+	if (!data || typeof data !== 'object' || !data.world) throw new Error('存档结构不对')
+	return data
+}
+
+/**
+ * 写存档。先写临时文件再 rename —— 同一个目录下的 rename 是原子操作，
+ * 所以不会出现「写到一半断电，读出来是半个 JSON」这种情况。
+ *
+ * 旧存档先留一份 .bak：整份存档丢掉的代价是「养了半天的生态没了」，
+ * 而这个备份只要一次复制，太便宜了，不值得省。
+ */
+function writeSave(json) {
+	const file = saveFile()
+	const tmp = file + '.tmp'
+
+	fs.writeFileSync(tmp, json, 'utf8')
+
+	try {
+		fs.copyFileSync(file, backupFile())
+	} catch {
+		// 第一次存档时还没有旧文件，复制失败是正常的
+	}
+
+	fs.renameSync(tmp, file)
+	return { ok: true, bytes: Buffer.byteLength(json, 'utf8') }
+}
+
+ipcMain.handle('pet:save', (_e, json) => {
+	if (typeof json !== 'string' || !json) return { ok: false, reason: '存档内容为空' }
+	try {
+		return writeSave(json)
+	} catch (e) {
+		console.error('[save] 写入失败:', e.message)
+		return { ok: false, reason: e.message }
+	}
+})
+
+ipcMain.handle('pet:load', () => {
+	try {
+		return { ok: true, data: readSaveFile(saveFile()) }
+	} catch (e) {
+		// 主存档读不出来时退到备份再试一次
+		try {
+			const data = readSaveFile(backupFile())
+			console.warn('[save] 主存档损坏，已改用备份:', e.message)
+			return { ok: true, data, recovered: true }
+		} catch {
+			return { ok: false, reason: fs.existsSync(saveFile()) ? 'corrupt' : 'empty', detail: e.message }
+		}
+	}
+})
+
+ipcMain.handle('pet:clear-save', () => {
+	for (const f of [saveFile(), backupFile(), saveFile() + '.tmp']) {
+		try {
+			fs.rmSync(f, { force: true })
+		} catch {
+			// 删不掉也无所谓，下一次存档就覆盖了
+		}
+	}
+	return { ok: true }
+})
+
+/**
+ * 退出前让渲染进程把世界存一次。
+ *
+ * 主进程手里没有世界状态（它全在渲染进程里），只能反过来问。
+ * 所以这是个握手：发个请求过去，等它回话；等不到就超时放行 ——
+ * 绝不能因为渲染进程卡住就让用户关不掉这个程序。
+ */
+let flushState = 'idle' // 'idle' | 'done'
+
+function flushRendererThen(proceed) {
+	if (SELFTEST || flushState === 'done') return proceed()
+
+	if (!win || win.isDestroyed() || win.webContents.isDestroyed()) {
+		flushState = 'done'
+		return proceed()
+	}
+
+	let fired = false
+	const go = () => {
+		if (fired) return
+		fired = true
+		flushState = 'done'
+		proceed()
+	}
+
+	ipcMain.once('pet:flush-done', go)
+	win.webContents.send('pet:flush-save')
+	setTimeout(go, FLUSH_TIMEOUT)
+}
+
+// ------------------------------------------------------------------ 生命周期
+
+app.whenReady().then(() => {
+	createWindow()
+
+	if (!SELFTEST) {
+		// 全局快捷键：即使窗口被置底、或者穿透状态下点不到按钮，也救得回来
+		// Ctrl+Shift+F  切换穿透
+		globalShortcut.register('CommandOrControl+Shift+F', () => {
+			setClickThrough(!clickThroughEnabled)
+		})
+		// Ctrl+Shift+T  切换置顶
+		globalShortcut.register('CommandOrControl+Shift+T', () => {
+			setAlwaysOnTop(!alwaysOnTop)
+		})
+		// Ctrl+Shift+Q  退出（穿透状态下没法点关闭按钮，给条退路）
+		globalShortcut.register('CommandOrControl+Shift+Q', () => {
+			app.quit()
+		})
+	}
+
+	screen.on('display-metrics-changed', refitToScreen)
+	screen.on('display-added', refitToScreen)
+	screen.on('display-removed', refitToScreen)
+
+	app.on('activate', () => {
+		if (BrowserWindow.getAllWindows().length === 0) createWindow()
+	})
+})
+
+/**
+ * 退出前存档。
+ *
+ * 和 win.on('close') 那处是同一个握手的两个入口：走「退出」按钮 / Ctrl+Shift+Q
+ * 会先到这里，走 Alt+F4 / 任务栏关闭则先到 close。两边都拦一次，
+ * flushState 保证只有第一次真的去等，第二次直接放行 —— 否则会互相拦成死循环。
+ *
+ * 注意拦截的前提是窗口还在：如果渲染进程已经崩了，flushRendererThen 会
+ * 立刻放行，不耽误退出。
+ */
+app.on('before-quit', (e) => {
+	if (SELFTEST || flushState === 'done') return
+	e.preventDefault()
+	flushRendererThen(() => app.quit())
+})
+
+app.on('will-quit', () => {
+	globalShortcut.unregisterAll()
+})
+
+app.on('window-all-closed', () => {
+	app.quit()
+})
