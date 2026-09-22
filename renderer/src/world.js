@@ -25,7 +25,7 @@ import {
 	snapshot,
 	revive,
 } from './entities.js'
-import { shopItem, foodPrice, flyPrice, bulkPrice, formatMoney } from './market.js'
+import { shopItem, foodPrice, flyPrice, bulkPrice, ovenPrice, formatMoney } from './market.js'
 
 /**
  * 读档时取一个数值：不是有限数就退回默认值。
@@ -75,7 +75,10 @@ export class World {
 			tool: 'none',
 			x: 0,
 			y: 0,
-			level: 0, // 烤制等级（决定火苗大小 / 颜色）
+			// 大火焰还是小火焰（喷火枪 = true）。⚠ 这里以前是个 `level` 数字，
+			// 因为烤制链当时有三档；现在只有打火机 / 喷火枪两档，
+			// 一个布尔比一个「只能取 1 或 2 的数字」贴切
+			big: false,
 			len: 0, // 水线长度
 			angle: 0, // 水线角度
 			radius: 0, // 扫帚半径
@@ -84,6 +87,14 @@ export class World {
 			rate: 0, // 每秒几颗（由 UI 按上面的状态算好）
 			acc: 0, // 时间累加器
 		}
+
+		/**
+		 * 烧着的蝇身上的火苗的时间累加器。
+		 *
+		 * ⚠ 和 toolFx.acc 一样是**纯表现层**，不进存档；
+		 *   而且它是**全场共用一个**而不是每只蝇一个 —— 理由见 `_emitBurnFx`
+		 */
+		this.burnAcc = 0
 
 		this.particles = []
 		this.wipeTrail = [] // 抹布拖尾 { x, y, life }
@@ -551,26 +562,104 @@ export class World {
 	// ================================================================
 
 	/**
-	 * 烤一具尸体。**每具只能烤一次** —— 已经烤过的直接返回 false。
+	 * 当前手里那档点火器（打火机 / 喷火枪），没买是 null。
 	 *
-	 * 不叠加是刻意的：能反复烤的话，把一只养到最大再拍死、用最高档反复刷，
-	 * 数值会指数膨胀，出售区那套「体重换钱」的定价就失去意义了。
-	 * 想卖更贵只能升级工具（打火机 → 喷火枪 → 烤炉）。
-	 *
-	 * ⚠ 只有 corpse 能烤，汁渍（stain）不行 —— 它是拍击溅出来的，
-	 * 不是一具身体，连 value 都没有（见 Remains.roastable）
-	 *
-	 * @param {Remains} r
-	 * @param {number} mul 倍率，由调用方按当前工具档位给
-	 * @returns {boolean} 真烤上了才返回 true
+	 * 档位查找走 `chainTier`，不在 world 里写死等级上限 —— 加一档只改 config
 	 */
-	roast(r, mul) {
-		if (!r || r.dead || !r.roastable || r.roasted) return false
-		if (!Number.isFinite(mul) || mul <= 1) return false
+	burnTier() {
+		return this.chainTier('roast', this.shopLevel('roast'))
+	}
 
-		r.roasted = true
-		r.roastMul = mul
+	/**
+	 * **手里这一把**点火器的判定半径（px）。
+	 *
+	 * 喷火枪比打火机大一圈 —— 那是它「有一小圈范围」的表达方式：
+	 * 仍然是单目标（只点着半径内最近的那一只），但够得着得多。
+	 * 数值住在 `market.roastChain[].pickRadius` 上，和 burnMs / mul 一处。
+	 *
+	 * ⚠ 和 `ignite(fly, tool)` 一样按 **tool id** 查，不是按当前等级 ——
+	 *   买到喷火枪之后玩家完全可能回头拿打火机，那时候半径要跟着手里那把走。
+	 *   按等级取的话两把枪的半径永远一样，而症状只是「喷火枪好像没变大」
+	 *
+	 * ⚠ 查不到就返回 0，**不要留一个 fallback 半径** —— 0 会让
+	 *   `_flyAt(m.x, m.y, 0)` 一个都点不着，一眼就能发现；
+	 *   fallback 的话是「悄悄用了旧值」，没人会去查
+	 */
+	burnRadiusFor(tool) {
+		const chain = chainOf('roast') ?? []
+		const t = chain.find((x) => x.id === tool)
+		return t && Number.isFinite(t.pickRadius) ? t.pickRadius : 0
+	}
+
+	/**
+	 * 把一只**活着的成虫**点着。
+	 *
+	 * 从 1.18.0 起，打火机和喷火枪干的是这件事 —— 不再是烤地上的尸体。
+	 * 点着之后它会带着火焰惊慌乱飞，烧满 `burnMs` 之后按 `mul` **自动卖掉**
+	 * （见 `_updateBurning`）。
+	 *
+	 * @param {object} fly
+	 * @param {string} tool **手里拿着哪一把**（`'lighter'` / `'flamer'`，就是那两颗
+	 *   按钮的 `data-tool`）。
+	 *
+	 *   ⚠ 这个参数不能省，也不能改成「取当前最高档」—— 玩家买到喷火枪之后
+	 *     工具栏上是**两颗**按钮，他完全可能回头去拿打火机。
+	 *     按「最高档」算的话，拿打火机点出来的也是 3 秒 ×1.5，
+	 *     两颗按钮变成同一把，而界面上看不出任何异常。
+	 *     这个 bug 是靠自检抓出来的：模拟器里每次都用满级，档位恰好等于最高档，
+	 *     所以它一直绿 —— 只有「拥有高档、却选了低档」才会露出来
+	 *
+	 * ⚠ 只认 `this.flies` 里的。罐中 / 烤炉里的**点不着** —— 那一整条机制的前提是
+	 *   「它要飞、要慌、要冒火」，三条都长在这个数组的遍历上。
+	 *   这和 `sellFly` 那条「罐子必须显式再查一遍」**刚好相反**，别照抄那边的形状
+	 *
+	 * ⚠ 「每只只吃一次倍率」的判重（`fly.burning`）**必须在这里**，不能放到 UI 层：
+	 *   UI 按住工具时会**每帧**调一次 ignite，判重放那边的话，
+	 *   来回蹭同一只会反复把倒计时重置回满 —— 表现是「怎么烧都烧不完」，
+	 *   而那种 bug 极难归因（看起来像火焰时长配错了）
+	 *
+	 * @returns {boolean} 真点着了才 true
+	 */
+	ignite(fly, tool) {
+		const chain = chainOf('roast') ?? []
+		const idx = chain.findIndex((t) => t.id === tool)
+		// 认不出这把工具、或者还没买到这一档 —— 两种都拒绝。
+		// 拥有权在这里也判一道：UI 的闸门拦的是「切换工具」，
+		// 而这里是「真的点着了火」，两边都得拦
+		if (idx < 0 || idx >= this.shopLevel('roast')) return false
+		const tier = chain[idx]
+
+		if (!fly || fly.dead || fly.burning) return false
+		if (this.flies.indexOf(fly) < 0) return false
+
+		fly.burnLeft = tier.burnMs
+		fly.burnMul = tier.mul
+		fly.burnBig = tier.id === 'flamer'
+
+		// 点着那一下先补一把火，不然「点着了没有」要等下一帧才看得出来 ——
+		// 和 burstRing 存在的理由是同一个（动作那一下要立刻有反馈）
+		for (let i = 0; i < 5; i++) this._emitFlameParticle(fly.x, fly.y, fly.burnBig)
 		return true
+	}
+
+	/**
+	 * 灭火。**只摘计时器和倍率**，死没死、在哪儿都不管。
+	 *
+	 * 四条路要调它：被拍死、进罐子、进烤炉、被卖掉。
+	 * 不灭的话那只虫会带着一个「烧到一半」的倒计时进容器，
+	 * 而容器里的虫不在 `this.flies` 里 —— `_updateBurning` 永远走不到它，
+	 * 那个倒计时就永久悬在存档里了。
+	 *
+	 * ⚠ 写成「`burnLeft` 为假就什么都不做」而不是无条件赋值：
+	 *   `swat` 的 tryKill 是**三种实体共用**的（成虫 / 幼虫 / 卵），
+	 *   无条件写的话会给幼虫和卵挂上两个 burnLeft / burnMul 自有字段，
+	 *   而自有字段会跟着 snapshot() 进存档 —— 存档里凭空多出几千个没意义的键
+	 */
+	extinguish(fly) {
+		if (fly && fly.burnLeft) {
+			fly.burnLeft = 0
+			fly.burnMul = 1
+		}
 	}
 
 	addOven(x, y) {
@@ -593,22 +682,25 @@ export class World {
 	/**
 	 * 手套把一只成虫放进烤炉。满了返回 false，由 UI 去提示。
 	 *
-	 * **装满 5 只就自动开烤**，不需要再点一下「开始」。
-	 * 这是刻意的：炉子只有一个容量数，再加一颗「开始烤」的按钮
-	 * 就得额外想清楚「放了 3 只能不能烤」「烤到一半还能不能加」，
-	 * 而自动开烤把所有这些问题都消掉了。
+	 * ⚠ 从 1.21.0 起是**每只各自计时、各自到账**：放进去的那一刻它就开始烤，
+	 *   烤满 `CONFIG.roast.oven.roastMs` 之后**自己**冒钱走人，
+	 *   不用等炉子装满，也不会被同炉的其他几只拖住。
+	 *
+	 *   原来是「装满 5 只 → 整炉一起开烤 → 一起结账」。改掉它是因为
+	 *   那个版本里「炉子里有几只」和「还要等多久」是两件不相干的事：
+	 *   放 1 只进去什么都不发生，玩家只能干等；而放满之后 5 只同时出锅，
+	 *   钱一次性到账，看不出哪只在什么时候烤好的。
+	 *
+	 * ⚠ 所以 `oven.roasting` **不再拦着往里放**。它现在只是「有没有在烤」
+	 *   （给火光用的读数）。用旧判据的话，炉子里烤着第一只时就再也放不进第二只，
+	 *   而界面上什么提示都没有 —— 「炉子坏了」
 	 */
 	putInOven(oven, fly) {
-		if (!oven || !fly || oven.full || oven.roasting) return false
+		if (!oven || !fly || oven.full) return false
 		const i = this.flies.indexOf(fly)
 		if (i >= 0) this.flies.splice(i, 1)
-		if (!oven.admit(fly)) return false
-		if (oven.full) {
-			// 时长从**当前档位**取 —— 8 秒和 ×1.8、$16 是同一档的三个属性，
-			// 都在 market.roastChain 的 lv3 那一条里
-			const tier = this.roastTier()
-			oven.startRoast(tier ? tier.roastMs : 0)
-		}
+		// 时长跟**炉子**走，不跟「等级」走 —— 炉子从 1.18.0 起是独立商品
+		if (!oven.admit(fly, CONFIG.roast.oven.roastMs)) return false
 		return true
 	}
 
@@ -640,6 +732,12 @@ export class World {
 		fly.y = clamp(oven.y + Math.sin(a) * oven.halfH * r, 8, this.h - 8)
 		fly.vx = 0
 		fly.vy = 0
+		// ⚠ 烤制倒计时也要清。它只在 oven.items 里被推，出来之后没人读 ——
+		//   留着是「已经不存在的事实的存档字段」，和 admit 里清 burnLeft 同理。
+		//   再放回炉子时 admit 会重新赋成满时长，所以清不清都不影响玩法，
+		//   但不清的话存档里会躺着一堆半截的倒计时，读的人会以为它还在烤
+		fly.roastLeft = null
+		fly.roastTotal = 0
 		// ⚠ 石化蝇从炉子里出来也还是在地上爬（「失去飞行」的第四个入口）
 		fly.mode = fly.canFly ? 'fly' : 'walk'
 		fly.modeTimer = 0
@@ -673,16 +771,29 @@ export class World {
 			// 用 updateJarred 是错的（那会把年龄推进减半），所以走普通 update
 			for (const f of oven.items) f.update(dtMs, this)
 
-			if (!oven.roasting) continue
-			oven.roastTimer -= dtMs
-			if (oven.roastTimer > 0) continue
-
-			// —— 出炉：结账 ——
-			const mul = this.roastMul()
+			// —— 每只各自推进自己的倒计时，烤满了就**当场**结账 ——
+			//
+			// ⚠ **倒着遍历**：结账时要把这一只从 `oven.items` 里摘掉，
+			//   正着 for...of 一边删一边走会漏掉紧跟着的那一只
+			//
+			// ⚠ 同一帧里可能有好几只同时烤满（比如连着拖进去的、或者存档读回来的），
+			//   所以飘字还是要按顺序错开，否则几个数字叠在一起看不清。
+			//   这里的 `i` 是**这一帧**里第几个结账的，不是炉子里的第几号
+			const mul = CONFIG.roast.oven.mul
 			const F = CONFIG.roast.oven.float
+			let settled = 0
 
-			let i = 0
-			for (const f of oven.items) {
+			for (let i = oven.items.length - 1; i >= 0; i--) {
+				const f = oven.items[i]
+				// ⚠ null = 没在烤（见 Fly.roastLeft 那段注释）。
+				//   这里**不能**写成 `!(f.roastLeft > 0)` —— 那样会把
+				//   「这一帧刚好烤满、roastLeft 归零」的那一只当成没在烤，
+				//   于是它永远结不了账，卡在炉子里
+				if (f.roastLeft === null) continue
+
+				f.roastLeft -= dtMs
+				if (f.roastLeft > 0) continue
+
 				// ⚠ `f.value` 必须在标 dead **之前**读 —— 它是从 age 派生的 getter，
 				//   顺序反了拿到的是死后的值（这里以前是「先给 addRemains 读、再标 dead」，
 				//   换成直接算钱之后，那个隐式的顺序保证就只剩这一行注释了）
@@ -690,34 +801,58 @@ export class World {
 
 				this._creditSale(gain)
 				// 飘字落在这只虫**自己在炉里的位置**上，而不是炉心 ——
-				// 5 只本来就散落在炉膛里，各冒各的才看得出「这只比那只值钱」
+				// 炉膛里本来就散落着几只，各冒各的才看得出「这只比那只值钱」
 				this.addFloatText(oven.x + f.x, oven.y + f.y, '+' + formatMoney(gain), {
-					delay: i * F.delayStep,
+					delay: settled * F.delayStep,
 				})
 
 				f.dead = true
 				f.causeOfDeath = 'roasted'
-				i++
+				f.roastLeft = null
+				oven.items.splice(i, 1)
+				settled++
 			}
-			oven.items = []
-			oven.roastTimer = null
 		}
 
 		this.ovens = this.ovens.filter((o) => !o.dead)
 	}
 
-	/** 当前烤制档位的倍率。没买就是 1（等于「不烤」） */
-	roastMul() {
-		const lv = this.shopLevel('roast')
-		if (lv <= 0) return 1
-		const tier = CONFIG.market.roastChain[lv - 1]
-		return tier ? tier.mul : 1
-	}
+	/**
+	 * 点火的每帧推进：惊慌 → 倒计时 → 烧完**自动出售**。
+	 *
+	 * ⚠ 结账**不走 `_resolveLifecycles`**，而是走 `sellFly`。理由要讲清楚：
+	 *   那条路是按 `causeOfDeath` 分派的，而它的 else 分支把**任何没被显式列出的
+	 *   死因都算成 natural，并且留一具尸体**（那个文件里警告过两次）。
+	 *   留它来收的话，玩家会**同时**拿到钱 + 地上一具尸体 + 一个「+1 自然老死」的
+	 *   计数 —— 三件事各自都不报错，只是数字全错。
+	 *   `sellFly` 自己会从 `this.flies` 里摘掉、置 `dead` 和 `'sold'`、
+	 *   钱走 `_creditSale`，而且**不留尸体** —— 正是「一次结算只写一份」的原路
+	 *
+	 * ⚠ 倒着遍历：`sellFly` 内部会 splice
+	 *
+	 * ⚠ 已知且**可以接受**的一个后果：正在产卵的母体被点着时不会乱飞
+	 *   （`Fly.update` 的 laying 分支返回得很早，`_panic` 那几行轮不到），
+	 *   它会安静地下满这几秒蛋然后被卖掉，没产完的那一窝就此消失。
+	 *   这是玩家**主动**拿火去点的，和养蝇人那种自动出售不是一回事，所以不修
+	 */
+	_updateBurning(dtMs) {
+		for (let i = this.flies.length - 1; i >= 0; i--) {
+			const f = this.flies[i]
+			if (f.dead || !(f.burnLeft > 0)) continue
 
-	/** 当前烤制档位（1/2/3），没买是 0 */
-	roastTier() {
-		const lv = this.shopLevel('roast')
-		return lv > 0 ? CONFIG.market.roastChain[lv - 1] : null
+			// 惊慌：复用挥手那一套（结束悬停 / 强制起飞 / 乱抽方向）。
+			// ⚠ 传 null —— 着火没有「要背离的那个点」，它只是自己身上在烧
+			this._panic(f, null)
+
+			f.burnLeft -= dtMs
+			if (f.burnLeft > 0) continue
+
+			// —— 烧完了，结账 ——
+			// ⚠ 先读 value 再卖：它是从 age 派生的 getter，sellFly 会把它标成 dead，
+			//   顺序反了拿到的是死后的值（和炉子那段是同一个坑）
+			const gain = this.sellFly(f, f.burnMul)
+			if (gain > 0) this.addFloatText(f.x, f.y, '+' + formatMoney(gain))
+		}
 	}
 
 	/**
@@ -1087,6 +1222,30 @@ export class World {
 				l.ateLastTick = true
 				f.nutrition -= drainPerLarva * dt
 				if (f.nutrition < 0) f.nutrition = 0
+
+				// —— 星空苹果：给幼虫骰一次「星云」 ——
+				//
+				// 位置必须**在这个「已经确认吃到」的分支里**：外面那些
+				// 抢不到位子的幼虫也贴在果子上，但它们一口都没啃到
+				// （见上面 eaters / maxEaters 那段注释）
+				//
+				// 三个条件缺一不可：
+				//   1. `f.type === 'star'` —— **成虫吃它没有任何事**，
+				//      所以这条路只在这里有，Fly 那边一行都不用加
+				//   2. `!l.starRolled` —— **一辈子只骰一次**，不是每口 10%。
+				//      没有它的话一份 200px 的星空苹果会被啃上千口，必中
+				//   3. 还没有星云 —— 已经有了就没什么可骰的
+				//
+				// ⚠ 用 `l.mutations = [...]` 换一个新数组，不 push 原地改：
+				//   mutations 是 revive / copyGenes 出来的独立数组，
+				//   原地改虽然也能跑，但一旦哪天有第二处共享了同一个数组引用，
+				//   症状会是「不知从哪冒出来一只星云」—— 换新数组把这个可能性掐掉
+				if (f.type === 'star' && !l.starRolled) {
+					l.starRolled = true
+					if (!hasMutation(l.mutations, 'nebula') && Math.random() < CONFIG.mutation.nebulaFromStar) {
+						l.mutations = [...l.mutations, 'nebula']
+					}
+				}
 			}
 		}
 	}
@@ -1215,6 +1374,17 @@ export class World {
 		// 排到它后面的话，尸体带的是上一帧的光环状态
 		this._applyGoldAura()
 
+		// 点火：惊慌 + 倒计时 + 烧完自动出售。
+		//
+		// ⚠ 排在 `_applyGoldAura` **之后** —— 结账读的是 `f.value`，
+		//   而 value 里含金光光环那个 ×1.1（光环每帧重写）。
+		//   排在它前面的话，卖出价用的是上一帧的光环状态
+		//
+		// ⚠ 排在成虫 update **之前**，理由和 `_applyStartle` 完全一样：
+		//   先把「惊慌」挂上，再让它们飞 —— 反了的话这一帧的速度加成
+		//   要等到下一帧才生效，着火的那一下会显得迟钝
+		this._updateBurning(dtMs)
+
 		// 疯狂蝇咬人。放在 update 循环**之前**：被打死的这一帧就不再更新了，
 		// 比「先动后死」（死尸还走了一步）自然一点
 		this._updateBerserk(dtMs)
@@ -1255,6 +1425,10 @@ export class World {
 		// 工具特效的持续发射。排在 _updateEffects 之前 —— 新发出来的粒子
 		// 本帧就会走一遍 update()，位置才是从发射点算起的
 		this._emitToolFx(dtMs)
+		// 烧着的蝇身上的火苗。和上面同一个理由排在 _updateEffects 之前；
+		// 它读的是 _updateBurning 刚推进过的 burnLeft，所以对「这一帧刚好烧完
+		// 被卖掉」的那些不会再发（sellFly 之后它们不在 this.flies 里了）
+		this._emitBurnFx(dtMs)
 		this._updateEffects(dtMs)
 		this._resolveLifecycles()
 		this._cleanup()
@@ -1286,7 +1460,6 @@ export class World {
 			return
 		}
 
-		const B = CONFIG.behavior
 		const R2 = R * R
 		for (const f of this.flies) {
 			const d2 = dist2(f.x, f.y, st.x, st.y)
@@ -1312,34 +1485,49 @@ export class World {
 			//   并且朝**背离指针**的方向逃
 			if (k <= CONFIG.tools.startleWakeAt) continue
 
-			f.pausing = false
-			f.hoverTimer = 0
-
-			// ⚠ 石化蝇（canFly = false）**吓也飞不起来**。
-			//
-			// 这是「失去飞行」五个入口里最难发现的一个 —— 它只在玩家
-			// 挥鼠标、而且指针恰好扫过那只石化蝇的时候才会走到。
-			// 漏掉它的症状是「那只石化的果蝇平时都在地上爬，
-			// 但一晃鼠标它就飞起来了」，而正常玩的时候很难复现。
-			// 它照样会受惊（速度倍率照加、照转方向），只是逃的方式是爬
-			if (f.mode !== 'fly' && f.canFly) {
-				f.mode = 'fly'
-				f.modeTimer = rand(B.flyMin, B.flyMax)
-				f.vx = 0
-				f.vy = 0
-			}
-
-			// 朝背离指针的方向逃。
-			// ⚠ 用 angleLerp 混一下而不是直接赋值：硬掰会让满屏果蝇
-			// 在同一帧齐刷刷转向，像被同一个磁场推开；
-			// 混一下各自保留一点原来的路线，才像各自在躲
-			const away = Math.atan2(f.y - st.y, f.x - st.x)
-			f.aim = angleLerp(f.aim, away, CONFIG.tools.startleTurn)
-
-			// 别让它在窜动节律里马上又改主意，否则刚转过去就被重抽掉。
-			// dartTimer 的单位是毫秒（和这个项目里所有时长一样）
-			f.dartTimer = Math.max(f.dartTimer, CONFIG.tools.startleDartHold)
+			this._panic(f, Math.atan2(f.y - st.y, f.x - st.x))
 		}
+	}
+
+	/**
+	 * 让一只自由成虫进入「惊慌」：结束停滞、起飞、把朝向掰开。
+	 *
+	 * 抽出来是因为它现在有**两个**调用方：挥手惊蝇（指针附近的每一只）
+	 * 和点火（烧着的每一只，见 `_updateBurning`）。
+	 *
+	 * ⚠ 抄一份的代价在这里：石化蝇「吓也飞不起来」那条规矩（见下）
+	 *   会有一份被漏掉，而那种 bug 只在「挥鼠标时指针恰好扫过一只石化蝇」
+	 *   或者「给石化蝇点了火」时才出现，几乎测不到
+	 *
+	 * @param {number|null} away 要背离的那个方向（弧度）。传 **null = 没有方向可躲** ——
+	 *   着火就是这一种：它不是被什么东西吓到，只是自己身上在烧。
+	 *   那时**不碰 aim**，让它照着自己的窜动节律乱飞，正是要的「慌」
+	 */
+	_panic(f, away) {
+		f.pausing = false
+		f.hoverTimer = 0
+
+		// ⚠ 石化蝇（canFly = false）**烧着也飞不起来**，只是爬得更快 ——
+		//   和「失去飞行」那五个入口是同一条规矩（见 Fly.canFly），
+		//   别在这儿另开一个例外
+		if (f.mode !== 'fly' && f.canFly) {
+			f.mode = 'fly'
+			f.modeTimer = rand(CONFIG.behavior.flyMin, CONFIG.behavior.flyMax)
+			f.vx = 0
+			f.vy = 0
+		}
+
+		if (away === null) return
+
+		// 朝背离那个点的方向逃。
+		// ⚠ 用 angleLerp 混一下而不是直接赋值：硬掰会让满屏果蝇
+		// 在同一帧齐刷刷转向，像被同一个磁场推开；
+		// 混一下各自保留一点原来的路线，才像各自在躲
+		f.aim = angleLerp(f.aim, away, CONFIG.tools.startleTurn)
+
+		// 别让它在窜动节律里马上又改主意，否则刚转过去就被重抽掉。
+		// dartTimer 的单位是毫秒（和这个项目里所有时长一样）
+		f.dartTimer = Math.max(f.dartTimer, CONFIG.tools.startleDartHold)
 	}
 
 	/**
@@ -1540,6 +1728,11 @@ export class World {
 			// 正在产卵的母体不动。把她卖掉会在场上留下一窝永远产不完的卵，
 			// 而玩家看到的是「刚才还在下蛋的那只突然没了」
 			if (f.laying) continue
+
+			// 正在烧的也不动。自动出售是**玩家没在看的时候**发生的，
+			// 而这一只再等几秒就能按 ×1.2 / ×1.5 结账 —— 现在按原价卖掉
+			// 是一笔玩家看得见的损失（他刚点的火，回来发现蝇没了、钱还少了）
+			if (f.burning) continue
 
 			// 筛的是**价值档**（普通 / 罕见 / 稀有 / 极稀有 / 超级稀有），
 			// 和数据面板上显示的那个词是同一个来源。
@@ -1885,7 +2078,7 @@ export class World {
 	 *   而丢一个已经快飘完的旧数字，没人看得出来
 	 */
 	addFloatText(x, y, text, opts) {
-		const F = CONFIG.roast.oven.float
+		const F = CONFIG.floatText
 		while (this.floatTexts.length >= F.maxCount) this.floatTexts.shift()
 		const t = new FloatText(x, y, text, opts)
 		this.floatTexts.push(t)
@@ -1978,22 +2171,89 @@ export class World {
 		for (let i = 0; i < n; i++) this._emitOneParticle(fx)
 	}
 
+	/**
+	 * 一颗火苗粒子，从 (x, y) 往上蹿、越飘越小（grow 为负 = 收尖）。
+	 *
+	 * ⚠ 抽成方法而不是让两家各自 `spawnParticle`：这里六个参数
+	 *   （向上的初速、`gravity: -40`、`drag: 3.4`、`grow: -0.5`、两档配色）
+	 *   是**调出来的一组值**。抄一份出去之后，改了这边那边不会跟着动，
+	 *   而症状只是「烧蝇的火苗和打火机的火苗看着不是同一种东西」——
+	 *   它像审美问题，所以没人会往「两份代码漂移了」上想
+	 *
+	 * 两个调用方：手里的打火机 / 喷火枪（`_emitOneParticle`）、
+	 * 被点着的蝇（`_emitBurnFx`）
+	 */
+	_emitFlameParticle(x, y, big) {
+		const F = CONFIG.tools.fx
+		this.spawnParticle(
+			x + rand(-2, 2),
+			y + rand(-2, 2),
+			rand(-14, 14),
+			-rand(26, big ? 90 : 58),
+			big ? (Math.random() < 0.5 ? '#cfe9ff' : '#ffd08a') : Math.random() < 0.5 ? '#fff0c0' : '#ffb14a',
+			rand(0.8, big ? 2.6 : 1.8),
+			{ life: big ? F.flameLifeBig : F.flameLife, gravity: -40, drag: 3.4, grow: -0.5 },
+		)
+	}
+
+	/**
+	 * 烧着的蝇身上的火苗。由 `_updateBurning` 推进的状态驱动，这里只负责发粒子。
+	 *
+	 * ⚠ 和 `_emitToolFx` 最大的不同：那个是**指针单例**（全世界只有一个
+	 *   `fx.x / fx.y`），这个是**从每一只烧着的蝇身上**发，所以不能复用它，
+	 *   但下面两条规矩必须一模一样：
+	 *
+	 *     1. 按**秒**累加（`acc += rate × dtMs / 1000`），不是每帧几颗。
+	 *        按帧算的话 10× 倍速下粒子会多十倍、掉帧时会少一大截，
+	 *        而两个方向都不报错
+	 *     2. 单帧封顶 `maxPerTick`。一帧卡了 500ms 之后累加器里会攒下几十颗，
+	 *        一次全倒出来就是一团糊
+	 *
+	 * ⚠ 累加器 `burnAcc` 是**全场共用一个**，不是每只蝇一个。三个理由：
+	 *   · 不用给 Fly 加一个会跟着存档走的字段（那个字段出了发射器毫无意义）
+	 *   · 封顶封的是「这一帧总共发几颗」，正是 maxPerTick 的用意 ——
+	 *     每只蝇各封一次的话，烧着 20 只就能在一帧里炸出 80 颗
+	 *   · 代价是粒子落在**哪一只**身上是随机的，但视觉上反而更好：
+	 *     火苗会在几只之间跳，比每只均匀分几颗更像一片火
+	 */
+	_emitBurnFx(dtMs) {
+		const F = CONFIG.tools.fx
+		const list = []
+		for (const f of this.flies) {
+			if (!f.dead && f.burnLeft > 0) list.push(f)
+		}
+		if (list.length === 0) {
+			this.burnAcc = 0
+			return
+		}
+
+		let rate = 0
+		for (const f of list) rate += f.burnBig ? F.flameRateBig : F.flameRate
+
+		this.burnAcc += rate * (dtMs / 1000)
+		let n = Math.floor(this.burnAcc)
+		if (n > F.maxPerTick) {
+			n = F.maxPerTick
+			this.burnAcc = 0
+		} else {
+			this.burnAcc -= n
+		}
+
+		for (let i = 0; i < n; i++) {
+			const f = list[Math.floor(Math.random() * list.length)]
+			// 落点散在**身体上**而不是一个点 —— 全挤在圆心像一根蜡烛
+			const s = (f.size ?? 12) * 0.22
+			this._emitFlameParticle(f.x + rand(-s, s), f.y + rand(-s, s), f.burnBig)
+		}
+	}
+
 	/** 一颗粒子落在哪儿、长什么样 —— 按工具分 */
 	_emitOneParticle(fx) {
 		const F = CONFIG.tools.fx
 
-		if (fx.tool === 'roast') {
-			// 火苗：从指针尖往上蹿，越飘越小（grow 为负 = 收尖）
-			const big = fx.level >= 2
-			this.spawnParticle(
-				fx.x + rand(-2, 2),
-				fx.y + rand(-2, 2),
-				rand(-14, 14),
-				-rand(26, big ? 90 : 58),
-				big ? (Math.random() < 0.5 ? '#cfe9ff' : '#ffd08a') : Math.random() < 0.5 ? '#fff0c0' : '#ffb14a',
-				rand(0.8, big ? 2.6 : 1.8),
-				{ life: big ? F.flameLifeBig : F.flameLife, gravity: -40, drag: 3.4, grow: -0.5 },
-			)
+		if (fx.tool === 'lighter' || fx.tool === 'flamer') {
+			// 火苗：从指针尖往上蹿。两档的差别由 fx.big 表达
+			this._emitFlameParticle(fx.x, fx.y, fx.big)
 			return
 		}
 
@@ -2072,17 +2332,24 @@ export class World {
 	 * （「隔离」就是靠这个白送的），所以这里必须显式再查一遍罐子。
 	 * 但**结算只写一份** —— 三条来源各自算一遍钱是最容易写歪的地方。
 	 *
-	 * 烤串是第三种：它既不在 this.flies 里、也不在任何罐子里，
-	 * 而且价钱要走 `skewer.price`（含烤制倍率）而不是 `fly.value`。
+	 * @param {object} fly
+	 * @param {number} [mul] 只作用在**活蝇**那一支上的倍率。点火器烧完自动出售时
+	 *   传它冻结在虫身上的 `burnMul`。
+	 *
+	 *   ⚠ **玩家用手动拖进出售区时不给这个参数**，也就是按原价卖。
+	 *     这是有意的：那笔倍率是「别去碰它、让它自己烧完」赚的，
+	 *     抓住一只正在烧的蝇等于自己放弃了它 —— 不是漏传了参数
+	 *
+	 *   ⚠ 尸体那一支**不吃这个倍率**。地上的尸体从 1.18.0 起没有倍率这一档了
+	 *     （`Remains.price` 里只乘掉价系数），传进来也会被忽略
 	 *
 	 * @returns {number} 这一只卖了多少钱（不存在、已经死了、哪儿都找不到就是 0）
 	 */
-	sellFly(fly) {
+	sellFly(fly, mul = 1) {
 		if (!fly || fly.dead) return 0
 
 		// 先认尸体。它在 remains 里，既不在 flies 也不在任何罐子里。
-		// ⚠ 只有 corpse 能卖（汁渍的 value 是 0，卖了也是 0 块钱），
-		// 而且**没烤过的也能卖** —— 只是按原价，烤过才有倍率
+		// ⚠ 只有 corpse 有价（汁渍的 value 是 0，卖了也是 0 块钱）
 		let gain
 		if (fly.kind === 'corpse' || fly.kind === 'stain') {
 			const ri = this.remains.indexOf(fly)
@@ -2098,7 +2365,12 @@ export class World {
 				if (!jar) return 0
 				jar.flies.splice(jar.flies.indexOf(fly), 1)
 			}
-			gain = fly.value
+			// ⚠ value 是 getter（含金光光环），要在标 dead 之前读
+			gain = fly.value * (Number.isFinite(mul) && mul > 0 ? mul : 1)
+			// 卖掉就是结清了 —— 不能留一个还能 tick 的倒计时。
+			// （本来也走不到了：dead 之后 _updateBurning 会跳过它，
+			//   但留着一个悬着的 burnMul 进存档是没有意义的）
+			this.extinguish(fly)
 		}
 
 		fly.dead = true
@@ -2106,6 +2378,27 @@ export class World {
 
 		this._creditSale(gain)
 		return gain
+	}
+
+	/**
+	 * 花钱摆一个烤炉。返回摆成了没有。
+	 *
+	 * ⚠ 上限的**真正闸门在这里**，UI 那边把按钮置灰只是提示 ——
+	 *   和 buyFood 同一条规矩：失败的操作**不留下任何痕迹**（钱不够不扣款、
+	 *   到上限不扣款）。这里只有一个，所以没有「退钱」那一半；
+	 *   但 dropOven 万一将来多出一条拒绝条件，这里必须退钱，
+	 *   否则就是「扣了钱没东西」，而玩家只会觉得钱莫名其妙少了
+	 */
+	buyOven() {
+		if (this.ovens.length >= CONFIG.roast.oven.maxCount) return false
+		const cost = ovenPrice()
+		if (!this.spend(cost)) return false
+		const oven = this.dropOven()
+		if (!oven) {
+			this.money += cost
+			return false
+		}
+		return true
 	}
 
 	/**
@@ -2209,10 +2502,31 @@ export class World {
 	// 所以升级链一律走下面这两个方法，别去碰 hasShopItem / buyShopItem
 	// （tools/simulate.js 和自检都依赖它们现在的一次性道具语义）。
 
-	/** 这条链升到几级了。没买过是 0 */
+	/**
+	 * 这条链升到几级了。没买过是 0。
+	 *
+	 * ⚠ **返回值必须夹在链长以内。** 等级是直接从存档里读回来的裸数字，
+	 *   而链的长度会跟着版本变 —— 1.18.0 把烤制链从三档砍到两档
+	 *   （烤炉出链、变成投放里 $5 的商品），老存档里那句 `shop.roast: 3`
+	 *   当场就成了越界值。
+	 *
+	 *   不夹的话 `chain[lv - 1].name` 会读到 undefined 并抛异常，
+	 *   而那个异常发生在**渲染循环里**（ui.update → refreshStats → refreshShop），
+	 *   会把整个主循环打死：表现是「读档之后屏幕上一个生物都没有」，
+	 *   而且不弹任何错误、面板还好好地挂在那儿 —— 极难归因。
+	 *
+	 *   夹住的代价只是「老玩家那一档作废」（烤炉现在是单独买的），
+	 *   不夹的代价是整个屏幕空掉。
+	 *
+	 * ⚠ 认不出的 id（不在任何一条链里）**不要返回 0**，原样返回数字 ——
+	 *   这个方法对一次性道具只是「顺手能读」，改变那部分语义会牵连别处
+	 */
 	shopLevel(id) {
 		const v = this.shop[id]
-		return Number.isFinite(v) ? v : 0
+		if (!Number.isFinite(v)) return 0
+		const chain = chainOf(id)
+		if (!chain) return Math.max(0, v)
+		return clamp(v, 0, chain.length)
 	}
 
 	/**
@@ -2263,6 +2577,10 @@ export class World {
 				if (dist2(x, y, e.x, e.y) > R2) continue
 				e.dead = true
 				e.causeOfDeath = 'swatted'
+				// 拍死 = 火也灭了。真正防「重复结算」的是 _updateBurning 里那句
+				// `if (f.dead) continue`，这里灭火只是把状态收干净 ——
+				// 不留一个悬着的 burnMul 在尸体上
+				this.extinguish(e)
 				killed++
 				this.burstJuice(e.x, e.y, e.size ?? 14)
 			}
@@ -2643,6 +2961,21 @@ export class World {
 				const fly = revive('adult', fd)
 				if (!fly || fly.dead) continue
 				if (oven.items.length >= oven.capacity) break
+
+				// ⚠ 老存档（1.20.x 及以前）里的炉子是**整炉一个倒计时**
+				//   （`Oven.roastTimer`），虫身上没有 `roastLeft`。那种档读进来
+				//   之后每一只的 `roastLeft` 都是 null —— 也就是「没在烤」，
+				//   而炉子**再也没有别的地方能给它开烤**了（1.21.0 起没有
+				//   「开烤」这个动作，全靠 admit 时挂上）。
+				//   不做这一步迁移的话，那些果蝇会**永远卡在炉子里**：
+				//   不烤、不卖、也拿不出来，而且不报任何错。
+				//
+				//   顺带也兜住了「手改过的存档」和「字段被写坏」两种输入
+				if (!Number.isFinite(fly.roastLeft) || !(fly.roastTotal > 0)) {
+					fly.roastLeft = CONFIG.roast.oven.roastMs
+					fly.roastTotal = CONFIG.roast.oven.roastMs
+				}
+
 				oven.items.push(fly)
 			}
 			this.ovens.push(oven)
@@ -2757,9 +3090,13 @@ export class World {
 			jarred: this.jarredCount,
 			ovens: this.ovens.length,
 			ovenItems: this.ovens.reduce((n, o) => n + o.items.length, 0),
-			// 尸体里能烤 / 烤过的数量。roastable 修的是汁渍 —— 它 value 是 0
-			corpses: this.remains.reduce((n, r) => n + (r.roastable ? 1 : 0), 0),
-			roasted: this.remains.reduce((n, r) => n + (r.roasted ? 1 : 0), 0),
+			// 有价的尸体数量。`sellable` 排掉的是汁渍 —— 它 value 是 0
+			//
+			// ⚠ 这里原来是 `r.roastable`，而且下面还有一行 `roasted`。
+			//   1.18.0 起尸体不能再烤，那两个成员一起删了；
+			//   只删成员不删这里的话，`undefined ? 1 : 0` 会**静默地恒为 0** ——
+			//   面板上的尸体数从此永远是 0，而不会报任何错
+			corpses: this.remains.reduce((n, r) => n + (r.sellable ? 1 : 0), 0),
 			shells: this.shells.length,
 			eating: this.larvae.reduce((n, l) => n + (l.eating ? 1 : 0), 0),
 			laying: this.flies.reduce((n, f) => n + (f.laying ? 1 : 0), 0),

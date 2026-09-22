@@ -203,3 +203,15 @@ export function foodPrice(type) {
 export function flyPrice() {
 	return CONFIG.market.prices.spawnFly
 }
+
+/**
+ * 摆一个烤炉的单价。
+ *
+ * ⚠ 它**没有**份数：烤炉一次只买一个（上限是 `CONFIG.roast.oven.maxCount`），
+ *   所以不需要 bulkPrice 那一套，也不该被塞进 `prices.food` ——
+ *   那张表是按「食物类型」索引的，塞进去会让 `Object.keys(prices.food)`
+ *   在 UI 和断言里凭空多出一个不是食物的键
+ */
+export function ovenPrice() {
+	return CONFIG.market.prices.oven
+}

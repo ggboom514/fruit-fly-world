@@ -41,6 +41,17 @@ contextBridge.exposeInMainWorld('pet', {
 	/** 删掉存档（「重新开始」时用） */
 	clearSave: () => ipcRenderer.invoke('pet:clear-save'),
 
+	// —— 彩蛋解锁 ——
+	//
+	// ⚠ 和存档**分开两个文件**：存档会被「重新开始」删掉，
+	//   而解锁要跨过那一步。详见主进程里 unlockFile() 那段注释
+
+	/** 读解锁状态。没解锁过返回 {ok:true, data:{}} */
+	loadUnlock: () => ipcRenderer.invoke('pet:load-unlock'),
+
+	/** 写解锁状态。只认 {star: boolean} 一个键（主进程会筛） */
+	saveUnlock: (data) => ipcRenderer.invoke('pet:save-unlock', data),
+
 	/** 主进程要退出了，让渲染进程赶紧存一次 */
 	onFlushSave: (callback) => {
 		ipcRenderer.on('pet:flush-save', () => callback())

@@ -206,6 +206,10 @@ function runSelfTest() {
 					'clearSave',
 					'onFlushSave',
 					'flushDone',
+					// 彩蛋解锁。这条桥断了的表现是「彩蛋解开了，重开一局又锁上」——
+					// 玩家只会觉得是运气问题，不会想到是桥断了
+					'loadUnlock',
+					'saveUnlock',
 				]
 				const missingBridge = bridgeMethods.filter((k) => typeof bridge[k] !== 'function')
 				if (missingBridge.length) return { ok: false, reason: 'preload 暴露的方法不全: ' + missingBridge.join(', ') }
@@ -538,26 +542,50 @@ function runSelfTest() {
 						return { ok: false, reason: '升级扣款数不对：' + (before - w4.money) }
 					}
 
-					// 买到 lv1 之后，工具栏那颗按钮要现身，并且写着这一档的名字
+					// —— 点火的两颗按钮：买到哪档就点亮哪颗 ——
+					//
+					// ⚠ 从 1.18.0 起，打火机和喷火枪是**两颗独立的按钮**
+					//   （不再是一颗「烤制」跟着档位改名）。两颗**一直显示**，
+					//   没买只是加上 locked 这个类 —— 「买过才出现」那种做法
+					//   会让按钮在工具栏里进进出出，位置来回跳
+					//
+					// ⚠ 写注释时**别用反引号**：这一整段住在一个模板字符串里，
+					//   一个反引号就会把它从中间截断，后面的中文会被当成代码求值，
+					//   报出来是「xxx is not a function」这种完全指错方向的消息。
+					//   这个坑这个项目已经踩过七次了
 					pet.ui.refreshToolButtons()
-					const roastBtn = document.getElementById('btn-roast')
-					if (roastBtn.classList.contains('hidden')) {
-						return { ok: false, reason: '买了打火机之后烤制按钮还是藏着的' }
+					const lighterBtn = document.getElementById('btn-lighter')
+					const flamerBtn = document.getElementById('btn-flamer')
+					if (!lighterBtn || !flamerBtn) {
+						return { ok: false, reason: '工具栏里找不到打火机 / 喷火枪那两颗按钮' }
 					}
-					if (roastBtn.textContent !== chain[0].name) {
-						return {
-							ok: false,
-							reason: '烤制按钮上写的是「' + roastBtn.textContent + '」，应当是「' + chain[0].name + '」',
-						}
+					// 单一那颗「烤制」必须已经不在了 —— 钉住旧结构被彻底换掉
+					if (document.getElementById('btn-roast') !== null) {
+						return { ok: false, reason: '旧的单一「烤制」按钮还在，应该已经换成打火机 + 喷火枪两颗' }
 					}
-					// 而 lv1 时它是个**工具**（按住烤），切得过去
-					pet.ui.setTool('roast')
-					if (pet.view.tool !== 'roast') {
-						return { ok: false, reason: '买了打火机却切不到烤制工具' }
+					if (lighterBtn.classList.contains('hidden') || flamerBtn.classList.contains('hidden')) {
+						return { ok: false, reason: '点火的两颗按钮不该带 hidden（没买只该是 locked）' }
+					}
+					// lv1：打火机解锁，喷火枪**仍然锁着**
+					if (lighterBtn.classList.contains('locked')) {
+						return { ok: false, reason: '买了打火机，打火机那颗按钮还是锁定态' }
+					}
+					if (!flamerBtn.classList.contains('locked')) {
+						return { ok: false, reason: '才 lv1 喷火枪就解锁了 —— 它是链条的第二级，应当还锁着' }
+					}
+
+					// 闸门：打火机切得过去，喷火枪切不过去
+					pet.ui.setTool('lighter')
+					if (pet.view.tool !== 'lighter') {
+						return { ok: false, reason: '买了打火机却切不到打火机工具' }
+					}
+					pet.ui.setTool('flamer')
+					if (pet.view.tool === 'flamer') {
+						return { ok: false, reason: '还没升级到喷火枪，却切过去了 —— setTool 的拥有权闸门没生效' }
 					}
 					pet.ui.setTool('none')
 
-					// 一路升到 lv3，按钮要跟着改名成烤炉，并且不再是个工具
+					// 一路升到满级
 					w4.money = 1000
 					for (let i = w4.shopLevel('roast'); i < chain.length; i++) {
 						pet.ui.refreshShop()
@@ -566,15 +594,51 @@ function runSelfTest() {
 						b.click()
 					}
 					pet.ui.refreshToolButtons()
-					const last = chain[chain.length - 1]
-					if (roastBtn.textContent !== last.name) {
+					// 满级之后两颗都该解锁
+					if (flamerBtn.classList.contains('locked')) {
+						return { ok: false, reason: '升到喷火枪了，那颗按钮还是锁定态' }
+					}
+					pet.ui.setTool('flamer')
+					if (pet.view.tool !== 'flamer') {
+						return { ok: false, reason: '升级到喷火枪之后切不过去 —— 闸门算错了等级' }
+					}
+					pet.ui.setTool('none')
+
+					// —— 老存档里的越界等级：链被改短之后不能把整个渲染循环炸掉 ——
+					//
+					// 1.18.0 **真实踩过**这个坑：烤制链从三档砍到两档（烤炉出链、
+					// 变成投放里 $5 的商品），而 1.17 写下的存档里是 shop.roast: 3。
+					// ui._chainRow 里那句 chain[lv - 1].name 于是读到 undefined 并抛
+					// TypeError —— 而那一行跑在**渲染循环里**
+					// （ui.update → refreshStats → refreshShop），一抛，
+					// 主循环就再也排不上下一帧。玩家的表现是
+					// 「读档之后屏幕上一个生物都没有」，而且不弹任何错误。
+					//
+					// 这里真的把等级设成越界值，再让商店**真的重建一次**
+					w4.shop.roast = chain.length + 1
+					try {
+						pet.ui.refreshShop()
+						pet.ui.refreshToolButtons()
+					} catch (e) {
 						return {
 							ok: false,
-							reason: '满级后按钮上写的是「' + roastBtn.textContent + '」，应当是「' + last.name + '」',
+							reason: '等级越界时重建商店抛异常了（读档空屏就是这么来的）: ' + e.message,
 						}
 					}
-					if (!roastBtn.classList.contains('hidden') === false) {
-						return { ok: false, reason: '满级后烤制按钮不该消失' }
+					const staleBtn = document.querySelector('#shop-list [data-chain="roast"]')
+					if (!staleBtn) return { ok: false, reason: '等级越界时商店里那一行整个没了' }
+					const staleName = staleBtn.closest('.shop-item').querySelector('.shop-name').textContent
+					// 夹回链长之后应当显示**最后一档**的名字，绝不是 undefined / 空串
+					const lastTierName = chain[chain.length - 1].name
+					if (!staleName || staleName.indexOf(lastTierName) !== 0) {
+						return {
+							ok: false,
+							reason: '等级越界时那一行显示的是「' + staleName + '」，应当是「' + lastTierName + '」',
+						}
+					}
+					// 两颗点火按钮也不该被越界等级弄崩（lv 夹成 2 = 两颗都解锁）
+					if (flamerBtn.classList.contains('locked')) {
+						return { ok: false, reason: '越界等级让喷火枪又变回锁定态了' }
 					}
 
 					// 捕虫网：买之前锁定、买之后解锁
@@ -906,85 +970,116 @@ function runSelfTest() {
 					return { ok: false, reason: '苍蝇拍落点失败: ' + e.message }
 				}
 
-				// —— 烤制改成吃尸体 ——
+				// —— 点火：碰到**活蝇**就点着 ——
+				//
+				// ⚠ 从 1.18.0 起，打火机 / 喷火枪不再烤地上的尸体，而是点着活着的成虫。
+				//   这一整段原来测的是「烤尸体」，现在换成「点火蝇」。
+				//   数值结算（烧完自动卖、不留尸体、不计自然老死）在无头模拟器里
+				//   逐条精确断言过了，这里测的是**窗口里那一套接线**：
+				//   闸门、_useTool、尸体点不着
 				try {
 					const w8 = pet.world
 					const chain = pet.config.market.roastChain
 					w8.remains.length = 0
+					w8.flies.length = 0
 					w8.shop.roast = chain.length
 
 					const f = w8.addFly(300, 300, 'F')
 					if (!f) return { ok: false, reason: 'addFly 失败' }
 					for (let i = 0; i < 600; i++) f.update(16, w8)
-					const value = f.value
-					const corpse = w8.addRemains(300, 300, 'corpse', f.size, 0, f)
-					if (!corpse) return { ok: false, reason: 'addRemains 没造出尸体' }
-					if (!corpse.roastable) {
-						return { ok: false, reason: '拍死留下的尸体不能烤 —— 烤制链没有入口' }
-					}
-					if (corpse.value !== value) {
-						return { ok: false, reason: '尸体上的售价快照不对' }
-					}
 
-					// 没烤过也能卖，但只有原价
-					if (Math.abs(corpse.price - value) > 1e-9) {
-						return { ok: false, reason: '新鲜尸体的价钱不等于原价' }
-					}
-
-					// 烤过之后乘倍率
-					const top = chain[chain.length - 1]
-					if (!w8.roast(corpse, top.mul)) return { ok: false, reason: '烤尸体失败了' }
-					if (Math.abs(corpse.price - value * top.mul) > 1e-9) {
-						return { ok: false, reason: '烤完没乘上倍率' }
-					}
-					// 每具只能烤一次
-					if (w8.roast(corpse, 1.2)) {
-						return { ok: false, reason: '同一具尸体被烤了第二次 —— 倍率会无限叠加' }
-					}
-
-					// 汁渍不能烤
-					const stain = w8.addRemains(10, 10, 'stain', 20, 0)
-					if (stain && (stain.roastable || w8.roast(stain, 1.8))) {
-						return { ok: false, reason: '汁渍被当成可烤的了 —— 它没有身体' }
-					}
-
-					// —— 接触即烤：**一次 _useTool 就要熟**，不许再计时 ——
+					// —— 一次 _useTool 就要点着，不许还要按住 ——
 					//
-					// ⚠ 这条走的是 UI 那一层（_useTool），不是直接调 world.roast。
-					//   直接调 world.roast 是测不出「有没有还要按住」的 ——
-					//   把计时逻辑加回去，那种断言照样绿
-					{
-						const c2 = w8.addRemains(400, 400, 'corpse', 14, 0, f)
-						if (!c2) return { ok: false, reason: '造不出接触即烤用的尸体' }
-						const mouseWas = { x: pet.view.mouse.x, y: pet.view.mouse.y }
-						const toolWas = pet.view.tool
-						pet.view.tool = 'roast'
-						pet.view.mouse.x = c2.x
-						pet.view.mouse.y = c2.y
-						// 只调**一次**，而且不累加任何时间
-						pet.ui._useTool()
-						if (!c2.roasted) {
-							pet.view.tool = toolWas
-							pet.view.mouse.x = mouseWas.x
-							pet.view.mouse.y = mouseWas.y
-							return {
-								ok: false,
-								reason: '指针碰到尸体那一下没有烤熟 —— 打火机 / 喷火枪应当是接触即烤，不该还要按住',
-							}
-						}
-						// 每具只能吃一次倍率：再扫一遍价钱不能变
-						const priceAfter = c2.price
-						pet.ui._useTool()
-						if (c2.price !== priceAfter) {
-							pet.view.tool = toolWas
-							pet.view.mouse.x = mouseWas.x
-							pet.view.mouse.y = mouseWas.y
-							return { ok: false, reason: '接触即烤之下反复蹭同一具尸体把倍率叠上去了' }
-						}
+					// ⚠ 这条走的是 UI 那一层（_useTool），不是直接调 world.ignite。
+					//   直接调 world.ignite 是测不出「有没有还要按住」的 ——
+					//   把「按住 N 秒」那种逻辑加回去，那种断言照样绿
+					const mouseWas = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+					const toolWas = pet.view.tool
+					pet.view.tool = 'lighter'
+					pet.view.mouse.x = f.x
+					pet.view.mouse.y = f.y
+					pet.ui._useTool() // 只调**一次**，不累加任何时间
+					if (!f.burning) {
 						pet.view.tool = toolWas
 						pet.view.mouse.x = mouseWas.x
 						pet.view.mouse.y = mouseWas.y
+						return {
+							ok: false,
+							reason: '指针碰到成虫那一下没有点着 —— 打火机应当是接触即燃，不该还要按住',
+						}
 					}
+					if (f.burnMul !== chain[0].mul) {
+						return { ok: false, reason: '点着时没有把打火机的倍率冻结在蝇身上' }
+					}
+					if (f.burnLeft !== chain[0].burnMs) {
+						return { ok: false, reason: '燃烧时长不是打火机的 burnMs' }
+					}
+
+					// 反复蹭同一只不能把倒计时重置 —— 按住工具时 _useTool 每帧都跑
+					const leftBefore = f.burnLeft
+					pet.ui._useTool()
+					if (f.burnLeft !== leftBefore) {
+						pet.view.tool = toolWas
+						pet.view.mouse.x = mouseWas.x
+						pet.view.mouse.y = mouseWas.y
+						return { ok: false, reason: '按住不放把燃烧倒计时重置了 —— 那样永远烧不完' }
+					}
+
+					// —— 地上的尸体现在**点不着** ——
+					//
+					// ⚠ 这一条钉的是「尸体不能再烤」这个新契约。少了它，
+					//   谁把尸体那条路加回来都不会被发现
+					const corpse = w8.addRemains(600, 300, 'corpse', f.size, 0, f)
+					if (!corpse) return { ok: false, reason: 'addRemains 没造出尸体' }
+					const fliesBefore = w8.flies.length
+					pet.view.mouse.x = corpse.x
+					pet.view.mouse.y = corpse.y
+					pet.ui._useTool()
+					if (corpse.burning) {
+						return { ok: false, reason: '尸体被点着了 —— 点火器只该认活着的成虫' }
+					}
+					if (w8.flies.length !== fliesBefore) {
+						return { ok: false, reason: '点火器把一只不在指针底下的蝇点着了 —— 判定半径太大' }
+					}
+					// 尸体还是只有原价这一档
+					if (Math.abs(corpse.price - corpse.value * corpse.decayFactor) > 1e-9) {
+						return { ok: false, reason: '尸体的价钱不等于「原价 × 掉价」—— 倍率那条路没删干净' }
+					}
+
+					// —— 喷火枪的判定半径**比打火机大一圈** ——
+					//
+					// ⚠ 「一小圈范围」这件事就是靠这两个数的差表达的：两把枪
+					//   仍然是单目标，但喷火枪够得着得多。数值住在
+					//   market.roastChain[].pickRadius 上
+					//
+					//   少了这条断言的话，谁把 pickRadius 抄成同一个数、
+					//   或者干脆忘了给 flamer 写，都不会有人发现 ——
+					//   症状只是「喷火枪好像没变大」，而那是主观的
+					const rLight = w8.burnRadiusFor('lighter')
+					const rFlame = w8.burnRadiusFor('flamer')
+					if (!(rLight > 0) || !(rFlame > 0)) {
+						return { ok: false, reason: '点火器的判定半径读出来是 ' + rLight + ' / ' + rFlame }
+					}
+					if (!(rFlame > rLight)) {
+						return {
+							ok: false,
+							reason: '喷火枪的判定半径 ' + rFlame + ' 不比打火机的 ' + rLight + ' 大 —— 两把枪手感一样了',
+						}
+					}
+					// 而且 UI 真的按**手里那把**去取，不是按等级取一个共用的
+					const toolWas2 = pet.view.tool
+					pet.view.tool = 'lighter'
+					const uiR = w8.burnRadiusFor(pet.view.tool)
+					pet.view.tool = 'flamer'
+					const uiR2 = w8.burnRadiusFor(pet.view.tool)
+					pet.view.tool = toolWas2
+					if (uiR !== rLight || uiR2 !== rFlame) {
+						return { ok: false, reason: '按手里那把取半径，拿到的却不是各自那个数' }
+					}
+
+					pet.view.tool = toolWas
+					pet.view.mouse.x = mouseWas.x
+					pet.view.mouse.y = mouseWas.y
 
 					// 掉价：前 5 分钟不变，之后往下走
 					const fresh = w8.addRemains(0, 0, 'corpse', 14, 0, f)
@@ -997,15 +1092,17 @@ function runSelfTest() {
 					}
 
 					w8.remains.length = 0
+					w8.flies.length = 0
 					w8.shop.roast = 0
+					w8.floatTexts.length = 0
 					// ⚠ 上面那几次 _useTool 会走 refreshStats → refreshToolButtons，
-					//   而那时候 shop.roast 还是满级 —— 烤制按钮于是被摘掉了 .hidden。
+					//   而那时候 shop.roast 还是满级 —— 两颗点火按钮于是被摘掉了 locked。
 					//   把等级改回来**不会**自动同步 DOM，得显式再刷一次，
-					//   否则后面「还没买打火机，烤制按钮不该出现」那条会红，
+					//   否则后面「还没买打火机，两颗按钮应当都锁着」那条会红，
 					//   而报出来的位置离真正的原因隔了好几屏
 					pet.ui.refreshToolButtons()
 				} catch (e) {
-					return { ok: false, reason: '尸体烤制流程失败: ' + e.message }
+					return { ok: false, reason: '点火流程失败: ' + e.message }
 				}
 
 				// 先塞几只幼虫进去再画。
@@ -1145,10 +1242,11 @@ function runSelfTest() {
 					if (toolsBox.classList.contains('collapsed')) {
 						return { ok: false, reason: '点了标题行但工具组没有展开' }
 					}
-					// ⚠ 基准要拿「**没被 .hidden 藏起来的**」那一批，不能直接拿
-					// toolButtons.length —— 烤制按钮在买了打火机之前是藏起来的，
-					// 用总数当基准的话这条断言会在开局就红
-					const shown = pet.ui.toolButtons.filter((b) => !b.classList.contains('hidden'))
+					// ⚠ 1.18.0 起**没有任何工具按钮带 hidden 这个类了** ——
+					//   点火那两颗以前是「买到打火机才现身」，现在改成一直显示、
+					//   没买只是加上 locked（和捕虫网同一套）。
+					//   所以可见数应当**等于**总数，不再需要「先滤掉 hidden」那一步
+					const shown = pet.ui.toolButtons
 					const visible = Array.from(document.querySelectorAll('#tools [data-tool]')).filter(
 						(b) => b.getBoundingClientRect().width > 0,
 					)
@@ -1159,11 +1257,17 @@ function runSelfTest() {
 						}
 					}
 
-					// 烤制按钮：没买之前必须整个藏起来
-					const roastBtn = document.getElementById('btn-roast')
-					if (!roastBtn) return { ok: false, reason: '#btn-roast 不存在' }
-					if (!roastBtn.classList.contains('hidden')) {
-						return { ok: false, reason: '还没买打火机，烤制按钮不该出现' }
+					// 点火那两颗：没买之前是**锁定态，但必须仍然可见可点** ——
+					// 做成 hidden 的话按钮会在工具栏里进进出出，位置来回跳
+					for (const id of ['btn-lighter', 'btn-flamer']) {
+						const b = document.getElementById(id)
+						if (!b) return { ok: false, reason: '#' + id + ' 不存在' }
+						if (b.classList.contains('hidden')) {
+							return { ok: false, reason: '还没买点火器，' + id + ' 却整个藏起来了（该只是 locked）' }
+						}
+						if (!b.classList.contains('locked')) {
+							return { ok: false, reason: '还没买点火器，' + id + ' 却已经解锁了' }
+						}
 					}
 
 					// 捕虫网：没买之前是**锁定态，但必须仍然可点**。
@@ -1529,18 +1633,45 @@ function runSelfTest() {
 
 					pet.ui.refreshFeed()
 					const feedBtns = grabBtns()
-					// 3 种能买的 × 2 档 = 6 个按钮。玻璃罐那一行**不在这 6 个里** ——
-					// 它是免费的，没有 [data-kind]，走的是 [data-jar]
-					if (feedBtns.length !== 6) {
+					// 3 种能买的 × 2 档 = 6，加上烤炉那**一个** = 7。
+					//
+					// ⚠ 烤炉和上面三种不一样：它花钱但**一次只买一个**，
+					//   所以没有 data-n，一个 id 只出一个按钮。
+					//   玻璃罐那一行**不在这 7 个里** —— 它免费，没有 [data-kind]，
+					//   走的是 [data-jar]
+					// ⚠ 按钮数**从 ui.unlockedFoodIds() 现算**，不写死。
+					//   写死的话，彩蛋解锁之后这里会变成 9 和 7 对不上，
+					//   而那是**正确行为** —— 断言会在玩家解锁的那一刻变红。
+					//   食物类：每种食物 2 档；其他类：果蝇 2 档 + 烤炉 1 个
+					//   （玻璃罐免费、没有 [data-kind]，不在这几个里）
+					const unlockedFoods = pet.ui.unlockedFoodIds()
+					const wantBtns = unlockedFoods.length * 2 + 2 + 1
+					if (feedBtns.length !== wantBtns) {
 						return {
 							ok: false,
-							reason: '投放弹窗渲染出了 ' + feedBtns.length + ' 个按钮，应当是 6 个（3 行 × 2 档）',
+							reason:
+								'投放弹窗渲染出了 ' + feedBtns.length + ' 个按钮，应当是 ' + wantBtns +
+								' 个（' + unlockedFoods.length + ' 种食物 × 2 档 + 果蝇 2 档 + 烤炉 1 个）',
 						}
 					}
-					for (const kind of ['apple', 'gold', 'fly']) {
+					for (const kind of [...unlockedFoods, 'fly']) {
 						if (feedBtns.filter((b) => b.dataset.kind === kind).length !== 2) {
 							return { ok: false, reason: '投放弹窗里「' + kind + '」那一行不是 2 个按钮' }
 						}
+					}
+					// 彩蛋没解锁时，星空苹果**一个按钮都不该有**。
+					// ⚠ 这条是彩蛋的入口守卫：漏了的话 unlockedFoodIds() 的过滤
+					//   形同虚设，而界面上看起来只是「多了一行」—— 完全不像 bug
+					if (!pet.ui.starUnlocked && feedBtns.some((b) => b.dataset.kind === 'star')) {
+						return { ok: false, reason: '还没解锁，投放弹窗里却已经有星空苹果了' }
+					}
+					// ⚠ 烤炉单独验，**不要塞进上面那个循环** ——
+					//   那个循环按 key.split('-') 取 n 再和 dataset.n 比，
+					//   而烤炉按钮**根本没有 data-n**，两者都是 undefined，
+					//   于是它会「碰巧」通过。碰巧通过等于没测
+					const ovenRow = feedBtns.filter((b) => b.dataset.kind === 'oven')
+					if (ovenRow.length !== 1) {
+						return { ok: false, reason: '投放弹窗里烤炉那一行有 ' + ovenRow.length + ' 个按钮，应当是 1 个' }
 					}
 					// —— 分组：食物类 / 其他，玻璃罐在「其他」里 ——
 					//
@@ -1551,20 +1682,24 @@ function runSelfTest() {
 					for (const cat of pet.config.market.feedCats) {
 						const box = feedList.querySelector('[data-cat="' + cat.id + '"]')
 						if (!box) return { ok: false, reason: '投放弹窗里没有「' + cat.name + '」这个分组' }
+						// ⚠ 期望值走 unlockedFoodIds()，不是 cat.items —— 星空苹果
+						//   在解锁之前**故意不渲染**，拿 config 的原始列表去比，
+						//   会在每个没解锁的玩家那里都红一条（而那是正确行为）
+						const wantItems = cat.id === 'food' ? unlockedFoods : cat.items
 						// 把行上的 id 收成一个去重集合（同一行的两个按钮会给出同一个 id）
 						const ids = new Set()
 						for (const b of box.querySelectorAll('[data-kind],[data-jar]')) {
 							ids.add(b.dataset.jar !== undefined ? 'jar' : b.dataset.kind)
 						}
-						if (ids.size !== cat.items.length) {
+						if (ids.size !== wantItems.length) {
 							return {
 								ok: false,
 								reason:
-									'「' + cat.name + '」里有 ' + ids.size + ' 行，配置里写了 ' + cat.items.length + ' 行（' +
+									'「' + cat.name + '」里有 ' + ids.size + ' 行，应当是 ' + wantItems.length + ' 行（' +
 									[...ids].join(',') + '）',
 							}
 						}
-						for (const id of cat.items) {
+						for (const id of wantItems) {
 							if (!ids.has(id)) {
 								return { ok: false, reason: '「' + cat.name + '」里没有「' + id + '」这一行' }
 							}
@@ -1586,7 +1721,7 @@ function runSelfTest() {
 							}
 						}
 					}
-					// 钱不够时六个按钮必须全禁用 —— 和商店同一条：光靠点击时报错的话，
+					// 钱不够时那七个按钮必须全禁用 —— 和商店同一条：光靠点击时报错的话，
 					// 玩家会以为「点了没反应」。
 					// ⚠ 玻璃罐**不在此列**：它免费，钱是 0 也该能点。
 					//   一起禁用的话，穷的时候连罐子都摆不了，而那不是设计意图
@@ -1608,11 +1743,111 @@ function runSelfTest() {
 					if (jarStillOn && jarStillOn.disabled) {
 						return { ok: false, reason: '钱是 0 时玻璃罐被禁用了 —— 它不花钱，应当照常能摆' }
 					}
-					// 给够钱再刷一次：六个都得活过来
+					// 给够钱再刷一次：七个都得活过来。
+					//
+					// ⚠ 10 是这几个按钮里最贵的那个（烤炉 $5）的**两倍** ——
+					//   以后把任何一件调价调到 10 以上，这里会红。
+					//   那时改这个数，**不要**改成 100 图省事：
+					//   那样「钱刚够」和「钱多得多」就没区别了，这条断言也就不再守着边界
 					pet.world.money = 10
 					pet.ui.refreshFeed()
 					if (grabBtns().some((b) => b.disabled)) {
 						return { ok: false, reason: '钱给够了却还有投放按钮是禁用状态' }
+					}
+					pet.world.money = 0
+
+					// —— 烤炉那一行：$5 摆一个，撞上限要置灰 ——
+					//
+					// ⚠ 也是**真实点击**，理由同下面玻璃罐那段：
+					//   直接调 world.buyOven() 的话，委托监听漏挂、按钮挡住、
+					//   data-kind 写错 —— 三种坏法全都测不出来
+					pet.world.ovens.length = 0
+					pet.world.money = pet.config.market.prices.oven
+					pet.ui.refreshFeed()
+					const ovenClick = feedList.querySelector('[data-kind="oven"]')
+					if (!ovenClick) return { ok: false, reason: '烤炉那一行不见了' }
+					if (ovenClick.disabled) {
+						return { ok: false, reason: '钱刚好等于烤炉价格，按钮却是禁用的' }
+					}
+					// 按钮上要看得见价格
+					if (!ovenClick.textContent.includes('$5.000')) {
+						return {
+							ok: false,
+							reason: '烤炉按钮上写的是「' + ovenClick.textContent + '」，应当含配置价 $5.000',
+						}
+					}
+					ovenClick.click()
+					if (pet.world.ovens.length !== 1) {
+						return { ok: false, reason: '点了烤炉按钮却没有摆出炉子（现在 ' + pet.world.ovens.length + ' 个）' }
+					}
+					if (Math.abs(pet.world.money) > 1e-9) {
+						return { ok: false, reason: '买了烤炉之后钱应当正好归零，现在是 ' + pet.world.money }
+					}
+					// 摆满之后必须置灰，而不是点了没反应
+					const ovenCap = pet.config.roast.oven.maxCount
+					pet.world.money = 1000
+					while (pet.world.ovens.length < ovenCap) pet.world.buyOven()
+					pet.ui.refreshFeed()
+					const ovenFull = feedList.querySelector('[data-kind="oven"]')
+					if (!ovenFull.disabled) {
+						return { ok: false, reason: '烤炉摆满了（' + ovenCap + ' 个），那颗按钮却还能点' }
+					}
+					// 收拾干净
+					pet.world.ovens.length = 0
+					pet.world.money = 0
+					pet.ui.refreshFeed()
+
+					// —— 分类折叠：折起来之后，**钱一变也不能弹回去** ——
+					//
+					// ⚠ 这是折叠功能唯一会真坏的地方。_renderCats 每次都是
+					//   innerHTML = '' 整块重建，而 refreshStats() 在**钱一变**
+					//   就同时调 refreshShop + refreshFeed。
+					//   折叠状态要是挂在 DOM 的 class 上，钱一动它就自己弹回去了 ——
+					//   而这个 bug 只在「玩着玩着卖了一只蝇」的时候出现，
+					//   看着完全随机，几乎不可能手工复现
+					for (const spec of [['feed-list', 'feed', 'other'], ['shop-list', 'shop', 'tool']]) {
+						const listId = spec[0]
+						const groupName = spec[1]
+						const catId = spec[2]
+						const listEl = document.getElementById(listId)
+						// 两张表都要先刷一次，拿到干净的 DOM
+						if (listEl === feedList) pet.ui.refreshFeed()
+						else pet.ui.refreshShop()
+
+						const box = listEl.querySelector('[data-cat="' + catId + '"]')
+						if (!box) return { ok: false, reason: listId + ' 里没有「' + catId + '」这一组' }
+						const toggle = box.querySelector('.cat-toggle')
+						if (!toggle) {
+							return { ok: false, reason: listId + ' 的分类标题不是一个能点的折叠按钮' }
+						}
+						if (box.classList.contains('collapsed')) {
+							return { ok: false, reason: listId + ' 的分类默认应当是展开的' }
+						}
+						toggle.click()
+						if (!box.classList.contains('collapsed')) {
+							return { ok: false, reason: '点了 ' + listId + ' 的分类标题却没有折叠' }
+						}
+
+						// 让钱变一下 —— 这一步会重建两个弹窗的整块 DOM
+						pet.world.money += 1
+						pet.ui.refreshStats()
+
+						const again = listEl.querySelector('[data-cat="' + catId + '"]')
+						if (!again) return { ok: false, reason: '刷新之后 ' + listId + ' 里找不到那一组了' }
+						if (!again.classList.contains('collapsed')) {
+							return {
+								ok: false,
+								reason:
+									'钱一变，' + groupName + ' 那一侧的折叠就弹回去了 —— ' +
+									'折叠状态存在 DOM 的 class 上了，要存在 ui.collapsedCats 这个 Set 里',
+							}
+						}
+						// 展开回去，别把状态留给后面的断言
+						const t2 = again.querySelector('.cat-toggle')
+						if (t2) t2.click()
+						if (again.classList.contains('collapsed')) {
+							return { ok: false, reason: '再点一下应当能展开，但没有' }
+						}
 					}
 					pet.world.money = 0
 
@@ -1873,10 +2108,30 @@ function runSelfTest() {
 					// 弹窗长得完全正常，中间一个空白框，自检也全绿。
 					// naturalWidth 是 0 就说明这张图根本没读进来
 					if (!qr.complete || qr.naturalWidth === 0) {
-						return { ok: false, reason: '支付宝二维码没加载出来（naturalWidth=0）—— 检查 renderer/assets/alipay-qr.png' }
+						return { ok: false, reason: '支付宝二维码没加载出来（naturalWidth=0）—— 检查 renderer/assets/alipay-qr.jpg' }
 					}
 					if (qr.naturalWidth < 200) {
 						return { ok: false, reason: '二维码只有 ' + qr.naturalWidth + 'px 宽，扫不出来' }
+					}
+
+					// —— 星云贴图真的加载出来了 ——
+					//
+					// ⚠ 和上面那条二维码一模一样：路径写错时 new Image()
+					//   **不报错、不抛异常**，只是永远不 onload。不查的话，
+					//   表现是「星空苹果是一块纯紫果肉」—— 看着像美术选择，
+					//   其实是 404，而且它只在**彩蛋解锁之后**才看得见，
+					//   没解锁的玩家和大部分自检都碰不到
+					const nb = pet.nebulaInfo()
+					if (!nb.ready) {
+						return {
+							ok: false,
+							reason: '星云贴图没加载出来（failed=' + nb.failed + '）—— 检查 ' + nb.src,
+						}
+					}
+					// 原图尺寸也是契约：分块的 cover 缩放按它算，
+					// 换成一张小图会被整套拉成一片糊
+					if (nb.w !== 1686 || nb.h !== 766) {
+						return { ok: false, reason: '星云贴图是 ' + nb.w + '×' + nb.h + '，应当是 1686×766' }
 					}
 
 					// ⚠ 和悬停卡片 / 食物投放区**相反**：指针压在卡片上时必须把鼠标要过来，
@@ -2092,6 +2347,22 @@ function runSelfTest() {
 						}
 						if (cs.animationName !== 'inspect-in') {
 							return { ok: false, reason: '卡片的入场动画是 ' + cs.animationName + '，应当是 inspect-in' }
+						}
+						// 卡片必须自己裁掉溢出的内容 —— 这是那道反光唯一的约束：
+						// 它是一条和卡片等大的横条，translateX 走到两头时整个身子在
+						// 卡片外面，没有祖先的 overflow 就会飞出去扫桌面。
+						//
+						// ⚠ 别改成查 getComputedStyle(inspect, '::after').overflow：
+						//   那句在修好之前**也是** 'hidden'（当年正是错写在了伪元素
+						//   自己身上 —— 而 overflow 裁的是子孙，伪元素没有子孙）。
+						//   拿它当断言会永远绿。这里查的必须是卡片**自己**。
+						if (cs.overflow === 'visible') {
+							return {
+								ok: false,
+								reason:
+									'价值 $' + v + ' 的卡片没有裁掉溢出的内容（overflow: ' + cs.overflow +
+									'）—— 反光扫过会从卡片边上飞出去扫到桌面上',
+							}
 						}
 						if (cs.borderTopColor !== rgb) {
 							return {
@@ -3036,11 +3307,14 @@ function runSelfTest() {
 
 					// 食物格：数量 = 配置里那两种，而且每一格都画了东西
 					const foodCells = cbody.querySelectorAll('[data-food]')
-					const wantFoods = pet.config.market.feedCats[0].items
+					// ⚠ 期望值走 unlockedFoodIds() —— 星空苹果在解锁之前
+					//   **故意不在图鉴里出现**（剧透）。拿 config 的原始列表比，
+					//   会在每个没解锁的玩家那里都红一条，而那是正确行为
+					const wantFoods = pet.ui.unlockedFoodIds()
 					if (foodCells.length !== wantFoods.length) {
 						return {
 							ok: false,
-							reason: '图鉴里画了 ' + foodCells.length + ' 种食物，配置里有 ' + wantFoods.length + ' 种',
+							reason: '图鉴里画了 ' + foodCells.length + ' 种食物，应当是 ' + wantFoods.length + ' 种',
 						}
 					}
 					for (const cell of foodCells) {
@@ -3060,12 +3334,16 @@ function runSelfTest() {
 
 					// 突变格：数量 = CONFIG.mutation.types，而且每格都带一枚胶囊
 					const geneCells = cbody.querySelectorAll('[data-gene]')
-					if (geneCells.length !== pet.config.mutation.types.length) {
+					// ⚠ 期望值要排掉星云 —— 它在解锁之前**故意不出现**（剧透），
+					//   和星空苹果同一条规矩。拿 config 的原始长度去比，
+					//   会在每个没解锁的玩家那里都红一条，而那是**正确行为**
+					const shownGenes = pet.config.mutation.types.filter(
+						(t) => t.id !== 'nebula' || pet.ui.starUnlocked,
+					)
+					if (geneCells.length !== shownGenes.length) {
 						return {
 							ok: false,
-							reason:
-								'图鉴里列了 ' + geneCells.length + ' 种基因，配置里有 ' +
-								pet.config.mutation.types.length + ' 种',
+							reason: '图鉴里列了 ' + geneCells.length + ' 种基因，应当是 ' + shownGenes.length + ' 种',
 						}
 					}
 					for (const cell of geneCells) {
@@ -3183,8 +3461,28 @@ function runSelfTest() {
 					pet.renderer.dpr = realDpr
 					for (const k of Object.keys(stash)) W2[k] = stash[k]
 
-					if (!(plain.cover > 0 && plain.bodyA > 150)) {
-						return { ok: false, reason: '画不出一只实心的普通成虫 —— 这条断言量不到东西' }
+					// 这条断言的用途只是「确认真的量到一只实心蝇」—— 也就是别让
+					// 下面那条「结晶 < 80」变成对空画布也成立的空断言。
+					//
+					// 门槛 110 是**量出来的**，不是拍的：14 次采样里普通蝇的 bodyA
+					// 落在 146~162（均值 154），结晶蝇约 46 —— 110 两头都留得开。
+					//
+					// ⚠ **别把门槛调回 150 附近**。它正好落在普通蝇的自然波动里
+					//   （蝇的朝向是随机的，采样框里腿 / 翅像素的占比跟着变），
+					//   实测大约每 4 次就有 1 次误报；而误报的代价是
+					//   「自检随机变红」，比不测还糟
+					if (!(plain.cover > 0 && plain.bodyA > 110)) {
+						// 把量到的数一起报出来 —— 只写「量不到东西」的话，
+						// 下次它再偶发失败，没人知道量到的到底是什么
+						return {
+							ok: false,
+							reason:
+								'画不出一只实心的普通成虫 —— 这条断言量不到东西（墨量 ' +
+								plain.cover +
+								' px，身体平均不透明度 ' +
+								Math.round(plain.bodyA) +
+								'，需要 >0 且 >150）',
+						}
 					}
 					// ① 全透明：身体的平均不透明度要掉到很低。
 					//    身体 alpha 是 0.14，实测约 36/255；门槛定 80
@@ -3237,6 +3535,68 @@ function runSelfTest() {
 					)
 				} catch (e) {
 					return { ok: false, reason: '结晶成虫外观检查失败: ' + e.message }
+				}
+
+				// —— 星空苹果：贴图是**世界锚定**的 ——
+				//
+				// 用户点名要的效果：星云钉在屏幕上不动，果子像一扇窗，
+				// 挪动时透出来的是星云的不同部分。
+				//
+				// ⚠ 判据是「同一个果子画在屏幕两个不同位置，它自己那一小块
+				//   像素**不一样**」。如果贴图是跟着果子走的（本地坐标），
+				//   两处会**逐像素相同** —— 这正是要抓的那个错。
+				//
+				// ⚠ 必须把 seed 和 angle 钉死。不钉的话两个多边形本来就不同，
+				//   断言会平凡通过，测的就成了「随机数有没有起作用」
+				let starTextureDiff = -1
+				try {
+					const W3 = pet.world
+					const stash3 = {}
+					for (const k of Object.keys(W3)) {
+						if (Array.isArray(W3[k])) {
+							stash3[k] = W3[k]
+							W3[k] = []
+						}
+					}
+					const cv3 = document.createElement('canvas')
+					cv3.width = W3.w
+					cv3.height = W3.h
+					const realCtx3 = pet.renderer.ctx
+					const realDpr3 = pet.renderer.dpr
+					pet.renderer.ctx = cv3.getContext('2d')
+					pet.renderer.dpr = 1
+
+					// 采样：把果子摆到 x，取果子中心 12×12 那一块
+					const shootAt = (x) => {
+						W3.foods.length = 0
+						const f = W3.addFood(x, 400, 'star', 60)
+						f.seed = 7
+						f.angle = 0
+						f.age = 0
+						pet.renderer.draw(W3, pet.view)
+						const d = pet.renderer.ctx.getImageData(x - 6, 394, 12, 12).data
+						W3.foods.length = 0
+						return d
+					}
+					const pxA = shootAt(300)
+					const pxB = shootAt(1100)
+					pet.renderer.ctx = realCtx3
+					pet.renderer.dpr = realDpr3
+					for (const k of Object.keys(stash3)) W3[k] = stash3[k]
+
+					let diff = 0
+					for (let i = 0; i < pxA.length; i++) if (pxA[i] !== pxB[i]) diff++
+					if (diff < 20) {
+						return {
+							ok: false,
+							reason:
+								'星空苹果在两个位置上画出来几乎一样（' + diff +
+								'/576 个通道不同）—— 贴图是跟着果子走的，不是钉在屏幕上',
+						}
+					}
+					starTextureDiff = diff
+				} catch (e) {
+					return { ok: false, reason: '世界锚定贴图检查失败: ' + e.message }
 				}
 
 				// —— 居中小卡的 ✕：必须**真的**点得到 ——
@@ -3581,11 +3941,17 @@ function runSelfTest() {
 					const savedToolFx = pet.view.tool
 					const savedMouseX = pet.view.mouse.x
 					const savedMouseY = pet.view.mouse.y
+					const savedBurnLv = pet.world.shopLevel('roast')
 					pet.view.mouse.x = 640
 					pet.view.mouse.y = 420
-					pet.ui.setTool('roast')
-					if (pet.view.tool !== 'roast') {
-						return { ok: false, reason: '打火机切不过去（view.tool 还是 ' + pet.view.tool + '）' }
+					// ⚠ 打火机现在有**拥有权闸门**了（1.18.0 起它和喷火枪是两颗
+					//   各自受管的按钮），所以得先真的买过才切得过去。
+					//   下面这句 setTool 会失败的话，恰好证明闸门是有效的
+					pet.world.shop.roast = 1
+					pet.ui.refreshToolButtons()
+					pet.ui.setTool('lighter')
+					if (pet.view.tool !== 'lighter') {
+						return { ok: false, reason: '买了打火机却切不过去（view.tool 还是 ' + pet.view.tool + '）' }
 					}
 					// 先跑几帧把发射器灌起来，再画一帧
 					const fxBefore = pet.world.particles.length
@@ -3615,6 +3981,7 @@ function runSelfTest() {
 					pet.view.mouse.x = savedMouseX
 					pet.view.mouse.y = savedMouseY
 					pet.ui.setTool(savedToolFx)
+					pet.world.shop.roast = savedBurnLv
 					pet.ui.refreshToolButtons()
 				} catch (e) {
 					return { ok: false, reason: '工具粒子端到端失败（多半是自绘光标还有残留调用点）: ' + e.message }
@@ -3736,7 +4103,6 @@ function runSelfTest() {
 				// 表现都是「进度条不动」或者「钱没变」—— 都不会报错
 				try {
 					const RO = pet.config.roast.oven
-					const rChain = pet.config.market.roastChain
 					const rw = pet.world
 
 					const savedRoastShop = rw.shopLevel('roast')
@@ -3745,9 +4111,9 @@ function runSelfTest() {
 					const savedRoastRemains = rw.remains
 					const savedRoastMoney = rw.money
 
-					// 把档位拉满：炉子的时长是从**当前档位**取的，没买过就是 0，
-					// startRoast(0) 会被拒 —— 而那看起来像是「没自动开烤」
-					rw.shop.roast = rChain.length
+					// ⚠ 炉子从 1.18.0 起**不在烤制链上了** —— 它是一件 $5 的独立商品，
+					//   所以这里**不再需要把档位拉满**。时长和倍率都直接读
+					//   CONFIG.roast.oven（这也正是上面那个 RO 的来源）
 					rw.flies = []
 					rw.ovens = []
 					rw.remains = []
@@ -3756,28 +4122,36 @@ function runSelfTest() {
 
 					const rOven = rw.dropOven()
 					if (!rOven) return { ok: false, reason: 'dropOven 没造出炉子' }
-					const rTier = rChain[rChain.length - 1]
 					for (let i = 0; i < RO.capacity; i++) {
 						const f = rw.addFly(200 + i * 40, 300, i % 2 ? 'F' : 'M')
 						if (f) rw.putInOven(rOven, f)
 					}
+					// ⚠ 1.21.0 起是**进炉即开烤**，不用等装满。
+					//   这条断言盯的正是那个改动：老机制下这里要为 false
 					if (!rOven.roasting) {
-						return { ok: false, reason: '装满 ' + RO.capacity + ' 只之后没有自动开烤' }
+						return { ok: false, reason: '放进去了却没有开始烤 —— 现在应当是进炉即开烤' }
+					}
+					// 每只**刚进去**就该领到自己的倒计时
+					for (const f of rOven.items) {
+						if (f.roastLeft !== RO.roastMs) {
+							return {
+								ok: false,
+								reason: '刚进炉的那只剩余时间是 ' + f.roastLeft + '，应当是 ' + RO.roastMs,
+							}
+						}
 					}
 
 					// 进度条得真的从 0 往上走。先画一帧 —— 这一行同时证明
 					// 进度条那段绘制没有抛异常（画布上一抛就是整个窗口白掉）
 					pet.renderer.draw(rw, pet.view)
-					if (!(rOven.roastProgress < 0.2)) {
-						return { ok: false, reason: '刚开烤进度就是 ' + rOven.roastProgress }
-					}
 
-					// 跑四分之一炉的时间
-					const quarter = Math.floor(rTier.roastMs / 4 / 16)
+					// 跑四分之一的时间
+					const quarter = Math.floor(RO.roastMs / 4 / 16)
 					for (let i = 0; i < quarter; i++) rw.update(1 / 60)
-					const p = rOven.roastProgress
-					if (!(p > 0.15 && p < 0.5)) {
-						return { ok: false, reason: '跑了四分之一炉的时间，进度是 ' + p + '（应当在 0.15~0.5 之间）' }
+					// ⚠ 进度现在是**每只各一条**，挑第一只来看
+					const p1 = 1 - rOven.items[0].roastLeft / rOven.items[0].roastTotal
+					if (!(p1 > 0.15 && p1 < 0.5)) {
+						return { ok: false, reason: '跑了四分之一的时间，进度是 ' + p1 + '（应当在 0.15~0.5 之间）' }
 					}
 					pet.renderer.draw(rw, pet.view) // 画到一半的进度条
 
@@ -3785,7 +4159,10 @@ function runSelfTest() {
 					const beforeMoney = rw.money
 					const beforeRemains = rw.remains.length
 					const beforeTexts = rw.floatTexts.length
-					rOven.roastTimer = 0
+					// ⚠ 每只各压到 0（炉子级的 roastTimer 已经没有这个字段了）。
+					//   0 是「这一帧刚好烤满」那个值；「没在烤」是 null，
+					//   两者不能混 —— 见 Fly.roastLeft 那段注释
+					for (const f of rOven.items) f.roastLeft = 0
 					rw.update(1 / 60)
 
 					if (rOven.roasting) return { ok: false, reason: '倒计时归零了却还在烤' }
@@ -3848,6 +4225,222 @@ function runSelfTest() {
 					return { ok: false, reason: '垃圾桶不可见（宽度为 0）' }
 				}
 
+				// —— 最后画一帧，**而且场上每一类东西都要有一个** ——
+				//
+				// ⚠ 这条是补一个真实的漏网之鱼：上面那条「结晶成虫外观」的像素断言
+				//   会把 world 里**所有数组**暂时清空（它只想要自己摆的那一只蝇），
+				//   于是「画尸体」「画蛆尸」「画空壳」这些分支在那条断言里一次都没跑到。
+				//   实测：drawCorpse 里引用了一个已经删掉的变量（ReferenceError），
+				//   而两条断言全绿 —— 真跑起来却是**每帧有尸体就整个 canvas 画不出来**。
+				//
+				//   所以这里摆齐每一样再 draw 一次。多一个实体只多几行，但它把
+				//   「某个 drawXxx 分支坏了」从「只能靠肉眼发现」变成「自检会红」
+				try {
+					const w9 = pet.world
+					w9.flies.length = 0
+					w9.remains.length = 0
+					w9.shells.length = 0
+					w9.larvae.length = 0
+					w9.eggs.length = 0
+					w9.foods.length = 0
+					w9.floatTexts.length = 0
+
+					w9.addFly(200, 200, 'M')
+					w9.addFly(260, 200, 'F', 'normal', ['crystal'])
+					w9.addLarva(320, 200, null, 0)
+					// 蛹：化蛹之后走的是另一条绘制分支
+					const pupa = w9.addLarva(380, 200, null, 0)
+					if (pupa) pupa.pupa = true
+					// 尸体、蛆尸、空壳、汁渍 —— 四类残留物各一个
+					w9.addRemains(440, 200, 'corpse', 14, 0)
+					w9.addRemains(480, 200, 'grub', 12, 0)
+					w9.addRemains(520, 200, 'stain', 18, 0)
+					w9.addFood(560, 200, 'apple', 30)
+					// 星空苹果 + 星云蝇 + 星云幼虫：星云那三条绘制分支各自
+					// 有自己的路径，不摆出来的话它们一次都跑不到
+					w9.addFood(600, 300, 'star', 30)
+					w9.addFly(660, 220, 'M', 'normal', ['nebula'])
+					w9.addLarva(720, 220, null, 0, ['nebula'])
+					w9.addFloatText(600, 200, '+$0.001')
+					w9.addOven(700, 400)
+
+					// ⚠⚠ **save / restore 必须配平** —— 这一条是这整块里最重要的。
+					//
+					// 画布的状态栈没有「查深度」的公开 API，所以这里直接**数**：
+					// 借真 ctx 绕一圈计数器，看这一帧里 save 和 restore 是不是一样多。
+					//
+					// 为什么非要有这条：ctx.save() 之后提前 return（少一次
+					// ctx.restore()）**不会报错、不会抛**，但那个变换会一直留着 ——
+					// 后面画的每一只虫都被先平移到那条虫的位置、再按它的角度转一下。
+					// 表现是「整屏生物被钉在一个点上、跟着它一起晃」，
+					// 而当时所有断言全绿：像素探针每次只画一样东西，
+					// 而「摆齐每样画一帧」那条只看有没有抛异常。
+					// 这个 bug 真的发生过一次（星云幼虫那支的提前 return）。
+					//
+					// ⚠ 数的是**这一帧之内**的差值。上一帧漏掉的 restore 不会算进来 ——
+					//   所以它每一帧都会红，而不是红一次就好了
+					const ctx9 = pet.renderer.ctx
+					const save9 = ctx9.save.bind(ctx9)
+					const restore9 = ctx9.restore.bind(ctx9)
+					let nSave = 0
+					let nRestore = 0
+					ctx9.save = () => {
+						nSave++
+						save9()
+					}
+					ctx9.restore = () => {
+						nRestore++
+						restore9()
+					}
+					try {
+						pet.renderer.draw(w9, pet.view)
+					} finally {
+						ctx9.save = save9
+						ctx9.restore = restore9
+					}
+					if (nSave !== nRestore) {
+						return {
+							ok: false,
+							reason:
+								'这一帧里 ctx.save() 调了 ' + nSave + ' 次、ctx.restore() 只有 ' + nRestore +
+								' 次 —— 某个 drawXxx 提前 return 时漏了 restore。' +
+								'画布变换会一直留着，后面画的每样东西都被挪到别处去',
+						}
+					}
+
+					w9.flies.length = 0
+					w9.remains.length = 0
+					w9.shells.length = 0
+					w9.larvae.length = 0
+					w9.eggs.length = 0
+					w9.foods.length = 0
+					w9.floatTexts.length = 0
+					w9.ovens.length = 0
+				} catch (e) {
+					return {
+						ok: false,
+						reason:
+							'摆齐各类实体之后画一帧抛了异常：' + e.message +
+							'（多半是某个 drawXxx 引用了已经删掉的字段）',
+					}
+				}
+
+				// —— 彩蛋：点罐子十下解锁星空苹果 ——
+				//
+				// ⚠ 放在**最后**：解锁会调 refreshFeed / refreshCodex 把两个
+				//   弹窗整块重建，前面那些查 DOM 的断言要是排在这后面，
+				//   拿到的就是重建前的旧节点
+				//
+				// ⚠ 这里会真的往 unlock.selftest.json 写一次。自检的 user-data-dir
+				//   是临时的，碰不到玩家的 unlock.json（见 main.js 的 unlockFile）
+				let eggTaps = 0
+				try {
+					// ⚠ 自己取一遍 DOM，不蹭前面那些块里的局部变量 ——
+					//   它们多半声明在某个已经关掉的 try 里，蹭了会直接 ReferenceError
+					const eggBtn = document.getElementById('btn-donate')
+					const eggFeed = document.getElementById('feed-list')
+					const eggCodex = document.getElementById('codex-body')
+
+					// 起始状态：**没解锁**。这条同时守着「默认态写在 HTML 的
+					// class="donate locked" 上」—— 补在 JS 里的话这里就漏了
+					if (pet.ui.starUnlocked) {
+						return { ok: false, reason: '自检一开始就是已解锁状态 —— 初始值应当是锁着的' }
+					}
+					// ⚠ 把连点计数清零再开始。前面那条「点图标那一层也能弹出」
+					//   的断言已经点过这颗罐子几下（不足十下，所以没解锁），
+					//   不清零的话这里点 9 下就跨过门槛了 —— 而报出来的是
+					//   「还差一下就已经解锁了」，看着像门槛算错了，
+					//   其实是断言自己的起点没摆正
+					pet.ui.starTaps = 0
+					if (!eggBtn.classList.contains('locked')) {
+						return { ok: false, reason: '没解锁时罐子没有 .locked（流光应当是蓝紫的）' }
+					}
+					if (pet.ui.unlockedFoodIds().includes('star')) {
+						return { ok: false, reason: '没解锁时 unlockedFoodIds() 里就有 star 了' }
+					}
+
+					// 差一下**不解锁**（十下才对），顺手确认它不是「点一下就开」
+					const need = pet.config.easterEgg.tapsToUnlock
+					for (let i = 0; i < need - 1; i++) eggBtn.click()
+					if (pet.ui.starUnlocked) {
+						return { ok: false, reason: '还差一下（点了 ' + (need - 1) + ' 下）就已经解锁了' }
+					}
+
+					// 第十下
+					eggBtn.click()
+					if (!pet.ui.starUnlocked) {
+						return { ok: false, reason: '点了 ' + need + ' 下罐子却没有解锁星空苹果' }
+					}
+					if (eggBtn.classList.contains('locked')) {
+						return { ok: false, reason: '解锁之后罐子的流光没有翻回金色（.locked 还在）' }
+					}
+
+					// 解锁之后：投放面板、图鉴、星尘三处都要跟着变。
+					//
+					// ⚠ 先给够钱：星空苹果 $1 一个，「投 10 个」那档就是 $10，
+					//   而自检跑到这里时钱包基本是空的 —— 不补的话两个按钮
+					//   都是置灰的，查出来会误报成「接线断了」。
+					//   用完还原，免得改掉摘要里报的那个钱数
+					const moneyBeforeEgg = pet.world.money
+					pet.world.money = 100
+					pet.ui.refreshFeed()
+					if (!pet.ui.unlockedFoodIds().includes('star')) {
+						return { ok: false, reason: '解锁之后 unlockedFoodIds() 里还是没有 star' }
+					}
+					const starBtns = [...eggFeed.querySelectorAll('[data-kind="star"]')]
+					if (starBtns.length !== 2) {
+						return {
+							ok: false,
+							reason: '解锁之后投放里星空苹果那一行有 ' + starBtns.length + ' 个按钮，应当是 2 个',
+						}
+					}
+					if (starBtns.some((b) => b.disabled)) {
+						return { ok: false, reason: '自检里钱是够的，星空苹果那两个按钮却是置灰的' }
+					}
+					// 星尘那一层真的被点亮了（10 秒后自己收，这里只看「放没放」）
+					const sf = document.getElementById('starfield')
+					if (!sf || sf.classList.contains('hidden') || !sf.classList.contains('on')) {
+						return { ok: false, reason: '解锁的那一刻没有放出星尘（#starfield 没有 .on）' }
+					}
+
+					// 写下去的解锁状态必须**读得回来**。
+					// ⚠ 这一条守的是 IPC 的**另一个方向**：上面那些只证明了
+					//   「点了十下界面上变了」，而「重开程序之后还认得」靠的是
+					//   loadUnlock。那条路断了的表现是「彩蛋解开了，下次打开又锁上」，
+					//   玩家只会以为是自己记错了
+					const unlockBack = await window.pet.loadUnlock()
+					if (!unlockBack || !unlockBack.ok || !unlockBack.data || !unlockBack.data.star) {
+						return {
+							ok: false,
+							reason: '解锁状态写下去之后读不回来 —— 重开一局彩蛋会又锁上',
+						}
+					}
+
+					// 图鉴：解锁之后星云基因格才出现
+					pet.ui.setCodexOpen(true)
+					pet.ui.refreshCodex()
+					const eggGeneCells = [...eggCodex.querySelectorAll('[data-gene]')]
+					if (!eggGeneCells.some((el) => el.dataset.gene === 'nebula')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '解锁之后图鉴里仍然没有星云那一格' }
+					}
+					if (!eggCodex.querySelector('[data-food="star"]')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '解锁之后图鉴里仍然没有星空苹果那一格' }
+					}
+					pet.ui.setCodexOpen(false)
+
+					// 星云的图鉴措辞**不能**是「0.0%」—— 那是句看着精确的谎话
+					const nebulaTxt = eggGeneCells.find((el) => el.dataset.gene === 'nebula').textContent
+					if (nebulaTxt.includes('0.0%')) {
+						return { ok: false, reason: '星云那一格写着「0.0%」—— 它不在抽奖池里，应当说来历' }
+					}
+					pet.world.money = moneyBeforeEgg
+					eggTaps = need
+				} catch (e) {
+					return { ok: false, reason: '彩蛋流程失败: ' + e.message }
+				}
+
 				const c = pet.world.counts
 				return {
 					ok: true,
@@ -3861,6 +4454,8 @@ function runSelfTest() {
 					panelWidth: Math.round(panel.getBoundingClientRect().width),
 					saveKB,
 					pupaColor,
+					starTextureDiff,
+					eggTaps,
 					money: pet.world.counts.money.toFixed(3),
 				}
 			})()`)
@@ -3892,15 +4487,21 @@ function runSelfTest() {
 					'  罐中列表防闪：连刷两次行节点不变、顺序被打乱能排回去\n' +
 					'  玻璃罐：观察模式就能拖（指针在罐上才接管，食物不算），移开后鼠标归还\n' +
 					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
+						'  越界等级：老存档里超出链长的等级被夹回来（表现为满级），商店照常重建、不抛异常\n' +
 					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +
 					'  重置：先弹确认，点「取消」什么都不动，点「确定」才清档\n' +
 					'  苍蝇拍：杀伤落点正好在拍面上（指针左上方），不在指针上；打死拍头那只、指针上那只不死（挥空也放一圈灰勾出杀伤半径）\n' +
 					'  工具粒子：工具图案和范围圈全删了，只剩系统指针 —— body 上没有 tool-active；' +
 						'举着打火机跑 20 帧粒子真的变多、画一帧不抛（证明自绘光标删干净了）、放下就停\n' +
 					'  扫帚：按钮在、B 键开关、滚轮调半径且夹在 30~200、按住真的把幼虫推开（只推不删）\n' +
-					'  烤制：尸体带着售价、接触即烤能烤能卖、倍率只吃一次、汁渍不能烤、前 5 分钟不掉价\n' +
-					'  烤炉：装满自动开烤、进度条真的从 0 走到 1（两头都画得出来）、' +
-						'进度满了**直接到账**且地上不留尸体、每只各冒一个「+$x」飘字、面板上的钱跟着变\n' +
+					'  点火：打火机 / 喷火枪是**两颗独立按钮**（买到哪档点亮哪颗），碰到活蝇一次就点着、' +
+						'按住不重置倒计时、地上的尸体点不着、尸体只剩原价这一档、前 5 分钟不掉价\n' +
+					'  烤炉：$5 从投放里买（一次性、有上限），**放进去就开始烤**（不用等装满）、' +
+						'每只各有一条自己的进度条（两头都画得出来）、' +
+						'**各自烤满各自到账**且地上不留尸体、每只各冒一个「+$x」飘字、面板上的钱跟着变\n' +
+					'  分类折叠：投放 / 商店的每一组都能折起来，而且**钱一变不会自己弹回去**\n' +
+					'  渲染覆盖：场上摆齐成虫 / 幼虫 / 蛹 / 尸体 / 蛆尸 / 汁渍 / 食物（含星空苹果）/ 星云蝇 / 星云幼虫 / 飘字 / 烤炉之后画一帧不抛，' +
+						'而且 ctx.save 与 restore **次数配平**（少一次 restore 会让画布变换一直留着，整屏生物被钉在一个点上跟着晃）\n' +
 					'  挥手惊蝇：慢速靠近完全不受惊、快甩才惊飞；悬停的踢出悬停、走路的起飞、方向背离指针；观察模式下一点不生效\n' +
 					'  幼虫饥饿：吃不到就饿死、留尸体（不可烤）、蛹期不计\n' +
 					'  统计：主面板只留存活 / 死亡，三条杠展开细分（含成虫总价值，与各蝇售价之和相符）\n' +
@@ -3919,6 +4520,11 @@ function runSelfTest() {
 					'  价值档对应：普通=白 · 罕见=蓝 · 稀有=紫 · 极稀有=金+流动 · 超级稀有=红+流动+反光 · 传说生物=淡彩+流动+反光\n' +
 					'  放大镜：买过之后商店那一行长出六颗档位按钮，勾哪几档就亮哪几档；' +
 						'没买不给、点一下 world.magnifierTiers 跟着变、选中态跟着走、一档不勾也允许\n' +
+					`  星云贴图：真的加载出来了（1686×766）；星空苹果在两个屏幕位置上` +
+						`画出来有 ${report.starTextureDiff}/576 个通道不同 —— 贴图是**钉在屏幕上**的，不是跟着果子走的\n` +
+					`  彩蛋：罐子初始是蓝紫流光（.locked），点 ${report.eggTaps} 下解锁、流光翻回金色，` +
+						'投放 / 图鉴同时冒出星空苹果和星云，星尘那 10 秒的层跟着点亮；' +
+						'差一下不会提前解锁、已解锁后不再重复计数\n' +
 					`  蛹是实心的，整排不透明（底色 ${report.pupaColor}）\n` +
 					'  preload 桥完整，渲染一帧无异常',
 			)
@@ -4008,6 +4614,22 @@ function backupFile() {
 	return path.join(app.getPath('userData'), name)
 }
 
+/**
+ * 彩蛋解锁状态，**单独一个文件**。
+ *
+ * ⚠ 为什么不塞进存档里：存档是「这一局养了什么」，玩家点「重新开始」
+ *   会把它整个删掉（见 save.js 的 clear()）。而解锁是**跨局**的 ——
+ *   重开一局之后彩蛋又锁上，玩家只会觉得「我上次明明解开了，坏了」，
+ *   而且没有任何提示告诉他为什么。用户要的是「永久解锁」。
+ *
+ * ⚠ 自检读写的是另一个文件，理由和 saveFile 一字不差：
+ *   自检跑的是临时造出来的世界，不能把玩家的真状态顶掉
+ */
+function unlockFile() {
+	const name = SELFTEST ? 'unlock.selftest.json' : 'unlock.json'
+	return path.join(app.getPath('userData'), name)
+}
+
 function readSaveFile(file) {
 	const raw = fs.readFileSync(file, 'utf8')
 	const data = JSON.parse(raw)
@@ -4062,6 +4684,30 @@ ipcMain.handle('pet:load', () => {
 		} catch {
 			return { ok: false, reason: fs.existsSync(saveFile()) ? 'corrupt' : 'empty', detail: e.message }
 		}
+	}
+})
+
+ipcMain.handle('pet:load-unlock', () => {
+	try {
+		return { ok: true, data: JSON.parse(fs.readFileSync(unlockFile(), 'utf8')) }
+	} catch {
+		// 文件不存在就是「还没解锁」—— 这是**正常路径**，不是错误，别打日志。
+		// 每个新玩家第一次启动都会走到这里
+		return { ok: true, data: {} }
+	}
+})
+
+ipcMain.handle('pet:save-unlock', (_e, data) => {
+	// ⚠ 只认白名单里的键。这是全项目**唯一**一条「渲染进程给什么就写什么」的路，
+	//   不筛的话它可以被拿来往这个文件里塞任意结构（渲染进程是页面，
+	//   页面是会被 XSS 影响的那一层 —— 主进程不该无条件相信它）
+	const safe = { star: !!(data && data.star) }
+	try {
+		fs.writeFileSync(unlockFile(), JSON.stringify(safe), 'utf8')
+		return { ok: true }
+	} catch (e) {
+		console.error('[unlock] 写入失败:', e.message)
+		return { ok: false, reason: e.message }
 	}
 })
 

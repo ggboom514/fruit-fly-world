@@ -740,6 +740,17 @@ button.toggle.on {
 	--gold: #e8b84b;
 	--gold-hi: #fff3c4;
 	--gold-lo: #a9761a;
+
+	/*
+	 * 彩蛋解锁**之前**那颗捐款小罐子的流光色（蓝紫）。
+	 *
+	 * ⚠ 单独一组变量，**不要去改 --gold-\*** —— 那三个还被
+	 *   `.gold::before`（卖价按钮）和 `.inspect.fx::before`（稀有度卡片）用着，
+	 *   在那边改成蓝紫的话，那两处的金边会跟着一起变色
+	 */
+	--arcane-lo: #3b2f8f;
+	--arcane: #6f5bd6;
+	--arcane-hi: #b9a6ff;
 }
 
 /*
@@ -980,6 +991,51 @@ button.toggle.on {
 	display: flex;
 	flex-direction: column;
 	gap: 4px;
+}
+
+/*
+ * 分类标题现在是个**折叠按钮**。
+ *
+ * ⚠ 只挂 `.cat-toggle`，**不要去改 `.shop-cat-name`** —— 图鉴那两张小标题
+ *   （ui._codexSection）用的是同一个类名，改了的话图鉴的标题也会跟着
+ *   多出一个悬停底色和手指指针，而它压根不是按钮
+ *
+ * ⚠ 也**不要**复用面板里的 `.fold-toggle` —— 那个有背景色、圆角和 11px 字号，
+ *   是给工具栏那种成块的折叠写的；分类标题要轻得多（见上面 `.shop-cat-name`）。
+ *   混用之后改任何一边都会影响另一边
+ */
+.cat-toggle {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	width: 100%;
+	background: none;
+	/* 那根细线是分类之间的分隔，不能跟着 border: 0 一起没掉 */
+	border: 0;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+	border-radius: 0;
+	/* 字号 / 字距 / 颜色全部沿用 .shop-cat-name，这里只改盒模型和光标 */
+	font: inherit;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+
+.cat-toggle:hover {
+	color: rgba(232, 226, 216, 0.92);
+}
+
+.cat-toggle .caret {
+	font-size: 9px;
+	transition: transform 0.15s ease;
+}
+
+.shop-cat.collapsed .cat-toggle .caret {
+	transform: rotate(-90deg);
+}
+
+.shop-cat.collapsed .shop-cat-rows {
+	display: none;
 }
 
 .shop-item {
@@ -1325,6 +1381,134 @@ body.over-grabbable {
 	mask-composite: exclude;
 	animation: border-flow 3s linear infinite;
 	pointer-events: none;
+}
+
+/*
+ * 彩蛋未解锁：罐身的流光换成蓝紫。
+ *
+ * ⚠ 只覆盖 `background`（也就是渐变本身），`mask` / `background-size` /
+ *   `animation` 全部**继承上面那一套** —— 复制一份的话，哪天调了流光速度，
+ *   这颗罐子会是全项目唯一没跟上的那个
+ *
+ * 蓝紫是「这里有点不一样」的提示，不是错误态：它照样在流动、照样好看，
+ * 只是发的是不属于这套金色配色的光
+ */
+#btn-donate.locked .jar-icon {
+	background: linear-gradient(180deg, rgba(111, 91, 214, 0.42), rgba(111, 91, 214, 0.1));
+}
+
+#btn-donate.locked .jar-icon::after {
+	background: linear-gradient(
+		90deg,
+		var(--arcane-lo),
+		var(--arcane),
+		var(--arcane-hi),
+		var(--arcane),
+		var(--arcane-lo)
+	);
+}
+
+#btn-donate.locked .jar-icon::before {
+	background: var(--arcane-hi);
+}
+
+/*
+ * 点罐子那一下的反馈：一缩一放。
+ *
+ * **刻意不给任何文字。** 弹一句「已点 3/10」就等于把彩蛋写在脸上，
+ * 前九下的乐趣全没了 —— 玩家该感觉到的是「这东西好像在应我」，
+ * 而不是「哦，十个解锁」
+ */
+.donate.tap {
+	animation: jar-tap 0.28s ease-out;
+}
+
+@keyframes jar-tap {
+	0% {
+		transform: scale(1);
+	}
+	35% {
+		transform: scale(0.82);
+	}
+	100% {
+		transform: scale(1);
+	}
+}
+
+/* 星空苹果那一行：紫色，和它自己的配色一致（对照 .feed-item-gold） */
+.feed-item-arcane .shop-name {
+	color: var(--arcane-hi);
+}
+
+/* ---------------------------------------------------------- 星尘（解锁彩蛋） */
+
+/*
+ * 解锁那一下的星尘。**铺满整屏、只在四周可见** —— 中间用 radial-gradient
+ * 的蒙版挖空，星星不会糊在玩家正在看的东西正中。
+ *
+ * 背景是两层：
+ *   1. 一层紫色渐晕打底
+ *   2. 星云图
+ *
+ * ⚠ 打底那层**不是装饰**：图挂了的时候（打包漏了 assets、路径写错），
+ *   整个元素会变成完全透明、一点反馈都没有 —— 而「点了十下什么都没发生」
+ *   是最难查的一类 bug。有了它，图坏了也还剩一圈紫光在呼吸
+ *
+ * ⚠ z-index 28：要高过画布和面板（#stage 和 .window 都是 z-auto），
+ *   但要**低于**捐款卡片的 30 —— 卡片是能点的东西
+ *   （虽然这层 pointer-events: none 压着也挡不住点击，但视觉上会脏）
+ */
+.starfield {
+	position: fixed;
+	inset: 0;
+	z-index: 28;
+	pointer-events: none;
+	opacity: 0;
+	background-image:
+		radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 42%, rgba(74, 52, 150, 0.34) 100%),
+		url(./assets/star-nebula.png);
+	background-size:
+		100% 100%,
+		cover;
+	background-position:
+		center,
+		center;
+	background-repeat: no-repeat, no-repeat;
+	-webkit-mask-image: radial-gradient(ellipse at center, transparent 38%, #000 92%);
+	mask-image: radial-gradient(ellipse at center, transparent 38%, #000 92%);
+}
+
+.starfield.hidden {
+	display: none;
+}
+
+/*
+ * 淡入 → 停一会儿 → 淡出，一共 10 秒。
+ *
+ * ⚠ 用 CSS 关键帧而不是 JS 补间：全项目每一处动画都是 @keyframes
+ *   （见 border-flow 那段注释），这里塞一套 rAF 补间的话，
+ *   「改动画时长」就变成一件要在两个地方分别改的事
+ *
+ * ⚠ `forwards` 是必需的：不加的话动画一结束 opacity 会弹回基值 0，
+ *   而那一下正好落在最后半秒里，看起来像闪了一下
+ */
+.starfield.on {
+	animation: starfield 10s ease-in-out forwards;
+}
+
+@keyframes starfield {
+	0% {
+		opacity: 0;
+	}
+	15% {
+		opacity: 0.85;
+	}
+	75% {
+		opacity: 0.85;
+	}
+	100% {
+		opacity: 0;
+	}
 }
 
 /* 罐盖：比罐身宽一点的一条，静止的纯金色 —— 全都在动反而看不出在动 */
@@ -1865,6 +2049,21 @@ body.booting .inspect {
 	backdrop-filter: blur(10px);
 	-webkit-backdrop-filter: blur(10px);
 	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.55);
+	/*
+	 * ⚠ 这一行是给下面 `.sheen::after` 那道反光擦屁股的，不是顺手加的。
+	 *
+	 * 反光是一条**和卡片等大**的横条，被 translateX(-100% → 100%) 推着走：
+	 * 走到两头时它整个身子在卡片**外面**。谁来把它按住，是这张卡片的事 ——
+	 * 只有祖先的 overflow 才裁得住它。
+	 *
+	 * ⚠ 「把 overflow: hidden 写在伪元素自己身上」是**假的**（原来就是这么写的）：
+	 *   overflow 裁的是**子孙**，而伪元素没有子孙。表现是那道白光从卡片边上
+	 *   飞出去、扫过桌面 —— 卡片越贵（超级稀有 / 传说）越明显。
+	 *
+	 * 副作用为零：overflow 不裁卡片**自己**的 box-shadow（那不算「内容」），
+	 * 也不动 backdrop-filter 的范围。卡片里全是普通流子元素，没有一个需要探出去。
+	 */
+	overflow: hidden;
 	font-size: 11px;
 	color: var(--text);
 	animation: inspect-in 0.14s ease;
@@ -2129,6 +2328,12 @@ body.booting .inspect {
 	transform: translateX(-100%);
 	animation: sheen 2.6s ease-in-out infinite;
 	pointer-events: none;
+	/*
+	 * ⚠ 这儿原来有一句 overflow: hidden，**已经删掉** —— 它从来没生效过，
+	 *   而且留着比删掉危险：它让下一个人以为「裁切在这一层做完了」。
+	 *   真正把反光关在卡片里的是上面 .inspect 自己的 overflow: hidden，
+	 *   别再加回来（要动就动那一处）。
+	 */
 }
 
 @keyframes sheen {

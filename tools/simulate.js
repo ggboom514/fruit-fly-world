@@ -39,7 +39,14 @@ import {
 	flyPrice,
 	bulkPrice,
 } from '../renderer/src/market.js'
-import { combineGenes, rollDeNovo, valueMulOf, weightMulOf, MUTATION_TYPES } from '../renderer/src/mutations.js'
+import {
+	combineGenes,
+	rollDeNovo,
+	valueMulOf,
+	weightMulOf,
+	speedMulOf,
+	MUTATION_TYPES,
+} from '../renderer/src/mutations.js'
 // ⚠ render.js 能在无头环境里 import：它只在**函数体**里碰 canvas / performance，
 //   模块顶层只有常量和函数定义。这一条要是哪天坏了，import 会直接抛
 import { magnifierTargets } from '../renderer/src/render.js'
@@ -619,8 +626,9 @@ let foodProblems = []
 		// 量的是**全程最近**的那一次平均距离，不是 90 秒后的终值。
 		//
 		// ⚠ 终值是一个很差的判据：果蝇在果子上吃够就会起飞，而
-		// `justSmelled` 只在**刚进入**嗅觉半径那一帧为真 —— 起飞之后就算还在半径里，
-		// 也不会再落回去了。于是它飞走、终值回升，哪怕招蝇机制完全正常也会「失败」。
+		// `justArrived` 只在**刚飞进落点半径**那一帧为真 —— 起飞之后要是没离开
+		// 那个半径，就不会再落回去了。于是它飞走、终值回升，
+		// 哪怕招蝇机制完全正常也会「失败」。
 		// 实测终值在 89~541px 之间乱跳，两条断言里就有一条是误报。
 		// 「全程最近」问的才是这条机制真正该回答的问题：它们有没有被吸过来过
 		let dMin = d0
@@ -636,10 +644,82 @@ let foodProblems = []
 		)
 		// 门槛定在「至少靠近一半」。飞行速度提到 1700px/s 之后，
 		// 光靠飞行时的方向偏转已经抓不住它们了 —— 真正起作用的是
-		// 「闻到味道就落下来走过去」，所以这条同时也在守着那个机制。
+		// 「飞到果子跟前就落下来」，所以这条同时也在守着那个机制。
 		if (dMin >= d0 * 0.5) {
-			foodProblems.push(`成虫没有明显靠近过食物（${d0.toFixed(0)} → 最近才 ${dMin.toFixed(0)}px）—— 检查 behavior.landChanceNearFood 和 _updateMode 里的「刚闻到」判定`)
+			foodProblems.push(`成虫没有明显靠近过食物（${d0.toFixed(0)} → 最近才 ${dMin.toFixed(0)}px）—— 检查 behavior.landChanceNearFood 和 _updateMode 里的「刚飞到」判定`)
 		}
+	}
+
+	// —— 落点：必须在**果子跟前**落地，不能在半路上就落下来走过去 ——
+	//
+	// 用户报过「果蝇去觅食怎么全程都是走过去的」。根因是落地那次掷骰挂在
+	// 「刚闻到味道」那一帧上，而那一刻正是离果子**最远**的地方
+	// （嗅觉半径 600px）—— 实测 100% 的个体都在 520~600px 处落地，
+	// 然后按 58px/s 爬 10 秒才到。
+	//
+	// ⚠ 这条和上面那条是**互补的，不能互相替代**：上面问「有没有被吸引过去」，
+	//   这条问「是被吸引飞的、还是自己走过去的」。
+	//   只有上面那条的话，把落地半径改回 600px 照样全绿。
+	world.larvae.length = 0
+	world.foods.length = 0
+	world.flies.length = 0
+	world.eggs.length = 0
+	const landingDist = []
+	let neverLanded = 0
+	const probeFood = world.addFood(960, 540, 'apple', 40)
+	if (probeFood) {
+		probeFood.age = CONFIG.food.rotTime // rot 是 getter，要催熟只能改 age
+		const TRIES = 40
+		for (let i = 0; i < TRIES; i++) {
+			world.flies.length = 0
+			const a = (i / TRIES) * TAU
+			const f = world.addFly(960 + Math.cos(a) * 900, 540 + Math.sin(a) * 900, 'M', 'normal')
+			// 石化蝇飞不起来，量不了「飞过去」这件事，跳过
+			if (!f || !f.canFly) continue
+			// 钉住飞行状态：不钉的话它可能一开局就掷中「落地」，
+			// 量到的就不是「飞到跟前才落」，而是「随机落地」
+			f.mode = 'fly'
+			f.modeTimer = 1e9
+			f.dartTimer = 1e9
+			f.hoverTimer = 0
+			f.aim = Math.atan2(540 - f.y, 960 - f.x)
+
+			let at = null
+			for (let t = 0; t < 900; t++) {
+				const before = f.mode
+				f.update(1000 / 60, world)
+				// 只看**第一次**从飞切到走的那一刻 —— 之后在果子上起起落落都不算
+				if (before === 'fly' && f.mode === 'walk') {
+					at = Math.hypot(f.x - 960, f.y - 540)
+					break
+				}
+			}
+			if (at == null) neverLanded++
+			else landingDist.push(at)
+		}
+	}
+	landingDist.sort((x, y) => x - y)
+	const medLand = landingDist.length ? landingDist[(landingDist.length / 2) | 0] : NaN
+	// ⚠ 判据是**落地之后还要走几秒**，不是「离食物多少 px」——
+	//   玩家抱怨的本来就是「全程走过去」，直接量那件事花多久最贴题。
+	//
+	// ⚠⚠ 门槛**绝对不能**写成 `foodLandRadius × 常数`。第一版就是那么写的，
+	//   结果把落点半径调回 600px（= 复现旧行为）之后断言跟着放宽，照样全绿 ——
+	//   自己证明自己，等于没测。这里锚在**爬行速度**上，
+	//   和落点半径、嗅觉半径都无关
+	const walkSec = medLand / CONFIG.walk.speed
+	console.log(
+		`  落地点：中位 ${Number.isFinite(medLand) ? medLand.toFixed(0) : '—'}px` +
+			`（落地半径 ${CONFIG.behavior.foodLandRadius}px、嗅觉半径 ${CONFIG.food.flyScentRadius}px），` +
+			`落地后还要爬 ${Number.isFinite(walkSec) ? walkSec.toFixed(1) : '—'} 秒`,
+	)
+	if (!Number.isFinite(medLand)) {
+		foodProblems.push(`40 次尝试里没有一只在飞行途中落地（${neverLanded} 次没落）—— 落点断言量不到东西`)
+	} else if (walkSec > 3) {
+		foodProblems.push(
+			`果蝇平均在离食物 ${medLand.toFixed(0)}px 的地方就落地了，落地后还要爬 ${walkSec.toFixed(1)} 秒 —— ` +
+				`看着就是「一路走过去」。检查 _updateMode 里判的是不是 foodLandRadius`,
+		)
 	}
 
 	// —— 拖走食物：幼虫的反应必须是**散开**的，不能同一帧集体掉头 ——
@@ -2957,6 +3037,8 @@ const buyProblems = []
 
 	// 金苹果不进自动投放的种类表 —— 它只能花钱买
 	if (F.types.includes('gold')) buyProblems.push('金苹果混进了 food.types，自动投放会白送')
+	// 星空苹果同理，而且它还得先解锁才买得到 —— 掉进自动投放等于白送彩蛋
+	if (F.types.includes('star')) buyProblems.push('星空苹果混进了 food.types，自动投放会白送彩蛋')
 
 	// —— 5. 投蝇 ——
 	//
@@ -3141,7 +3223,7 @@ const fxProblems = []
 
 	// —— 火苗：会冒、往上飘 ——
 	wFx.particles.length = 0
-	run({ tool: 'roast', x: 500, y: 500, level: 1, rate: 34 }, 60)
+	run({ tool: 'lighter', x: 500, y: 500, rate: CONFIG.tools.fx.flameRate }, 60)
 	const flame = wFx.particles.slice()
 	if (flame.length === 0) {
 		fxProblems.push('举着打火机 1 秒一颗粒子都没冒 —— 火苗特效没接上')
@@ -3152,7 +3234,7 @@ const fxProblems = []
 		}
 		// 数量应当约等于 rate × life。粒子寿命 0.34s × rand(0.7~1.3)，
 		// 所以稳态的存活数在 rate×0.24 ~ rate×0.44 之间，宽松取 ±70%
-		const want = 34 * 0.34
+		const want = CONFIG.tools.fx.flameRate * 0.34
 		if (flame.length < want * 0.3 || flame.length > want * 2.4) {
 			fxProblems.push(`打火机 1 秒后场上有 ${flame.length} 颗粒子，按 rate×life 应当在 ${(want * 0.3).toFixed(0)}~${(want * 2.4).toFixed(0)} 之间`)
 		}
@@ -3160,7 +3242,7 @@ const fxProblems = []
 	// 喷火枪要比打火机**多**（更大更长更密是用户的原话）
 	const bigCount = (() => {
 		wFx.particles.length = 0
-		run({ tool: 'roast', x: 500, y: 500, level: 3, rate: CONFIG.tools.fx.flameRateBig }, 60)
+		run({ tool: 'flamer', x: 500, y: 500, big: true, rate: CONFIG.tools.fx.flameRateBig }, 60)
 		return wFx.particles.length
 	})()
 	if (!(bigCount > flame.length)) {
@@ -3169,7 +3251,7 @@ const fxProblems = []
 
 	// —— 关掉之后只减不增 ——
 	wFx.particles.length = 0
-	run({ tool: 'roast', x: 500, y: 500, level: 1, rate: 34 }, 30)
+	run({ tool: 'lighter', x: 500, y: 500, rate: CONFIG.tools.fx.flameRate }, 30)
 	const before = wFx.particles.length
 	wFx.toolFx.on = false
 	for (let i = 0; i < 120; i++) wFx.update(1 / 60)
@@ -3190,7 +3272,7 @@ const fxProblems = []
 			spawned++
 			return origSpawn(...args)
 		}
-		Object.assign(wRate.toolFx, { on: true, tool: 'roast', level: 1, x: 100, y: 100, rate: 60, acc: 0 })
+		Object.assign(wRate.toolFx, { on: true, tool: 'lighter', x: 100, y: 100, rate: 60, acc: 0 })
 		for (let i = 0; i < 60; i++) wRate._emitToolFx(1000 / 60)
 		if (spawned < 50 || spawned > 70) {
 			fxProblems.push(`rate=60/s 跑 1 秒发出了 ${spawned} 颗，应当约 60 —— 发射器多半是按帧算的`)
@@ -3207,7 +3289,7 @@ const fxProblems = []
 			spawned++
 			return origSpawn(...args)
 		}
-		Object.assign(wBig.toolFx, { on: true, tool: 'roast', level: 1, x: 0, y: 0, rate: 200, acc: 0 })
+		Object.assign(wBig.toolFx, { on: true, tool: 'lighter', x: 0, y: 0, rate: 200, acc: 0 })
 		wBig._emitToolFx(500) // 卡了半秒
 		if (spawned > CONFIG.tools.fx.maxPerTick) {
 			fxProblems.push(`单帧 dt=500ms 发出了 ${spawned} 颗，上限是 ${CONFIG.tools.fx.maxPerTick} —— 卡一帧就会炸出一团`)
@@ -3225,13 +3307,87 @@ const fxProblems = []
 		if (capped !== CONFIG.world.maxParticles) {
 			fxProblems.push(`粒子数没有被 maxParticles 卡住（${capped}）`)
 		}
-		Object.assign(wFull.toolFx, { on: true, tool: 'roast', level: 1, x: 0, y: 0, rate: 100, acc: 0 })
+		Object.assign(wFull.toolFx, { on: true, tool: 'lighter', x: 0, y: 0, rate: 100, acc: 0 })
 		try {
 			for (let i = 0; i < 60; i++) wFull._emitToolFx(1000 / 60)
 		} catch (e) {
 			fxProblems.push(`满员时发射器抛了异常：${e.message}`)
 		}
 		if (wFull.particles.length !== capped) fxProblems.push('满员时粒子数还在涨')
+	}
+
+	// —— 烧着的蝇身上的火苗：发射点必须在**它身上**，不是指针 ——
+	//
+	// ⚠ 这一条是这次改动里最容易写歪、又最难发现的地方：`_emitToolFx` 是
+	//   **指针单例**（全世界只有一个 fx.x / fx.y），拿它去发烧蝇的火，
+	//   火焰会从鼠标那里冒出来。而屏幕上看起来只是「火焰飘错了地方」——
+	//   像特效没调好，谁都不会往「接错发射器」上想。
+	//   所以这里把 toolFx 关掉，只留烧蝇这一路，然后量**粒子到蝇的距离**
+	{
+		const wBurn = new World(W, H)
+		wBurn.reset()
+		wBurn.flies.length = 0
+		wBurn.particles.length = 0
+		wBurn.shop.roast = 1
+
+		const bf = wBurn.addFly(400, 300, 'F')
+		if (!bf) fxProblems.push('烧蝇那段：addFly 失败')
+		else if (!wBurn.ignite(bf, 'lighter')) fxProblems.push('烧蝇那段：ignite 没点着')
+		else {
+			// 把指针那一套彻底关掉 —— 只剩「从蝇身上发」这一条来路
+			wBurn.toolFx.on = false
+			wBurn.particles.length = 0
+
+			// ⚠ 要跑**好几帧**才能凑出一颗：发射率是 34 颗/秒，而一帧只有 1/60 秒，
+			//   累加器每帧涨 0.567 —— 头一帧注定是 0 颗。只跑一帧就断言「冒了没有」
+			//   会得到一条恒红的假警报（第一版就是这么写的）
+			for (let i = 0; i < 5; i++) wBurn.update(1 / 60)
+			const beforeFrame = wBurn.particles.length
+			wBurn.update(1 / 60)
+			// 只认**最后一帧**发出来的那些：新粒子本帧不走 update()，
+			// 所以它们还停在发射点上，正好用来量距离
+			const fromFly = wBurn.particles.slice(beforeFrame)
+			if (fromFly.length === 0) {
+				fxProblems.push('烧着的蝇跑了 6 帧，一颗粒子都没冒')
+			}
+			for (const p of fromFly) {
+				const d = Math.hypot(p.x - bf.x, p.y - bf.y)
+				if (d > bf.size * 1.6) {
+					fxProblems.push(
+						`烧蝇的火苗落在离它 ${d.toFixed(0)}px 的地方 —— 多半是接到了指针那个单例上（见 _emitBurnFx）`,
+					)
+					break
+				}
+				if (!(p.vy < 0)) {
+					fxProblems.push('烧蝇的火苗不往上飘')
+					break
+				}
+			}
+
+			// 单帧封顶：一帧卡了 500ms 也不能一次炸出一团。
+			//
+			// ⚠ **直接调 `_emitBurnFx(500)`**，不要写 `update(0.5)` ——
+			//   `World.update` 会把半秒切成 15 个 33ms 的子步，每个子步各发一次，
+			//   于是上限是**按子步**生效的，总量可以到 15 倍。
+			//   第一版就是拿 `update(0.5)` 去量，报出来「单帧发了 11 颗」——
+			//   数字没错，是断言把「一帧」理解成了「一次 update 调用」
+			wBurn.particles.length = 0
+			wBurn._emitBurnFx(500)
+			if (wBurn.particles.length > CONFIG.tools.fx.maxPerTick) {
+				fxProblems.push(
+					`烧蝇的火苗单帧发了 ${wBurn.particles.length} 颗，上限是 ${CONFIG.tools.fx.maxPerTick}`,
+				)
+			}
+
+			// 灭火之后必须**停**
+			wBurn.extinguish(bf)
+			if (bf.burning) fxProblems.push('extinguish 之后 burning 还是 true')
+			wBurn.particles.length = 0
+			for (let i = 0; i < 60; i++) wBurn.update(1 / 60)
+			if (wBurn.particles.length > 0) {
+				fxProblems.push(`火灭了还在冒粒子（${wBurn.particles.length} 颗）—— 发射器没跟着状态停`)
+			}
+		}
 	}
 
 	// —— 挥拍 / 撒网：命中与否都要放一圈 ——
@@ -3303,6 +3459,7 @@ const fxProblems = []
 		`  工具粒子：火苗 ${flame.length} 颗（喷火枪 ${bigCount} 颗）· 挥拍/撒网命中与否都放圈 · ` +
 			`按秒发射、单帧封顶 ${CONFIG.tools.fx.maxPerTick}、满员静默`,
 	)
+	console.log('  烧蝇的火苗：从**蝇身上**发（不是指针）· 往上飘 · 灭火即停')
 }
 
 // ---------------------------------------------------------------- 扫帚
@@ -3787,7 +3944,10 @@ const magnifierProblems = []
 	// ⚠ `jar` 是特例：它不花钱、不在任何价格表里（走 world.dropJar），
 	//   但仍然要归类，否则那颗按钮就没了
 	const feedTally = tally(CONFIG.market.feedCats)
-	const feedWanted = [...Object.keys(CONFIG.market.prices.food), 'fly', 'jar']
+	// ⚠ 这张表是**手写的**，不从 feedCats 现算 —— 现算的话它就永远绿，等于不测。
+	//   `oven` 必须手写进来：它是 `prices` 的**顶层键**，
+	//   不会被 `Object.keys(prices.food)` 带出来（那个只看 food 那一层）
+	const feedWanted = [...Object.keys(CONFIG.market.prices.food), 'fly', 'jar', 'oven']
 	for (const id of feedWanted) {
 		const n = feedTally.get(id) ?? 0
 		if (n === 0) catProblems.push(`投放项「${id}」没有归到任何分类里 —— 它不会出现在投放界面上`)
@@ -3815,9 +3975,10 @@ const roastProblems = []
 
 	// —— 1. 拍死留下的尸体带着售价 ——
 	//
-	// 烤制现在是吃**尸体**的（牙签那套在 1.7.0 取消了）。所以尸体必须
-	// 记住「这曾经是一只值多少钱的果蝇」—— 忘记了的话，拍死的果蝇
-	// 就只是一堆擦掉完事的垃圾，整条烤制链没有入口
+	// ⚠ 从 1.18.0 起，**地上的尸体不能再烤了** —— 打火机 / 喷火枪改成点着活蝇。
+	//   所以这一节测的不再是「尸体能不能烤」，而是「尸体还值不值钱」：
+	//   它必须记住「这曾经是一只值多少钱的果蝇」，否则拍死的果蝇就只是
+	//   一堆擦掉完事的垃圾，玩家连按原价卖掉这条路都没有
 	w.flies.length = 0
 	w.remains.length = 0
 	const victim = w.addFly(W / 2, H / 2, 'F')
@@ -3834,19 +3995,26 @@ const roastProblems = []
 		}
 		if (c1.rarity !== victim.rarity) roastProblems.push('尸体的稀有度没抄过来')
 		if (c1.sex !== victim.sex) roastProblems.push('尸体的性别没抄过来')
-		if (!c1.roastable) roastProblems.push('刚拍死的尸体应当是能烤的')
+		if (!c1.sellable) roastProblems.push('刚拍死的尸体应当是能卖的')
 		if (Math.abs(c1.decayFactor - 1) > 1e-9) roastProblems.push('刚拍死的尸体不该掉价')
+		// ⚠ 这条钉的是「倍率那一档真的没了」：`roastMul` 要是被谁加回来，
+		//   地上的尸体就会比活蝇还值钱，而点火器那一整套就没意义了
+		if (c1.roastMul !== undefined) {
+			roastProblems.push('尸体上又出现了 roastMul —— 尸体从 1.18.0 起不该有倍率这一档')
+		}
+		if (Math.abs(c1.price - c1.value * c1.decayFactor) > 1e-9) {
+			roastProblems.push(`尸体的价钱 ${c1.price} 不等于「原价 × 掉价」—— 多半是倍率被加回来了`)
+		}
 	}
 	console.log(
-		`  尸体：拍死一只满成长雌蝇，售价快照 ${formatMoney(valueBefore)}（稀有度 ${victim.rarity}）`,
+		`  尸体：拍死一只满成长雌蝇，售价快照 ${formatMoney(valueBefore)}（稀有度 ${victim.rarity}）· **只能按原价卖**`,
 	)
 
-	// ⚠ 汁渍不能烤也不能卖 —— 它是拍击溅出来的，不是一具身体
+	// ⚠ 汁渍不能卖 —— 它是拍击溅出来的，不是一具身体，连 value 都没有
 	const stain = w.addRemains(50, 50, 'stain', 20, 0)
 	if (stain) {
-		if (stain.roastable) roastProblems.push('汁渍被当成可烤的了 —— 它没有身体')
+		if (stain.sellable) roastProblems.push('汁渍被当成能卖的了 —— 它没有身体')
 		if (stain.price > 0) roastProblems.push('汁渍居然有价钱')
-		if (w.roast(stain, 1.8)) roastProblems.push('汁渍被烤成功了')
 		if (w.sellFly(stain) > 0) roastProblems.push('汁渍被卖出去了')
 	}
 
@@ -3883,61 +4051,224 @@ const roastProblems = []
 		)
 	}
 
-	// —— 3. 烤制倍率：三档各算一遍，且**每具只能烤一次** ——
+	// —— 3. 点火：点着 → 烧够时间 → **直接变钱**，不留尸体 ——
 	//
-	// 这条是整个烤制机制的地基。不钉住的话，「反复烤无限翻倍」
-	// 会悄悄把经济搞崩，而且崩得很慢、很难归因
-	if (c1) {
-		const base = c1.value
-		for (const tier of chain) {
-			const probe = w.addRemains(0, 0, 'corpse', 14, 0, victim)
-			if (!w.roast(probe, tier.mul)) roastProblems.push(`烤 ${tier.name} 失败了`)
-			const want = base * tier.mul
-			if (Math.abs(probe.price - want) > 1e-9) {
-				roastProblems.push(`${tier.name} 烤完是 ${probe.price}，应当是 ${want}`)
-			}
-			if (!probe.roasted) roastProblems.push(`${tier.name} 烤完 roasted 还是 false`)
-		}
-		console.log(
-			`  三档倍率：` +
-				chain.map((t) => `${t.name} ${formatMoney(base * t.mul)}`).join(' / ') +
-				`（未烤 ${formatMoney(base)}）`,
-		)
+	// 这是 1.18.0 这次改动的地基。和上一版的区别只有一处，但那是全部意义：
+	//   上一版火只改**地上那具尸体**的价钱，还要玩家自己拖去出售区；
+	//   这一版火直接烧**活着的成虫**，烧完自动结账。
+	//
+	// ⚠ 下面这几条必须逐条钉死：钱涨了多少、**尸体数没涨**、**natural 没涨**、
+	//   sold 涨了。少了任何一条，「走 _resolveLifecycles 结算」那个 bug
+	//   就会表现为「钱拿到了，地上还多一具尸体，统计里还多一个自然老死」——
+	//   三件事各自都不报错
+	for (const tier of chain) {
+		const wb = new World(W, H)
+		wb.reset()
+		wb.flies.length = 0
+		wb.remains.length = 0
+		wb.shop.roast = tier.level
 
-		// 每具只能烤一次：**先真的烤一遍**，再烤第二次必须被拒。
-		// ⚠ 不能拿没烤过的尸体直接测第二次 —— 那样第一次就会成功，
-		// 断言报的是「重复烤」，实际测的却是「第一次烤」，白红一场
-		if (!w.roast(c1, 1.2)) roastProblems.push('第一次烤就被拒了')
-		const before = c1.price
-		const again = w.roast(c1, 1.8)
-		if (again) roastProblems.push('同一具尸体被烤了第二次 —— 倍率必须每具只能吃一次')
-		if (c1.price !== before) roastProblems.push('重烤之后价钱变了，倍率被叠加了')
+		const f = wb.addFly(W / 2, H / 2, 'F')
+		if (!f) {
+			roastProblems.push(`${tier.name} 那段：addFly 失败`)
+			continue
+		}
+		for (let i = 0; i < 600; i++) f.update(16, wb)
 
-		// 倍率和掉价是**相乘**的，不是二选一
-		const decayed = w.addRemains(0, 0, 'corpse', 14, 0, victim)
-		decayed.age = 20 * 60000 // 掉到底
-		w.roast(decayed, 1.8)
-		const want = base * CONFIG.roast.decayTo * 1.8
-		if (Math.abs(decayed.price - want) > 1e-9) {
-			roastProblems.push(`掉到底 + 烤过的价钱是 ${decayed.price}，应当是 ${want}`)
+		if (!wb.ignite(f, tier.id)) {
+			roastProblems.push(`${tier.name} 没点着`)
+			continue
+		}
+		if (f.burnLeft !== tier.burnMs) {
+			roastProblems.push(`${tier.name} 的燃烧时长是 ${f.burnLeft}，应当是 ${tier.burnMs}`)
+		}
+		if (f.burnMul !== tier.mul) roastProblems.push(`${tier.name} 的倍率没冻结在蝇身上`)
+		if (!f.burning) roastProblems.push(`${tier.name} 点着之后 burning 是 false`)
+
+		// ⚠ 再点一次必须被拒，而且**不能重置倒计时** ——
+		//   UI 按住工具时会每帧调一次 ignite，能重置的话就永远烧不完
+		const leftBefore = f.burnLeft
+		if (wb.ignite(f, tier.id)) roastProblems.push(`${tier.name} 把同一只点了第二次`)
+		if (f.burnLeft !== leftBefore) {
+			roastProblems.push('重点一次把倒计时重置了 —— 按住不放就永远烧不完')
 		}
 
-		// 普通（没烤过的）果蝇卖价不能被污染
-		const plain = w.addFly(10, 10, 'M')
-		if (plain) {
-			for (let i = 0; i < 600; i++) plain.update(16, w)
-			if (Math.abs(plain.value - plain.weight * CONFIG.market.pricePerMg) > 1e-9) {
-				roastProblems.push('没烤过的果蝇售价被改动了 —— 倍率漏给了未烤的')
-			}
+		// 烧到一半：还在烧，而且**还没给钱**
+		const money0 = wb.money
+		for (let t = 0; t < Math.floor(tier.burnMs / 2 / 16); t++) wb._updateBurning(16)
+		if (!f.burning) roastProblems.push(`${tier.name} 才烧了一半就结束了`)
+		if (wb.money !== money0) roastProblems.push('还没烧完就给钱了')
+
+		// —— 烧完：结账 ——
+		// ⚠ 结账金额要在**最后一次 tick 之前**读 f.value（它是 age 派生的 getter，
+		//   中间跑的这半程已经推进了年龄）。做法和炉子那段一样：
+		//   把倒计时压到最后一帧，读完再走
+		f.burnLeft = 1
+		const want = f.value * tier.mul
+		const remains0 = wb.remains.length
+		const natural0 = wb.stats.natural
+		const sold0 = wb.stats.sold ?? 0
+		wb._updateBurning(16)
+
+		// ⚠ **必须补这一行**。上面是直接调 `_updateBurning` 的（不经 `step()`），
+		//   而「留尸体 / 记成自然老死」是 `_resolveLifecycles` 干的活 ——
+		//   不调它的话，下面那两条断言**永远为真**：死掉的蝇在数组里没人收，
+		//   自然也就没有尸体、没有计数。
+		//   这正是「恒真的断言」那类陷阱：写完就绿，但它什么都没测。
+		//   补上之后，「拿 die('roasted') 顶替 sellFly」那种写法会当场红两条
+		wb._resolveLifecycles()
+
+		const got = wb.money - money0
+		if (Math.abs(got - want) > 1e-9) {
+			roastProblems.push(
+				`${tier.name} 烧完到账 ${formatMoney(got)}，应当是「售价 ${formatMoney(f.value)} × ${tier.mul}」= ${formatMoney(want)}`,
+			)
 		}
+		if (wb.remains.length !== remains0) {
+			roastProblems.push(`${tier.name} 烧完留下尸体了 —— 它必须直接变成钱`)
+		}
+		if (wb.stats.natural !== natural0) {
+			roastProblems.push(`${tier.name} 烧完被记成了自然老死 —— 结算走到 _resolveLifecycles 里去了`)
+		}
+		if ((wb.stats.sold ?? 0) !== sold0 + 1) roastProblems.push(`${tier.name} 烧完的出售计数没涨`)
+		if (wb.flies.indexOf(f) >= 0) roastProblems.push(`${tier.name} 烧完的蝇还留在 world.flies 里`)
+		if (f.burnLeft > 0) roastProblems.push(`${tier.name} 结账之后倒计时没清`)
+		// 冒了一个「+$x」（炉子那条路也是这么显示的，玩家才有得对照）
+		if (wb.floatTexts.length === 0) roastProblems.push(`${tier.name} 烧完没有冒出金额飘字`)
+	}
+	console.log(
+		`  点火：` +
+			chain.map((t) => `${t.name} 烧 ${t.burnMs / 1000} 秒 ×${t.mul}`).join(' / ') +
+			` —— 烧完直接到账、不留尸体、不计自然老死`,
+	)
+
+	// —— 3b. 灭火：四条抢先路径 ——
+	//
+	// ⚠ 不灭的话，那只虫会带着倒计时进容器，而容器里的虫不在 this.flies 里，
+	//   `_updateBurning` 永远走不到它 —— 倒计时就永久悬在存档里了
+	{
+		const wE = new World(W, H)
+		wE.reset()
+		wE.shop.roast = 1
+
+		const fresh = (x) => {
+			wE.flies.length = 0
+			const f = wE.addFly(x, H / 2, 'F')
+			wE.ignite(f, 'lighter')
+			return f
+		}
+
+		// ① 被拍死
+		const fSwat = fresh(W * 0.3)
+		if (!fSwat.burning) roastProblems.push('灭火那组：前提没成立（没点着）')
+		wE.swat(fSwat.x, fSwat.y)
+		if (fSwat.burning) roastProblems.push('被拍死的蝇还带着火')
+
+		// ② 进玻璃罐
+		const fJar = fresh(W * 0.4)
+		wE.jars.length = 0
+		const jar = wE.addJar(W / 2, H / 2)
+		if (jar && jar.admit(fJar) && fJar.burning) roastProblems.push('进罐的蝇还带着火')
+
+		// ③ 进烤炉
+		const fOven = fresh(W * 0.5)
+		wE.ovens.length = 0
+		const ov = wE.addOven(W / 2, H / 2)
+		if (ov && ov.admit(fOven) && fOven.burning) roastProblems.push('进炉的蝇还带着火')
+
+		// ④ 被玩家手工卖掉（拖进出售区，不带第二个参数）
+		const fSold = fresh(W * 0.6)
+		const wantPlain = fSold.value
+		const gotPlain = wE.sellFly(fSold)
+		if (Math.abs(gotPlain - wantPlain) > 1e-9) {
+			roastProblems.push(
+				`手工卖掉一只烧着的蝇拿到 ${formatMoney(gotPlain)}，应当是**原价** ${formatMoney(wantPlain)} —— 倍率只有「让它自己烧完」才给`,
+			)
+		}
+		if (fSold.burning) roastProblems.push('被卖掉的蝇还带着火')
 	}
 
-	// —— 3. 烤炉：容量 5，装满自动开烤，8 秒后出炉 ——
+	// —— 3b-2. 手里拿的是**哪一把**就按哪一把算 ——
 	//
-	// ⚠ 先把等级拉满。炉子的时长是从**当前档位**取的（烤制链的 lv3），
-	// 而这个世界还没买过任何东西 —— 不设等级的话 startRoast(0) 会被拒，
-	// 后面所有断言都会跟着红，而报出来的是「没自动开烤」这种表面现象
-	w.shop.roast = chain.length
+	// ⚠ 这条是自检抓出来的一个真 bug：`ignite` 一开始取的是「当前**最高**档」，
+	//   而不是「手里这一把」。玩家买到喷火枪之后工具栏上是两颗按钮，
+	//   他完全可能回头去拿打火机 —— 那时点出来的是 3 秒 ×1.5，
+	//   两颗按钮变成同一把，而界面上看不出任何异常。
+	//
+	//   模拟器原来一直绿，是因为它每次都把等级设成刚好等于要测的那一档，
+	//   「最高档」和「手里那把」恰好一致。这条断言把两者拆开
+	{
+		const wT = new World(W, H)
+		wT.reset()
+		wT.shop.roast = 2 // **两把都买了**
+		const chainT = CONFIG.market.roastChain
+		const lo = chainT[0]
+		const hi = chainT[1]
+
+		wT.flies.length = 0
+		const fLo = wT.addFly(200, 200, 'F')
+		if (!wT.ignite(fLo, lo.id)) roastProblems.push('两把都买了，却点不着打火机')
+		else {
+			if (fLo.burnLeft !== lo.burnMs) {
+				roastProblems.push(`拿着打火机点火，燃烧时长却是 ${fLo.burnLeft}，应当是 ${lo.burnMs}`)
+			}
+			if (fLo.burnMul !== lo.mul) {
+				roastProblems.push(`拿着打火机点火，倍率却是 ${fLo.burnMul}，应当是 ${lo.mul} —— 取成最高档了`)
+			}
+			if (fLo.burnBig) roastProblems.push('拿着打火机点出来的却是大火焰')
+		}
+
+		// 反过来：拿着喷火枪就是高档那一套
+		const fHi = wT.addFly(600, 200, 'F')
+		if (!wT.ignite(fHi, hi.id)) roastProblems.push('两把都买了，却点不着喷火枪')
+		else {
+			if (fHi.burnLeft !== hi.burnMs) roastProblems.push('拿着喷火枪点的燃烧时长不对')
+			if (fHi.burnMul !== hi.mul) roastProblems.push('拿着喷火枪点的倍率不对')
+			if (!fHi.burnBig) roastProblems.push('拿着喷火枪点出来的不是大火焰')
+		}
+
+		// 没买到那一档就点不着：只有打火机时，喷火枪必须被拒
+		const wT2 = new World(W, H)
+		wT2.reset()
+		wT2.shop.roast = 1
+		wT2.flies.length = 0
+		const fX = wT2.addFly(400, 400, 'F')
+		if (wT2.ignite(fX, hi.id)) {
+			roastProblems.push('只买了打火机，却能用喷火枪点火 —— 拥有权闸门没生效')
+		}
+		// 认不出的工具 id 也要拒绝，不能默默按某一档算
+		if (wT2.ignite(fX, 'nonsense')) roastProblems.push('用不存在的工具 id 居然点着了火')
+	}
+
+	// —— 3c. 养蝇人不碰正在烧的 ——
+	//
+	// 自动出售是玩家没在看的时候发生的。正在烧、马上要按倍率结账的那只
+	// 被按原价卖掉，是玩家看得见的一笔损失
+	{
+		const wK = new World(W, H)
+		wK.reset()
+		wK.shop.roast = 1
+		wK.flies.length = 0
+		const f = wK.addFly(W / 2, H / 2, 'F')
+		for (let i = 0; i < 600; i++) f.update(16, wK)
+		wK.ignite(f, 'lighter')
+
+		wK.keeper.sell = true
+		// 卖**全部**档位 —— 只要有一只没被排除，它就会被卖掉
+		wK.keeper.tiers = CONFIG.market.valueTiers.map((t) => t.id)
+		wK.money = 0
+		wK._keeperSell()
+		if (wK.flies.indexOf(f) < 0) {
+			roastProblems.push('养蝇人把正在烧的蝇按原价卖掉了 —— 它该被跳过')
+		}
+		if (!f.burning) roastProblems.push('养蝇人那一路把火弄灭了')
+	}
+
+	// —— 4. 烤炉：容量 5，装满自动开烤，8 秒后整炉卖钱 ——
+	//
+	// ⚠ 炉子从 1.18.0 起**不在烤制链上了** —— 它是一件 $5 的独立商品
+	//   （投放 → 其他，见 market.prices.oven），所以这里**不再需要设等级**。
+	//   时长和倍率都从 CONFIG.roast.oven 直接读
 	const oven = w.dropOven()
 	if (!oven) roastProblems.push('dropOven 没造出炉子')
 	else {
@@ -3955,18 +4286,33 @@ const roastProblems = []
 		if (accepted !== R.oven.capacity) {
 			roastProblems.push(`往容量 ${R.oven.capacity} 的炉子里塞了 7 只，收下了 ${accepted} 只`)
 		}
-		if (!oven.roasting) roastProblems.push('装满之后没有自动开烤')
 
-		// 烤够时间。时长从**档位**取（烤制链的 lv3），不是 CONFIG.roast.oven ——
-		// 后者根本没有 roastMs 这个键
-		const tier3 = chain[chain.length - 1]
-		const mulWant = tier3.mul
-		if (!(oven.roastTotal > 0)) {
-			roastProblems.push(`开烤之后 roastTotal 是 ${oven.roastTotal}，倒计时会变成 NaN`)
+		// —— 核心：**放进去就开始烤，不用等装满** ——
+		//
+		// ⚠ 这一条是 1.21.0「单独烤制」的全部意义。留神别把它当成
+		//   「反正最后都会烤完」：老机制下推进到容量上限才开烤，
+		//   而这句断言要的是**每一只刚进去就已经在倒计时**了 ——
+		//   只塞 1 只进去也应该立刻开烤（下面单独验）
+		if (!oven.roasting) roastProblems.push('刚放进去没有开始烤 —— 现在应当是进炉即开烤')
+		for (const f of oven.items) {
+			if (!(f.roastTotal > 0)) {
+				roastProblems.push(`进炉之后 roastTotal 是 ${f.roastTotal}，倒计时会变成 NaN`)
+				break
+			}
+			if (f.roastTotal !== R.oven.roastMs) {
+				roastProblems.push(`单只时长是 ${f.roastTotal}，CONFIG.roast.oven.roastMs 是 ${R.oven.roastMs}`)
+				break
+			}
+			if (f.roastLeft !== f.roastTotal) {
+				roastProblems.push(`刚进炉 roastLeft 就是 ${f.roastLeft}，应当等于总时长`)
+				break
+			}
 		}
+
 		// 先盯住「没到点不能出炉」——不先验这一条的话，
 		// 「倒计时写成 0、一帧就出炉」这种错会被下面的最终断言当成「通过」
-		const half = Math.floor(tier3.roastMs / 32)
+		const mulWant = R.oven.mul
+		const half = Math.floor(R.oven.roastMs / 32)
 		for (let i = 0; i < half; i++) w._updateOvens(16)
 		if (!oven.roasting) roastProblems.push('才烤了一半就出炉了')
 		if (oven.items.length !== accepted) {
@@ -3981,8 +4327,17 @@ const roastProblems = []
 		//   就和结算时读到的不一样，断言只能写成「差一帧的近似」。
 		//   压到 0 再 `_updateOvens(0)`：dt=0 时 `f.update(0)` 不推进年龄，
 		//   于是记下来的 value 就是结算时的那一个
-		while (oven.roasting && oven.roastTimer > 16) w._updateOvens(16)
-		oven.roastTimer = 0
+		// ⚠ 倒计时现在**挂在每只虫身上**（`f.roastLeft`），不再有炉子级的
+		//   `roastTimer`。所以「压到最后一帧」要逐只压
+		while (oven.roasting) {
+			let anyFar = false
+			for (const f of oven.items) {
+				if (f.roastLeft > 16) anyFar = true
+			}
+			if (!anyFar) break
+			w._updateOvens(16)
+		}
+		for (const f of oven.items) f.roastLeft = 0
 
 		const wantEach = oven.items.map((f) => f.value)
 		// 出炉之后 oven.items 会被清空，所以先把这几只留下来查生死
@@ -4033,12 +4388,39 @@ const roastProblems = []
 		if (texts.length !== accepted) {
 			roastProblems.push(`出炉冒出 ${texts.length} 个飘字，应当是 ${accepted} 个（每只一个）`)
 		}
+		// ⚠ 这里只比**金额的集合**，不比顺序 —— 顺序是**后进先出**，
+		//   和放进炉子的先后相反。
+		//
+		//   原因在 world._updateOvens：那一圈倒着遍历 oven.items（结账时要把
+		//   这一只 splice 掉，正着走会漏掉紧跟着的那一只），所以同一帧里一起
+		//   烤满的这几只按倒序结账，飘字也跟着倒序。1.21.0 改「各自计时」之前
+		//   一炉只有一个整炉倒计时、根本不会同帧结算，这条断言当时是逐位写的；
+		//   改完之后它会**偶尔**红（5 只身价一样时又看不出来，所以十次里红一次，
+		//   最难查的那种）。
+		//
+		//   ⚠ 这个顺序玩家看不出来 —— 延后本来就是用来把几个数字错开的，
+		//     谁先谁后都一样 —— 所以**刻意不钉它**：钉了的话，谁把遍历方向
+		//     改成正着走（一件完全无害的事）都会撞红一条其实不成立的断言。
+		//
+		//   ⚠ 但**别**因此退化成「只数个数」：金额算错倍数、或者张冠李戴成
+		//     另一个数，只能靠下面这次集合比对抓出来
+		//
+		//   ⚠ 要注意这条的**分辨率**：比的是 formatMoney 三位小数之后的字符串，
+		//     而一炉的金额就在 $0.004 这一档，所以 ±10% 的偏差（$0.0036 → $0.0040）
+		//     是**看不见**的 —— 拿 1.1 倍去试会绿着回来。真要验它有没有牙齿，
+		//     得用 2 倍这种量级的扰动
+		const wantTexts = wantEach.map((v) => '+' + formatMoney(v * mulWant))
+		const gotSorted = texts.map((t) => t.text).sort()
+		const wantSorted = wantTexts.slice().sort()
+		if (gotSorted.join(' | ') !== wantSorted.join(' | ')) {
+			roastProblems.push(
+				`一炉飘字的金额对不上：冒出来的是 ${gotSorted.join(' / ')}，应当是 ${wantSorted.join(' / ')}`,
+			)
+		}
 		texts.forEach((t, i) => {
-			const want = '+' + formatMoney(wantEach[i] * mulWant)
-			if (t.text !== want) {
-				roastProblems.push(`第 ${i} 个飘字写的是「${t.text}」，应当是「${want}」`)
-			}
-			// 延后要逐个错开 —— 一炉 5 个数字同时冒出来会糊成一团
+			// ⚠ 延后**按结账次序**发下去（第 i 个结账的延后 i 步），
+			//   所以这一条仍然是逐位比对的 —— 它钉的是「错开」本身，
+			//   和上面那个「谁先谁后」不是一回事
 			const wantDelay = i * CONFIG.roast.oven.float.delayStep
 			if (Math.abs(t.delay - wantDelay) > 1e-9) {
 				roastProblems.push(`第 ${i} 个飘字的延后是 ${t.delay}，应当是 ${wantDelay}`)
@@ -4064,53 +4446,139 @@ const roastProblems = []
 		}
 
 		console.log(
-			`  烤炉：容量 ${oven.capacity}，塞 7 只收下 ${accepted} 只并自动开烤，` +
-				`${tier3.roastMs / 1000} 秒后**直接到账** ${formatMoney(wantTotal)}（×${mulWant}）、` +
+			`  烤炉：容量 ${oven.capacity}，塞 7 只收下 ${accepted} 只、**进炉即开烤**（不用等装满），` +
+				`各烤 ${R.oven.roastMs / 1000} 秒后**各自到账**共 ${formatMoney(wantTotal)}（×${mulWant}）、` +
 				`不留尸体、每只各冒一个数字`,
 		)
+
+		// —— 单独烤制：**只放 1 只**也要自己烤完自己到账 ——
+		//
+		// ⚠ 这是和老机制差别最大的地方，而且是最容易「改回去也没人发现」的一条：
+		//   老版本要装满 5 只才开烤，只放 1 只进去会永远躺在那儿。
+		//   上面那一大段塞的是满炉，**一路满着跑**，所以这条单独放一只来验
+		const solo = w.dropOven()
+		if (!solo) roastProblems.push('单独烤制用的第二个炉子没造出来')
+		else {
+			const f = w.addFly(500, 500, 'M')
+			if (!f) roastProblems.push('单独烤制的探针果蝇没造出来')
+			else if (!w.putInOven(solo, f)) roastProblems.push('往空炉子里放 1 只居然被拒了')
+			else if (!solo.roasting) roastProblems.push('只放了 1 只，炉子没有开始烤')
+			else {
+				const before = w.money
+				// 差一帧停住，再 dt=0 结账 —— 和上面同一个理由（别让 age 漂）
+				while (solo.roasting && f.roastLeft > 16) w._updateOvens(16)
+				f.roastLeft = 0
+				// ⚠ 售价必须在**跑完之后、结账之前**读：`f.value` 是从 age 派生的
+				//   getter，上面那个 while 每转一圈都在推进年龄。
+				//   在 while **之前**读的话，拿到的是几分钟前的价钱 ——
+				//   而两边的差只有几厘，断言报出来会是「到账 $0.004，应当是 $0.004」
+				//   这种看着像相等的一句话
+				const wantSolo = f.value * mulWant
+				w._updateOvens(0)
+				if (solo.items.length !== 0) roastProblems.push('单独烤的那只没有出炉')
+				const got = w.money - before
+				if (Math.abs(got - wantSolo) > 1e-9) {
+					roastProblems.push(
+						`单只烤制到账 ${formatMoney(got)}，应当是 ${formatMoney(wantSolo)}`,
+					)
+				}
+			}
+			solo.dead = true
+			w.ovens = w.ovens.filter((o) => o !== solo)
+		}
+
+		// —— 老存档迁移：炉里的虫没有 per-fly 倒计时时要补上 ——
+		//
+		// ⚠ 1.20.x 及以前的存档里，炉子是**整炉一个倒计时**（Oven.roastTimer），
+		//   虫身上没有 roastLeft。那种档读进来之后每一只都是 null = 「没在烤」，
+		//   而 1.21.0 起**没有别的地方能给它开烤**（全靠 admit 时挂上）。
+		//   不迁移的话那些果蝇会永远卡在炉子里：不烤、不卖、拿不出来，也不报错。
+		//
+		//   造一个「老格式」的存档来验：把 items 里的 roastLeft / roastTotal 删掉
+		{
+			const src = new World(W, H)
+			const oldOven = src.dropOven()
+			const inside = src.addFly(300, 300, 'M')
+			// ⚠ 必须**真的塞进炉子**再存 —— 只是造出来放在场上，
+			//   `ovens[0].items` 会是空的，这条断言就变成对空数组做的（恒真）
+			if (!oldOven || !inside || !src.putInOven(oldOven, inside)) {
+				roastProblems.push('老存档迁移用的炉子 / 探针没准备好')
+			}
+			const snap = src.serialize()
+			// 手写一份老格式：虫身上没有那两个键
+			for (const o of snap.ovens) for (const it of o.items) delete it.roastLeft
+			const dst = new World(W, H)
+			dst.restore(JSON.parse(JSON.stringify(snap)))
+			const restored = dst.ovens[0]
+			if (!restored || restored.items.length !== 1) {
+				roastProblems.push('老格式存档读回来之后炉子是空的 —— 迁移那段把虫弄丢了')
+			} else if (restored.items[0].roastLeft !== R.oven.roastMs) {
+				roastProblems.push(
+					`老存档里的炉中虫读回来 roastLeft 是 ${restored.items[0].roastLeft}，` +
+						`应当被补成 ${R.oven.roastMs} —— 不然它会永远卡在炉子里`,
+				)
+			} else if (!restored.roasting) {
+				roastProblems.push('老存档里的炉中虫读回来没有开始烤')
+			} else {
+				// 补上之后要真的能烤完、能到账
+				const before = dst.money
+				const f2 = restored.items[0]
+				while (restored.roasting && f2.roastLeft > 16) dst._updateOvens(16)
+				f2.roastLeft = 0
+				const want = f2.value * R.oven.mul
+				dst._updateOvens(0)
+				if (restored.items.length !== 0) roastProblems.push('老存档迁移过来的那只没有出炉')
+				if (Math.abs(dst.money - before - want) > 1e-9) {
+					roastProblems.push('老存档迁移过来的那只到账金额不对')
+				}
+				console.log(`  老存档迁移：炉里的虫没有倒计时 → 自动补成 ${R.oven.roastMs}ms 并正常烤完`)
+			}
+			// oldOven / inside 只是造存档用的，不影响后面
+			void oldOven
+			void inside
+		}
 	}
 
-	// —— 4. 出售：尸体按 price 结算（含掉价和倍率）——
+	// —— 5. 出售：尸体按 price 结算（= 原价 × 掉价，**没有倍率这一档**）——
 	//
-	// 挑倍率**最高**的那一具来卖。随便挑一具的话可能刚好是 ×1.2，
-	// 打印出来「卖出 $0.002（未烤只值 $0.002）」看着像倍率根本没生效 ——
-	// 数字是对的（0.0024 显示成 $0.002），但读的人会先怀疑代码
+	// ⚠ 这里原来挑的是「烤过的、倍率最高的那一具」。尸体不能再烤之后
+	//   那个筛选条件恒为空 —— 而「筛出空数组 → toSell 是 undefined →
+	//   报一句『没有烤好的可以卖』」看起来像前面红了，其实只是断言过时了。
+	//   所以直接挑**最值钱的那一具**，顺便覆盖「尸体按原价卖」这条契约
 	const toSell = w.remains
-		.filter((r) => r.roastable && r.roasted)
+		.filter((r) => r.sellable)
 		.sort((a, b) => b.price - a.price)[0]
-	if (!toSell) roastProblems.push('没有烤好的可以卖，前面的断言多半已经红了')
+	if (!toSell) roastProblems.push('一具能卖的尸体都没有，前面的断言多半已经红了')
 	else {
 		const moneyBefore = w.money
 		const want = toSell.price
-		const got = w.sellFly(toSell)
+		// 尸体那一支**不吃**第二个参数（倍率只作用于活蝇），这里显式传一个，
+		// 顺便钉住「传了也会被忽略」——不然有人会以为尸体也能吃倍率
+		const got = w.sellFly(toSell, 1.8)
 		if (Math.abs(got - want) > 1e-9) {
-			roastProblems.push(`卖烤好的尸体拿到 ${got}，应当是 ${want}`)
+			roastProblems.push(`卖尸体拿到 ${got}，应当是原价 × 掉价 = ${want}`)
 		}
 		if (Math.abs(w.money - moneyBefore - want) > 1e-9) {
 			roastProblems.push('卖了尸体但钱没有加上去')
 		}
 		if (w.remains.indexOf(toSell) >= 0) roastProblems.push('卖掉之后尸体还留在 world.remains 里')
 		console.log(
-			`  出售：烤好的尸体卖出 ${formatMoney(got)}` + `（未烤原价 ${formatMoney(toSell.value)}）`,
+			`  出售：尸体卖出 ${formatMoney(got)}` + `（原价 ${formatMoney(toSell.value)} · 只剩原价这一档）`,
 		)
 	}
 
-	// 没烤过的尸体**也能卖**，只是按原价 —— 玩家清屏时顺手卖掉是条正当出路
-	const rawCorpse = w.addRemains(0, 0, 'corpse', 14, 0, victim)
-	if (rawCorpse) {
-		const want = rawCorpse.price
-		const got = w.sellFly(rawCorpse)
-		if (Math.abs(got - want) > 1e-9) {
-			roastProblems.push(`卖没烤过的尸体拿到 ${got}，应当是原价 ${want}`)
-		}
-	}
-
-	// —— 5. 可升级链：逐级扣款、钱不够不扣不升 ——
+	// —— 6. 可升级链：逐级扣款、钱不够不扣不升 ——
 	const cw = new World(W, H)
 	cw.reset()
 	const prices = chain.map((t) => t.price)
-	if (Math.abs(prices.reduce((a, b) => a + b, 0) - 27) > 1e-9) {
-		roastProblems.push(`三档价格合计 ${prices.reduce((a, b) => a + b, 0)}，应当是 27`)
+	// ⚠ 这个 11 是**手写的字面量**，故意不写 `reduce` 自己的结果 ——
+	//   它守的是「玩家实际要付多少钱」这件事。从 chain 现算等于不测：
+	//   改价格时它会跟着一起变，永远绿
+	if (Math.abs(prices.reduce((a, b) => a + b, 0) - 11) > 1e-9) {
+		roastProblems.push(`两档价格合计 ${prices.reduce((a, b) => a + b, 0)}，应当是 11`)
+	}
+	if (chain.length !== 2) {
+		roastProblems.push(`烤制链有 ${chain.length} 档，应当是 2（炉子已经挪去投放了）`)
 	}
 
 	// 钱不够：一分都不能扣，等级也不能动
@@ -4151,23 +4619,77 @@ const roastProblems = []
 	if (back2.shopLevel('roast') !== chain.length) {
 		roastProblems.push(`存档往返之后等级从 ${chain.length} 变成了 ${back2.shopLevel('roast')}`)
 	}
-	if (back2.roastMul() !== cw.roastMul()) roastProblems.push('存档往返之后烤制倍率对不上')
+	// 存档往返之后倍率不能丢 —— 它决定点火器能卖多少钱。
+	// ⚠ 以前这里比的是 `roastMul()`（一个跟着等级走的 getter），
+	//   那条路随炉子出链一起删了，现在比的是**当前档位的 mul**
+	if (cw.burnTier().mul !== back2.burnTier().mul) {
+		roastProblems.push('存档往返之后点火倍率对不上')
+	}
 
-	// —— 6. 尸体 / 烤炉也要能存档往返 ——
+	// —— 6b. 老存档里的越界等级：链被改短之后不能把整个程序炸掉 ——
 	//
-	// ⚠ 尸体新加的 value / rarity / roasted / roastMul 全靠 snapshot 的
-	// **反黑名单**机制自动跟随 —— 也就是说这条断言的真正作用是：
-	// 万一将来谁把这些字段塞进了 REF_FIELDS，或者改成白名单，这里当场红
+	// 这是 1.18.0 **真实踩过**的坑：烤制链从三档砍到两档（烤炉出链，变成投放里
+	// $5 的商品），而 1.17 的存档里写着 `shop.roast: 3`。
+	// UI 那边 `chain[lv - 1].name` 于是读到 undefined 并抛 TypeError，
+	// 而那一行跑在**渲染循环里**（ui.update → refreshStats → refreshShop）——
+	// 一抛，主循环就再也排不上下一帧。玩家的表现是
+	// 「读档之后屏幕上一个生物都没有」，还不弹任何错误。
+	//
+	// 这里钉的是**源头**：shopLevel 必须把等级夹回链长以内。
+	// 只在 UI 里加个兜底是不够的 —— burnTier / ignite / 养蝇人全都在读它
+	const staleOver = new World(W, H)
+	staleOver.shop.roast = chain.length + 5
+	const gotOver = staleOver.shopLevel('roast')
+	const tierOk = !!staleOver.chainTier('roast', gotOver)
+	const burnOk = !!staleOver.burnTier()
+	// 越界应当表现为「已经满级」，而不是崩溃、也不是还能继续升
+	const upgraded = staleOver.upgradeShopItem('roast')
+
+	// 反向：手改存档塞进来的负数也不能变成负等级
+	const staleNeg = new World(W, H)
+	staleNeg.shop.roast = -3
+	const gotNeg = staleNeg.shopLevel('roast')
+
+	if (gotOver !== chain.length) {
+		roastProblems.push(
+			`越界的等级没被夹回来：存档里是 ${chain.length + 5}，shopLevel 给出 ${gotOver}`,
+		)
+	}
+	// 夹回来之后必须还能取到一个**真的档位** —— UI 那一行的名字就靠它
+	if (!tierOk) roastProblems.push('夹回来的等级在链里取不到档位，界面会读到 undefined')
+	if (!burnOk) roastProblems.push('越界等级让 burnTier 取不到档位（点火倍率会变成 NaN）')
+	if (upgraded) roastProblems.push('等级越界之后居然还能继续升级')
+	if (gotNeg !== 0) roastProblems.push(`负数等级没被夹成 0，而是 ${gotNeg}`)
+
+	// ⚠ 这一行打印的是**实测值**，不是写死的结论 ——
+	//   上面那几条断言全红的时候，它必须跟着一起露馅
+	console.log(
+		`  越界等级：老存档里的 ${chain.length + 5} → ${gotOver}（档位${tierOk ? '取得到' : '取不到'}），` +
+			`负数 -3 → ${gotNeg}，再升一级${upgraded ? '居然成功了' : '被拒（满级）'}`,
+	)
+
+	// —— 7. 尸体 / 烧着的蝇 / 烤炉都要能存档往返 ——
+	//
+	// ⚠ 这些东西**全靠 snapshot 的反黑名单机制**自动跟随 —— 也就是说
+	//   这条断言的真正作用是：万一将来谁把这些字段塞进了 REF_FIELDS、
+	//   或者把 snapshot 改成白名单，这里当场红
 	cw.remains.length = 0
+	cw.flies.length = 0
 	const mk = cw.addFly(W / 2, H / 2, 'F')
 	if (mk) {
 		for (let i = 0; i < 600; i++) mk.update(16, cw)
 		const rc = cw.addRemains(mk.x, mk.y, 'corpse', mk.size, 0, mk)
-		if (rc) {
-			rc.age = 7 * 60000 // 停在掉价中途
-			cw.roast(rc, 1.5)
-		}
+		if (rc) rc.age = 7 * 60000 // 停在掉价中途
 	}
+	// 再放一只**正在烧的**进去：burnLeft / burnMul / burnBig 三个字段
+	// 也是自有属性，必须跟着存档往返 —— 读回来它会接着烧完并自己结账
+	const burnMe = cw.addFly(W * 0.3, H / 2, 'M')
+	if (burnMe) {
+		cw.shop.roast = 2
+		cw.ignite(burnMe, 'flamer')
+		cw.shop.roast = chain.length
+	}
+
 	const rt2 = cw.serialize()
 	const back3 = new World(W, H)
 	back3.restore(JSON.parse(JSON.stringify(rt2)))
@@ -4181,14 +4703,33 @@ const roastProblems = []
 		const a = cw.remains[i]
 		const b = back3.remains[i]
 		if (!b) continue
-		if (a.value !== b.value || a.roasted !== b.roasted || a.roastMul !== b.roastMul) {
-			roastProblems.push('尸体的 value / roasted / roastMul 在存档往返里丢了')
-		}
+		if (a.value !== b.value) roastProblems.push('尸体的 value 在存档往返里丢了')
 		if (a.rarity !== b.rarity || a.sex !== b.sex) {
 			roastProblems.push('尸体的 rarity / sex 在存档往返里丢了')
 		}
 		if (Math.abs(a.price - b.price) > 1e-9) {
 			roastProblems.push(`存档往返之后价钱从 ${a.price} 变成了 ${b.price}`)
+		}
+		// ⚠ 老存档里的 roasted / roastMul 会被 revive 写回来（那两个键已经删了，
+		//   revive 是「原型上没有就新增」）。它们**无害** —— price 和 drawCorpse
+		//   两处都不再读它们。这里显式钉一句，免得以后有人看到存档里的
+		//   两个陌生键以为是 bug
+		if (b.roasted !== undefined && b.roastMul !== undefined && b.price !== a.price) {
+			roastProblems.push('老存档里的 roasted / roastMul 居然影响了价钱 —— 那两个键必须被彻底忽略')
+		}
+	}
+	// 烧着的一只：三个字段原样往返
+	{
+		const bBurn = back3.flies.find((f) => f.sex === 'M')
+		if (!burnMe) roastProblems.push('存档往返那组：addFly 失败')
+		else if (!bBurn) roastProblems.push('存档往返之后那只烧着的蝇不见了')
+		else {
+			if (bBurn.burnLeft !== burnMe.burnLeft) {
+				roastProblems.push(`烧着的蝇 burnLeft 从 ${burnMe.burnLeft} 变成了 ${bBurn.burnLeft}`)
+			}
+			if (bBurn.burnMul !== burnMe.burnMul) roastProblems.push('烧着的蝇 burnMul 在存档往返里丢了')
+			if (bBurn.burnBig !== burnMe.burnBig) roastProblems.push('烧着的蝇 burnBig 在存档往返里丢了')
+			if (!bBurn.burning) roastProblems.push('读档回来那只蝇不烧了 —— 它该接着烧完并结账')
 		}
 	}
 	console.log(
@@ -4624,7 +5165,7 @@ const geneProblems = []
 			}
 		}
 		console.log(
-			`  只有母方携带 × ${TRIALS} 次：四种突变的遗传率 ${MUTATION_TYPES.map((t) => (oneSide[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}` +
+			`  只有母方携带 × ${TRIALS} 次：五种突变的遗传率 ${MUTATION_TYPES.map((t) => (oneSide[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}` +
 				`（期望 ${MUTATION_TYPES.map((t) => (expectOne(t) * 100).toFixed(0) + '%').join(' / ')}，含新发）`,
 		)
 		if (worstOne > TOL) {
@@ -4660,7 +5201,19 @@ const geneProblems = []
 		// 万一有人把「双方」那条路改成只骰一次（或者两次取交集），
 		// 上面两条会各自按自己的期望值去卡，反而可能都过 —— 这条不会。
 		// 用一个新发概率最低的突变来比，差距最干净
+		//
+		// ⚠ 加了星云（chance 恒为 0）之后，这一行**必然**选中它 ——
+		//   0 比谁都小。这不是巧合，是这里想要的：概率 0 的那一种
+		//   实测率正好等于期望的 20% / 36%，没有任何新发项掺进来，
+		//   两个数之间的差距因此最干净。下面那条断言把这个前提钉住，
+		//   免得哪天星云的 chance 被改成非 0，这里悄悄换了个比较对象
 		const cleanest = MUTATION_TYPES.reduce((a, b) => (a.chance < b.chance ? a : b))
+		if (cleanest.id !== 'nebula') {
+			geneProblems.push(
+				`「差距最干净」那条挑中的是 ${cleanest.id}，不是星云 —— ` +
+					'星云的 chance 应当是 0（它只能靠吃星空苹果得到）',
+			)
+		}
 		const gap = (both[cleanest.id] - oneSide[cleanest.id]) / TRIALS
 		if (!(gap > 0.1)) {
 			geneProblems.push(
@@ -4688,6 +5241,22 @@ const geneProblems = []
 		console.log(`  野生型双亲 ${TRIALS} 次产卵：新发突变出现率 ${(rate * 100).toFixed(1)}%（期望约 ${(want * 100).toFixed(1)}%）`)
 		if (!(Math.abs(rate - want) < 0.02)) {
 			geneProblems.push(`新发突变率是 ${(rate * 100).toFixed(1)}%，期望约 ${(want * 100).toFixed(1)}%`)
+		}
+
+		// ⚠ 星云**永远不能**从新发里冒出来 —— 它唯一的来源是幼虫吃星空苹果。
+		//   这一条比上面那条更直接：上面那条看的是**总**发生率，
+		//   星云真要是混进去了，也只让总数涨一点点（0.1 对 8.7%），
+		//   完全可能落在容差里静悄悄地过去
+		let nebulaDeNovo = 0
+		for (let i = 0; i < TRIALS; i++) {
+			if (rollDeNovo().includes('nebula')) nebulaDeNovo++
+		}
+		console.log(`  新发抽奖 ${TRIALS} 次里骰到星云：${nebulaDeNovo} 次`)
+		if (nebulaDeNovo > 0) {
+			geneProblems.push(
+				`新发抽奖骰出了 ${nebulaDeNovo} 次星云 —— 它只能靠吃星空苹果得到，` +
+					`chance 必须是 0（现在是 ${CONFIG.mutation.types.find((t) => t.id === 'nebula').chance}）`,
+			)
 		}
 	}
 
@@ -4751,6 +5320,39 @@ const geneProblems = []
 		// 连乘而不是相加：1.3 × 2 = 2.6，不是 1 + 0.3 + 1 = 2.3
 		if (Math.abs(both / base - 2.6) > 1e-6) {
 			geneProblems.push(`两种价值突变同时存在时是 ${(both / base).toFixed(3)}×，应当是连乘 2.6×`)
+		}
+
+		// —— 星云：价值 ×1.2、速度 ×2 ——
+		//
+		// ⚠ 速度这一条量的是 `speedScale` 这个**消费点**，不是某个字段。
+		//   星云的 ×2 并进了 Fly.speedScale 的 getter，而 _walk / _fly /
+		//   updateJarred 三条路都读它 —— 在这里量等于把三条路一起钉住了。
+		//   写进 targetSpeed 之类的地方是**不生效**的（每帧会被重写），
+		//   那种错法在这里会立刻现形
+		const nebulaPrice = price(['nebula'])
+		console.log(
+			`  星云：价值 ${(nebulaPrice / base).toFixed(2)}× / 速度 ${speedMulOf(['nebula'])}×`,
+		)
+		if (Math.abs(nebulaPrice / base - 1.2) > 1e-6) {
+			geneProblems.push(`星云的价值倍率是 ${(nebulaPrice / base).toFixed(3)}，应当是 1.2`)
+		}
+		if (speedMulOf(['nebula']) !== 2) {
+			geneProblems.push(`星云的速度倍率是 ${speedMulOf(['nebula'])}，应当是 2`)
+		}
+		// 虫身上真的读到了这个倍率 —— 配置里写了 2 但没接上去的话，
+		// 上面那条照样绿（它只读 config），这条不会
+		const nebFly = new World(100, 100).addFly(10, 10, 'M', 'normal', ['nebula'])
+		const plainFly = new World(100, 100).addFly(10, 10, 'M', 'normal', [])
+		const ratio2 = nebFly.speedScale / plainFly.speedScale
+		console.log(`  星云蝇的 speedScale 是普通蝇的 ${ratio2.toFixed(2)} 倍`)
+		if (Math.abs(ratio2 - 2) > 1e-6) {
+			geneProblems.push(`星云蝇的 speedScale 只有普通蝇的 ${ratio2.toFixed(3)} 倍，应当是 2 —— 倍率没接到消费点上`)
+		}
+		// 和体格**相乘**而不是相加：极端变异 0.3 × 2 = 0.6
+		const nebExtreme = new World(100, 100).addFly(10, 10, 'M', 'extreme', ['nebula'])
+		const extreme = new World(100, 100).addFly(10, 10, 'M', 'extreme', [])
+		if (Math.abs(nebExtreme.speedScale / extreme.speedScale - 2) > 1e-6) {
+			geneProblems.push('星云和体格倍率没有相乘 —— 极端变异 + 星云应当正好是它的 2 倍')
 		}
 
 		// 石化：体重 ×1.5（售价跟着走，因为 value = priceOf(weight)）

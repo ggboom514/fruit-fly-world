@@ -116,9 +116,17 @@ export class SaveManager {
 				return 'continued'
 			} catch (e) {
 				// 存档在结构上过关、恢复却炸了：不留一个半死不活的世界，直接清掉重开
+				//
+				// ⚠ **reset() 不能省，只 clear() 是不够的。** clear() 删的是磁盘上那份
+				//   文件，而 restore() 是「先把所有数组清空、再逐个往里填」——
+				//   它在半路抛出的话，内存里留下的是一个**空的或者填了一半**的世界。
+				//   只 clear() 就直接返回的话，玩家拿到的是一局「日志写着新局、
+				//   场上是残骸」的游戏：开局那几只不会回来（构造函数早就跑过了），
+				//   屏幕上一个生物都没有，而且不报任何错。
 				console.error('[save] 恢复世界失败，按新局开始:', e)
 				this.lastError = '存档恢复失败，已按新局开始'
 				await this.clear()
+				this.world.reset()
 				return 'fresh'
 			}
 		}

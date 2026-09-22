@@ -28,6 +28,7 @@ import {
 	hasMutation,
 	valueMulOf,
 	weightMulOf,
+	speedMulOf,
 	inheritFrom,
 	rollDeNovo,
 	combineGenes,
@@ -115,6 +116,37 @@ export class Fly {
 		// 每帧由 world._applyStartle() 重写，只写给自由飞的成虫
 		this.startleMul = 1
 
+		// —— 被点着（打火机 / 喷火枪）——
+		//
+		// 三个都是**自有属性**，所以 snapshot() / revive() 会自动带着它们，
+		// 不用动 REF_FIELDS、也不用升存档版本号（和 rarity / goldAura 同一条规矩）。
+		// 0 / 1 / false 一律表示「没在烧」
+		//
+		// ⚠ 唯一写它们的地方是 `world.ignite()`，读的地方是 `world._updateBurning()`。
+		//   别在 UI 层写 —— 按住工具时 UI 每帧都会调一次 ignite，
+		//   在那里改倒计时的话，「来回蹭同一只」会反复重置点火时长，
+		//   表现是「怎么烧都烧不完」，而且极难归因
+		this.burnLeft = 0 // 还要烧多久（ms）
+		this.burnMul = 1 // 烧完自动出售的倍率，**点着那一刻冻结**（每只只吃一次）
+		this.burnBig = false // 大火焰还是小火焰。**只给粒子用**，不参与任何数值
+
+		// —— 在烤炉里烤（1.21.0 起是**每只各自计时**）——
+		//
+		// 同样是自有属性 → 自动进存档，不用动 REF_FIELDS。
+		//
+		// ⚠ 计时器**放在虫身上而不是炉子上**：炉子那边原来是一对
+		//   `roastTimer/roastTotal`（整炉共用一份），改成各自到账之后，
+		//   一炉 5 只各有各的进度，炉子级的单个倒计时已经表达不了。
+		//
+		// ⚠ 只有 `world._updateOvens` 推这两个数，别在别处写 ——
+		//   罐子 / 点火那两条路都够不着炉里的虫（它们不在 this.flies 里）
+		// ⚠ 「没在烤」用 **null**，不用 0。
+		//   0 是「这一帧刚好烤满、该结账了」那个瞬间的值，两者撞在一起的话
+		//   结算那一帧就分不出「刚烤好的」和「压根没进过炉子的」。
+		//   （点火那两个字段用 0 表示没在烧，是因为它们的倒计时没有
+		//     「归零即结账」这一步 —— 别照抄那边的形状）
+		this.roastLeft = null // 还要烤多久（ms）；null = 没在烤
+		this.roastTotal = 0 // 这一只的总时长，进度条要用它算比例
 		// 果蝇不是匀速飞，而是「窜一下、悬停一下」
 		this.dartTimer = rand(0, A.dartIntervalMax)
 		this.hoverTimer = 0
@@ -131,7 +163,12 @@ export class Fly {
 		this.gaitPhase = rand(0, TAU) // 腿部步态相位，跟着实际位移一起推进
 		this.pausing = false // 「走一段」之间的那个停顿
 		this.boutTimer = rand(CONFIG.walk.boutMin, CONFIG.walk.boutMax)
-		this.wasInScent = false // 上一帧闻没闻到食物，用来抓「刚闻到的瞬间」
+		// 上一帧是不是已经飞到果子跟前了，用来抓「刚飞到的瞬间」。
+		//
+		// ⚠ 这里判的是**距离**（behavior.foodLandRadius），不是「有没有闻到」
+		//   （food.flyScentRadius，600px）。用后者的话落地的掷骰发生在
+		//   刚闻到味道那一刻 —— 也就是离果子最远的地方，果蝇会一路走过去
+		this.wasNearFood = false
 
 		// 进食：走到果子上的成虫在果实范围内随机踱步，而不是钉在圆心
 		this.feeding = false // 这一帧是不是已经站在果子上了
@@ -249,9 +286,15 @@ export class Fly {
 	 * 乘在**消费点**（wantSpeed / speed / want）而不是 targetSpeed 的赋值处：
 	 * 赋值有三四处（构造函数、飞/走切换、窜的间歇、罐子），漏一处就会出现
 	 * 「变异蝇在某些时候飞得和普通一样快」。消费点只有三处，且天然覆盖全部路径。
+	 *
+	 * ⚠ 星云的 ×2 也**并进这里**，不另开一条消费路径。
+	 *   `rarityInfo` 是「体格带来的迟钝」，星云是「基因带来的敏捷」，两者相乘 ——
+	 *   一只极端变异 + 星云 = 0.3 × 2 = 0.6，「又重又快」被如实表达出来了。
+	 *   形状和下面的 `panicMul` 一样：多个来源在 getter 里合流，
+	 *   三处消费点（_walk / _fly / updateJarred）一行都不用改
 	 */
 	get speedScale() {
-		return this.rarityInfo.speedScale
+		return this.rarityInfo.speedScale * speedMulOf(this.mutations)
 	}
 
 	// ---------------------------------------------------------- 基因
@@ -329,6 +372,24 @@ export class Fly {
 	// ⚠ 和 speedScale 一样乘在**消费点**（_walk 的 speed、_fly 的 wantSpeed），
 	// 不在 targetSpeed 的赋值处 —— 赋值点有三四处，漏一处就会
 	// 「平时躲得开、某些时候突然不动了」，而那种 bug 只在挥手时出现，极难复现
+
+	/** 正在被点着烧。**由 burnLeft 推导，不存字段** —— 存了就有两个真相 */
+	get burning() {
+		return this.burnLeft > 0
+	}
+
+	/**
+	 * 惊慌时的速度倍率 = 挥手受惊 × 着火。
+	 *
+	 * ⚠ 必须是**消费点**，不能把 burnPanicMul 乘进 startleMul ——
+	 *   `_applyStartle` 每帧**无条件重写** startleMul（连「手没挥、复位成 1」
+	 *   那条路径都在写），乘进去当场被抹掉，表现是「烧着的蝇一点也不慌」，
+	 *   不报错也不崩。这和上面 speedScale 那条注释是同一个道理：
+	 *   赋值点很多，消费点只有 _walk 和 _fly 两处
+	 */
+	get panicMul() {
+		return this.startleMul * (this.burning ? CONFIG.roast.burnPanicMul : 1)
+	}
 
 	die(cause) {
 		this.dead = true
@@ -700,17 +761,24 @@ export class Fly {
 	_updateMode(dtMs) {
 		const B = CONFIG.behavior
 
-		// —— 刚飞进食物的气味范围：立刻掷一次落地判定 ——
+		// —— 刚飞到果子跟前：立刻掷一次落地判定 ——
 		//
-		// 这一条不能并到下面那个计时器里。飞行速度提到 1700px/s 之后，
-		// 果蝇穿过 420px 的嗅觉半径只要 0.25 秒，而模式计时器 1.2~6 秒才到期一次 ——
-		// 等它到期时果蝇早就飞走了，判定永远撞不上，招蝇等于失效。
-		// 真实果蝇也是闻到的当下就往食物上落，不会等「时机到了」再决定。
-		const inScent = this.bait != null
-		const justSmelled = inScent && !this.wasInScent
-		this.wasInScent = inScent
+		// 这一条不能并到下面那个计时器里。飞行速度 1700px/s，穿过
+		// 90px 的落地半径只要 0.05 秒，而模式计时器 1.2~6 秒才到期一次 ——
+		// 等它到期时果蝇早就飞过头了，判定永远撞不上，招蝇等于失效。
+		// 真实果蝇也是飞到果子上就落，不会等「时机到了」再决定。
+		//
+		// ⚠ 半径必须是**离果子的距离**，不是嗅觉范围。早先用的是
+		//   「刚闻到」（600px），那等于在离果子最远的那一点上做决定 ——
+		//   实测 100% 的果蝇都在 520~600px 处落地，然后爬 10 秒才到，
+		//   看起来就是「去觅食的果蝇全程都在走」。
+		const bait = this.bait
+		const nearFood =
+			bait != null && dist2(this.x, this.y, bait.x, bait.y) < B.foodLandRadius * B.foodLandRadius
+		const justArrived = nearFood && !this.wasNearFood
+		this.wasNearFood = nearFood
 
-		if (this.mode === 'fly' && justSmelled && Math.random() < B.landChanceNearFood) {
+		if (this.mode === 'fly' && justArrived && Math.random() < B.landChanceNearFood) {
 			this._land()
 			return
 		}
@@ -742,7 +810,11 @@ export class Fly {
 
 		// 天上飞够了：决定是继续飞还是落下来走。
 		// 已经在食物附近的话，落地概率高得多，这样它会来回踱着不离开。
-		if (Math.random() < (inScent ? B.landChanceNearFood : B.landChance)) this._land()
+		//
+		// ⚠ 「附近」同样要用 foodLandRadius，不能用嗅觉范围 ——
+		//   这是「半路落地、然后一路走过去」的第二条路径：果蝇在离果子
+		//   400px 的地方飞够了时间，掷中 0.7 就地落下，接着爬 7 秒。
+		if (Math.random() < (nearFood ? B.landChanceNearFood : B.landChance)) this._land()
 		else this.modeTimer = rand(B.flyMin, B.flyMax)
 	}
 
@@ -809,7 +881,7 @@ export class Fly {
 			// 在果子上觅食时慢下来 —— 赶路和拱食本来就不是一个速度。
 			// 再乘上体重倍率（爬行这一路也要，否则变异蝇一落地就和普通一样快）
 			const speed =
-			W.speed * (this.feeding ? F.feedSpeedScale : 1) * this.speedScale * this.startleMul
+			W.speed * (this.feeding ? F.feedSpeedScale : 1) * this.speedScale * this.panicMul
 			this.x += Math.cos(this.aim) * speed * dt
 			this.y += Math.sin(this.aim) * speed * dt
 			// 步态相位跟着**实际走过的距离**推进 ——
@@ -938,7 +1010,7 @@ export class Fly {
 
 		// 悬停时目标速度归零，就停在原地扇翅膀。
 		// 乘上体重倍率 —— 变异果蝇更重、也更迟钝（见 speedScale 那段注释）
-		let wantSpeed = (this.hoverTimer > 0 ? 0 : this.targetSpeed) * this.speedScale * this.startleMul
+		let wantSpeed = (this.hoverTimer > 0 ? 0 : this.targetSpeed) * this.speedScale * this.panicMul
 
 		// —— 进场减速 ——
 		//
@@ -1256,6 +1328,17 @@ export class Larva {
 		this.starveAfter = rand(CONFIG.larva.starveMin, CONFIG.larva.starveMax) * berserkLifespanMul(this.mutations)
 		/** 上一轮结算有没有吃到。由 world._updateFeeding 写，这里只读 */
 		this.ateLastTick = true
+		/**
+		 * 星空苹果那次骰子投过没有。**一辈子只有一次** ——
+		 * 见 world._updateFeeding 里那条授予分支。
+		 *
+		 * ⚠ 没有它的话就变成「每咬一口都骰 10%」：一份 200px 的星空苹果
+		 *   durability 拉满、会被啃上千口，那就是必中，$1 直接买到星云。
+		 *
+		 * 是个布尔自有字段 → snapshot() 自动带着走，不用动 REF_FIELDS、不用升版本号；
+		 * 又因为它是「**发生过的事实**」而不是每帧重算的状态，所以抽在构造里
+		 */
+		this.starRolled = false
 
 		this.wanderTimer = 0
 		this.wanderTarget = this.angle
@@ -1609,7 +1692,11 @@ export class Larva {
 	 * @param {number} scale 速度倍率（啃食时慢下来）
 	 */
 	_advance(dt, scale = 1) {
-		const speed = CONFIG.larva.crawlSpeed * this.speedScale * scale
+		// ⚠ 星云的 ×2 乘在**这里**（消费点），不写进 `this.speedScale` 字段 ——
+		//   那个字段是「这只虫自己爬多快」的**孵化那一刻抽定**的个体差异；
+		//   而星云是**半路**吃出来的，写进字段就得在授予处再改一次，
+		//   漏了的表现是「拿到了星云，但爬得还是那么慢」
+		const speed = CONFIG.larva.crawlSpeed * this.speedScale * speedMulOf(this.mutations) * scale
 		// 扫帚的推力**另算**，不乘 speedScale —— 那是「这只虫自己爬多快」的个体差异，
 		// 而扫帚是同一把，推谁都是同样的力
 		this.x += (Math.cos(this.angle) * speed + this.pushVx) * dt
@@ -2097,13 +2184,11 @@ export class Oven {
 		/** 炉里的成虫。x / y 是相对炉心的偏移，和 Jar.flies 一个规矩 */
 		this.items = []
 
-		/**
-		 * 开烤之后的倒计时（ms）。null = 还没开烤。
-		 * ⚠ 只有这两个字段配合起来才画得出「烤到几成了」——
-		 * 光有剩余时间不知道总量，算不出比例
-		 */
-		this.roastTimer = null
-		this.roastTotal = 0
+		// ⚠ 这里原来有一对 `roastTimer` / `roastTotal`（整炉共用一个倒计时）。
+		//   1.21.0 改成**每只各自计时、各自到账**之后删掉了 ——
+		//   倒计时现在挂在**虫身上**（`Fly.roastLeft` / `roastTotal`），
+		//   见 Oven.admit 和 world._updateOvens。
+		//   炉子级的单个进度已经表达不了「一炉 5 只各有各的进度」
 
 		this.dead = false
 	}
@@ -2116,9 +2201,16 @@ export class Oven {
 		return this.items.length >= this.capacity
 	}
 
-	/** 正在烤 */
+	/**
+	 * 炉子里**有没有东西在烤**。
+	 *
+	 * ⚠ 判据是「有没有哪一只的倒计时在走」，不是「炉子有没有开烤」——
+	 *   每只各自计时之后，炉子本身没有「开烤」这个动作了。
+	 *   火光那层氛围靠它，所以它必须是 O(n) 扫一遍而不是读一个字段
+	 */
 	get roasting() {
-		return this.roastTimer !== null
+		for (const f of this.items) if (f.roastLeft !== null) return true
+		return false
 	}
 
 	get halfW() {
@@ -2135,7 +2227,10 @@ export class Oven {
 	 * 和 Jar.admit 一样，这里也是**屏幕坐标 → 炉内相对坐标**的唯一转换点。
 	 * 传进来的果蝇还带着世界坐标，出去时 x / y 已经变成相对偏移了。
 	 */
-	admit(fly) {
+	/**
+	 * @param {number} ms 这一只烤多久 —— **每只各领一份**，见下面那段注释
+	 */
+	admit(fly, ms) {
 		if (this.full) return false
 		const s = CONFIG.roast.oven.innerScale
 		fly.x = rand(-1, 1) * this.halfW * s
@@ -2150,31 +2245,29 @@ export class Oven {
 		//   留着的话它会带着一个外面已经不存在的 +10% 一直待在炉子里 ——
 		//   而且 goldAura 是自有字段，**会跟着存档走**，等于永久通胀
 		fly.goldAura = 1
+		// ⚠ 火也要灭，理由和上面两条一模一样，而且更硬：
+		//   倒计时是 world._updateBurning 在推的，而那个循环**只遍历 this.flies** ——
+		//   炉里的果蝇不在里面，所以这个倒计时永远走不完。
+		//   不灭的话它会带着一个「烧到一半」的存档字段在炉子里躺到天荒地老
+		fly.burnLeft = 0
+		fly.burnMul = 1
+
+		// ⚠ **进炉就开始烤**，不再等装满。
+		//
+		//   1.21.0 起炉子是「各自计时、各自到账」：这一只进来就领自己的倒计时，
+		//   谁先烤完谁先冒钱走人。所以这里直接把倒计时挂上 ——
+		//   原来那个「装满 5 只 → startRoast() 整炉一起开烤」的入口**没有了**。
+		//
+		// ⚠ 时长是**参数**，不是炉子自己去 CONFIG 里找。
+		//   早先这里写的是 `CONFIG.roast.oven.roastMs`，而那个键当时**根本不存在**，
+		//   于是倒计时变成 NaN、炉子一次都不 tick，症状是「放进去就没动静」。
+		//   现在这个键真的存在了，但保持「调用方传进来」——
+		//   炉子不该知道时长住在哪一节配置里
+		fly.roastLeft = ms
+		fly.roastTotal = ms
+
 		this.items.push(fly)
 		return true
-	}
-
-	/**
-	 * 开烤。空炉子点了不该有反应，更不能白烧一个倒计时。
-	 *
-	 * ⚠ 时长是**调用方传进来的**，炉子自己不去 CONFIG 里找。
-	 * 8 秒这个数住在 `market.roastChain` 的 lv3 那一条上 ——
-	 * 它和「×1.8」「$16」是同一档的三个属性，拆开放两处迟早会对不上。
-	 * （早先这里写的是 `CONFIG.roast.oven.roastMs`，而那个键**根本不存在**，
-	 * 于是倒计时变成 NaN、炉子一次都不 tick —— 见下面 update 的第一行注释）
-	 */
-	startRoast(ms) {
-		if (this.roasting || this.items.length === 0) return false
-		if (!Number.isFinite(ms) || ms <= 0) return false
-		this.roastTimer = ms
-		this.roastTotal = ms
-		return true
-	}
-
-	/** 烤到几成了，0 → 1。没在烤就是 0 */
-	get roastProgress() {
-		if (!this.roasting || !(this.roastTotal > 0)) return 0
-		return clamp(1 - this.roastTimer / this.roastTotal, 0, 1)
 	}
 }
 
@@ -2194,7 +2287,9 @@ export class Oven {
  */
 export class FloatText {
 	constructor(x, y, text, opts = {}) {
-		const F = CONFIG.roast.oven.float
+		// 公共样式在 CONFIG.floatText，不在炉子那节 —— 点火（烧完自动卖）
+		// 也在用这个类，去读炉子的配置会让「改炉子飘字颜色」莫名其妙改到烧蝇
+		const F = CONFIG.floatText
 
 		this.x = x
 		this.y = y
@@ -2349,6 +2444,11 @@ export class Jar {
 		//   给罐中果蝇结算的（罐中列表里那个「售价」就是它）。
 		//   带着外面蹭来的 +10% 进罐子，等于白送钱，而且再也洗不掉
 		fly.goldAura = 1
+		// ⚠ 火也一样要灭，而且这条的理由最硬：倒计时是 world._updateBurning
+		//   在推的，那个循环**只遍历 this.flies** —— 罐里的果蝇不在里面，
+		//   所以这个倒计时永远走不完，那只会一直带着「烧了一半」的存档字段躺着
+		fly.burnLeft = 0
+		fly.burnMul = 1
 
 		// 罐里是**飞着的**：翅膀张开、会扑腾。
 		// 初始速度给 0，让它自己加速到罐内巡航速度 —— 直接给满速会看起来像被弹进去
@@ -2552,25 +2652,29 @@ export class Remains {
 		this.seed = rand(0, 1000) // 让形状稳定但不重复
 		this.dead = false
 
-		// —— 尸体才能烤、才值钱 ——
+		// —— 只有尸体值钱 ——
 		//
 		// ⚠ 汁渍（stain）永远是 0：它是拍击溅出来的，不是一具身体。
-		// 而且它**没有 rarity**，烤制相关的整套字段对它都没意义，
-		// 所以这里全部走「没有 fly 就留空」这一条路
+		// 而且它**没有 rarity**，所以这里全部走「没有 fly 就留空」这一条路
+		//
+		// ⚠ 这里原来还有 roasted / roastMul 两个字段（「烤过了没有」「倍率」）——
+		//   1.18.0 起**地上的尸体不能再烤了**，那套「拿打火机烤尸体、再拖去
+		//   出售区」整个取消，点火器改成点着活蝇。**这两个键必须一起删干净**：
+		//   老存档里的尸体身上还带着 `roasted: true`，而 revive() 会把它写回去 ——
+		//   只删 price 里的倍率、留着下面的绘制分支的话，那批老尸体会全部
+		//   画成焦褐色（看起来像「烤过的」，其实已经不是了）
 		this.value = fly ? fly.value : 0 // 死那一刻的售价快照
 		this.rarity = fly ? fly.rarity : null
 		this.sex = fly ? fly.sex : null
-		this.roasted = false // 烤过了没有。**单向**，再烤不会更贵
-		this.roastMul = 1
 
-		// 挂了多久才开始掉价（ms）。0 = 立刻开始（汁渍用不上，它没价）
+		// 挂了多久才开始掉价（ms）。汁渍用不上，它没价
 		this.decayStart = CONFIG.roast.decayStartMs
 		this.decaySpan = CONFIG.roast.decaySpanMs
 		this.decayTo = CONFIG.roast.decayTo
 	}
 
-	/** 这一具能不能拿去烤 / 拿去卖 */
-	get roastable() {
+	/** 这一具是不是一具**有价**的尸体（汁渍不是，它没 value） */
+	get sellable() {
 		return this.kind === 'corpse' && this.value > 0
 	}
 
@@ -2590,9 +2694,15 @@ export class Remains {
 		return lerp(1, this.decayTo, t)
 	}
 
-	/** 现在卖掉能换多少钱。烤过的再乘倍率 */
+	/**
+	 * 现在卖掉能换多少钱 = 死那一刻的售价 × 掉价系数。
+	 *
+	 * ⚠ 这里原来还乘一个 `roastMul`（烤过的倍率）。1.18.0 起尸体不能再烤，
+	 *   所以没有那一档了 —— 地上那具尸体只有「原价 × 掉价」这一个价钱。
+	 *   想拿倍率就得拿点火器去点**活着的**成虫（见 world.ignite）
+	 */
 	get price() {
-		return this.value * this.decayFactor * this.roastMul
+		return this.value * this.decayFactor
 	}
 
 	/**

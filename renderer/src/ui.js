@@ -26,6 +26,7 @@ import {
 	valueTierOf,
 	foodPrice,
 	flyPrice,
+	ovenPrice,
 	bulkPrice,
 	keeperOptions,
 	chainOf,
@@ -36,6 +37,19 @@ import { drawFoodIcon } from './render.js'
 
 /** 投放面板上每一行给的两档数量。想加「投 100 个」就往这里加一个数 */
 const FEED_QUANTITIES = [1, 10]
+
+/**
+ * 食物 id → 中文名。
+ *
+ * ⚠ 这**一张表**要伺候四个地方：投放的提示语、投放面板那一行、
+ *   图鉴的格子、养蝇人卡片的「投什么」。以前它们各写一份三元表达式
+ *   （`id === 'gold' ? '金苹果' : '苹果'`），加第三种食物时改漏一处，
+ *   界面上就会出现「投下 3 个苹果」而实际投的是星空苹果 —— 不报错，只是假话
+ *
+ * ⚠ 名字**只在这里定义**。config 里那几个 name（market.shop 的、_feedRowFor
+ *   TABLE 的）是各自面板自己的说法，短一点长一点都行；这一张是「这东西叫什么」
+ */
+const FOOD_NAME = { apple: '苹果', gold: '金苹果', star: '星空苹果' }
 
 export class UI {
 	/**
@@ -60,8 +74,38 @@ export class UI {
 		// wipeScrub 之后把它清零，而 `_updateToolFx` 跑在那之后，读不到那个数了
 		this.clothScrubbed = false
 		this.lastPointer = { x: 0, y: 0 }
+
+		/**
+		 * 商店 / 投放弹窗里被折起来的分类，元素是 `'shop:tool'` 这样的键。
+		 *
+		 * ⚠ 存成**实例上的 Set**，不能靠 DOM 上的 class —— `_renderCats` 每次
+		 *   都重建整块 DOM，而 `refreshStats()` 在钱一变时就同时调
+		 *   refreshShop + refreshFeed。挂在 DOM 上的话，钱一动折叠就自己弹回去，
+		 *   而这个 bug 只在「玩着玩着卖了一只蝇」的时候出现，看着完全随机
+		 *
+		 * 纯 UI 状态，不进存档 —— 和工具 / 倍速那两个折叠面板同一条规矩：
+		 * 它不影响模拟，也不需要跨会话记住
+		 */
+		this.collapsedCats = new Set()
 		this.clothDownAt = 0 // 这一次「按住」开始于什么时候（用来提示「要来回滑」）
 		this.clothHinted = false
+
+		/**
+		 * 星空苹果解没解锁（彩蛋）。**未解锁的初始值** ——
+		 * 真正的值由 app.js 启动时从 unlock.json 读回来，走 setStarUnlocked。
+		 *
+		 * ⚠ 唯一的真值来源是这里的 `_starUnlocked`（外面只准通过 getter
+		 *   `starUnlocked` 读）。投放面板、图鉴、罐子配色全部读它，
+		 *   别各自去翻存档 —— 两份状态总有一天会变成「图鉴里有、投放里没有」
+		 */
+		this._starUnlocked = false
+		/**
+		 * 这一轮连点了几下捐款罐子。**只在内存里** ——
+		 * 它问的是「刚才连点了几下」，跨会话记住没有意义
+		 * （也没人会关掉程序之后接着点）
+		 */
+		this.starTaps = 0
+		this.starTimer = null
 
 		// 这里原本有一个 roastHold / roastTarget / roastHinted ——
 		// 打火机和喷火枪当年要「按住烤满 N 秒」。改成**接触即烤**之后
@@ -147,7 +191,8 @@ export class UI {
 			through: $('btn-through'),
 			btnJar: $('btn-jar'),
 			btnNet: $('btn-net'),
-			btnRoast: $('btn-roast'),
+			btnLighter: $('btn-lighter'),
+			btnFlamer: $('btn-flamer'),
 			jarWindow: $('jar-window'),
 			jarHead: $('jar-head'),
 			jarList: $('jar-list'),
@@ -175,6 +220,10 @@ export class UI {
 			sellAllBody: $('sellall-body'),
 			donatePop: $('donate-pop'),
 			donateClose: $('donate-close'),
+			// 解锁彩蛋那一下的星尘。⚠ 它**不参与**鼠标接管判定 ——
+			// 见 _updateInteractive 那段注释：铺满整屏的装饰一旦吃掉鼠标，
+			// 桌面上会整整 10 秒点不动东西
+			starfield: $('starfield'),
 			btnReset: $('btn-reset'),
 			quit: $('btn-quit'),
 			swarm: $('swarm-badge'),
@@ -227,17 +276,11 @@ export class UI {
 
 	_bindEvents() {
 		for (const btn of this.toolButtons) {
-			btn.addEventListener('click', () => {
-				// 烤制按钮代表的是一条**升级链的当前档位**，所以它的行为会变：
-				// lv1 / lv2 是「按住烤」的工具，lv3（烤炉）变成「点一下摆一个炉子」。
-				// 同一颗按钮换行为，好过每升一级就多冒出来一个按钮
-				if (btn.dataset.tool === 'roast' && this.world.shopLevel('roast') >= 3) {
-					const oven = this.world.dropOven()
-					this._flashHint(oven ? '摆了一个烤炉' : '烤炉太多啦')
-					return
-				}
-				this.setTool(btn.dataset.tool)
-			})
+			// ⚠ 这里原来有一段特判：`data-tool === 'roast'` 且等级 ≥3 时，
+			//   点一下变成「摆一个烤炉」而不是 setTool。
+			//   炉子挪进投放弹窗之后它没有存在理由了 —— 留着的话，
+			//   玩家点「打火机」会凭空摆出一个炉子
+			btn.addEventListener('click', () => this.setTool(btn.dataset.tool))
 		}
 		for (const btn of this.speedButtons) {
 			btn.addEventListener('click', () => this.setSpeed(btn.dataset.speed))
@@ -305,6 +348,19 @@ export class UI {
 			const n = Number(btn.dataset.n)
 			const kind = btn.dataset.kind
 
+			// 烤炉：一次只买一个，钱和上限的闸门都在 world.buyOven 里。
+			// ⚠ 放在最前面并 return —— 它和下面「投 N 个」的语义完全不同
+			//   （那个按份数乘单价、还能部分成功退钱），混在 if/else 里会被误读。
+			//   ⚠ 按钮上的 disabled 只是**提示**，真正的闸门在 world.buyOven
+			if (kind === 'oven') {
+				if (this.world.buyOven()) this._flashHint('摆了一个烤炉')
+				else if (this.world.ovens.length >= CONFIG.roast.oven.maxCount) {
+					this._flashHint(`烤炉最多摆 ${CONFIG.roast.oven.maxCount} 个`)
+				} else this._flashHint('钱不够')
+				this.refreshStats()
+				return
+			}
+
 			if (kind === 'fly') {
 				const placed = this.world.buyFlies(n)
 				if (placed < n) this._flashHint('果蝇到上限了')
@@ -313,7 +369,7 @@ export class UI {
 				const placed = this.world.buyFood(kind, n)
 				if (placed === 0) this._flashHint('食物放不下了，先收拾一下')
 				else if (placed < n) this._flashHint(`只放得下 ${placed} 个，剩下的没算钱`)
-				else this._flashHint(`投下 ${placed} 个${kind === 'gold' ? '金苹果' : '苹果'}`)
+				else this._flashHint(`投下 ${placed} 个${FOOD_NAME[kind] ?? kind}`)
 			}
 			this.refreshStats()
 		})
@@ -325,7 +381,15 @@ export class UI {
 		// 是不是捐了几张卡之一 —— 那样点在设置卡上会把设置卡自己关掉
 		const inAnyCard = (t) =>
 			!!(t.closest && (t.closest('#donate-pop') || t.closest('#settings-pop') || t.closest('#reset-pop')))
-		this.el.btnDonate.addEventListener('click', () => this.setDonateOpen(!this.view.donateOpen))
+		// ⚠ 这一次点击**同时也是彩蛋的计数器**（点十下解锁星空苹果）。
+		//   两件事共用一次点击是有意的：那颗罐子本来就长在那儿、本来就在发光，
+		//   不必再加第二颗藏起来的按钮 —— 藏起来的东西没人会去找。
+		//   副作用是连点时会开关卡片十下，10 是偶数所以最后停在「关」上；
+		//   玩家在连点的时候本来也看不清卡片
+		this.el.btnDonate.addEventListener('click', () => {
+			this._tapDonate()
+			this.setDonateOpen(!this.view.donateOpen)
+		})
 		this.el.donateClose.addEventListener('click', () => this.setDonateOpen(false))
 
 		// —— 设置卡片：正常 / 烦人模式 ——
@@ -1004,7 +1068,10 @@ export class UI {
 		let best = null
 		let bestD = Infinity
 		for (const r of this.world.remains) {
-			if (r.dead || !r.roastable) continue
+			// ⚠ 判的是 kind 而不是 `r.sellable`：戴手套能拖的是**所有**尸体，
+			//   包括值 0 的那种（虽然正常玩法里生不出来）。`sellable` 还要求
+			//   value > 0，拿它当判据会让一部分尸体突然拖不动
+			if (r.dead || r.kind !== 'corpse') continue
 			const rad = Math.max(12, r.size * 0.95)
 			const d = dist2(x, y, r.x, r.y)
 			if (d > rad * rad || d >= bestD) continue
@@ -1268,37 +1335,31 @@ export class UI {
 			return
 		}
 
-		// 烤制（打火机 / 喷火枪）：**碰到就熟**。
+		// 点火（打火机 / 喷火枪）：**碰到活蝇就点着**。
 		//
-		// 这里是**接触即烤**，不是「按住 N 秒」。原本两档要按住 5 秒 / 3 秒，
-		// 而实机的手感是：满屏尸体时得一只一只按住等，既慢又容易烤到一半手滑挪开
-		// —— 挪开就白烤（旧版会归零重来）。改成碰到就熟之后，
-		// **按住扫过去一片就全熟了**，因为 _useTool 在按住时每帧都跑。
+		// 从 1.18.0 起这两把烧的是**活着的成虫**，不再是地上的尸体。
+		// 点着之后它带着火焰惊慌乱飞，烧满 burnMs 秒后自动按倍率卖掉
+		// （见 world._updateBurning）。
 		//
-		// ⚠ 「每只只吃一次倍率」这条守卫**不在**这里，在 world.roast 里
-		//   （roasted 标记）。所以按着不放来回蹭同一只不会反复翻倍 ——
-		//   这是数值不失控的关键，别把判重移到这一层来
-		if (this.view.tool === 'roast') {
-			const tier = this.world.roastTier()
-			if (!tier) return
-
-			const s = this._corpseAt(m.x, m.y)
-			if (!s) return
-
-			// 已经烤过的再碰不会更贵。得说一声 ——
-			// 不然玩家会以为「明明碰上了却没反应」是坏了。
-			// ⚠ 这条提示**不加限制次数**：接触即烤之下指针会反复扫过同一具，
-			//   加个「每次按住只提示一次」的标志反而要额外的状态和重置点，
-			//   而 _flashHint 自己会去抖（它只有一条提示条，后一条直接覆盖前一条）
-			if (s.roasted) {
-				this._flashHint('这只已经烤过了')
-				return
-			}
-
-			if (this.world.roast(s, tier.mul)) {
-				this._flashHint(`烤好了，售价 ×${tier.mul}`)
-				this.refreshStats()
-			}
+		// 这里是**接触就点着**，不是「按住 N 秒」。按住扫过去一片就全点着了，
+		// 因为 _useTool 在按住时每帧都跑。
+		//
+		// ⚠ 「每只只吃一次倍率」这条守卫**不在**这里，在 `world.ignite` 里
+		//   （`fly.burning` 判重）。放这一层的话，按着不放来回蹭同一只
+		//   会把倒计时反复重置回满 —— 表现是「怎么烧都烧不完」，
+		//   而且那种 bug 极难归因。别把判重移上来
+		if (this.view.tool === 'lighter' || this.view.tool === 'flamer') {
+			// ⚠ 半径**按手里这一把**取（喷火枪大一圈），不写死在 CONFIG.roast 里 ——
+			//   见 world.burnRadiusFor 那段注释。
+			//   仍然是**单目标**：只点着半径内最近的那一只。
+			//   想改成「圈里全点着」，把这一行换成遍历 world.flies 收集再逐个 ignite，
+			//   但那样喷火枪会变成清屏工具，得连倍率一起重调
+			const f = this._flyAt(m.x, m.y, this.world.burnRadiusFor(this.view.tool))
+			// ⚠ 把**手里这一把**传进去。传「当前最高档」的话，
+			//   买了喷火枪之后回头拿打火机，点出来的还是 3 秒 ×1.5
+			if (f) this.world.ignite(f, this.view.tool)
+			// 点着那一下的反馈是**火焰粒子**（ignite 里直接撒了一把），
+			// 所以这里不再闪提示条 —— 满屏点火时提示条会被刷成一片
 			return
 		}
 
@@ -1553,6 +1614,95 @@ export class UI {
 		this._updateInteractive()
 	}
 
+	// ---------------------------------------------------------- 彩蛋
+
+	/**
+	 * 捐款罐子被点了一下。够 tapsToUnlock 下就解锁星空苹果。
+	 *
+	 * ⚠ 已经解锁之后直接返回：**不解锁了还继续数**，否则每点十下就重放一次星尘，
+	 *   罐子会变成一个「点着玩」的按钮，彩蛋变成噪声
+	 */
+	_tapDonate() {
+		if (this._starUnlocked) return
+		this.starTaps++
+
+		// 一缩一放的反馈。**不给任何文字** ——
+		// 弹一句「已点 3/10」就等于把彩蛋写在脸上，前九下的乐趣全没了
+		const btn = this.el.btnDonate
+		if (btn) {
+			btn.classList.remove('tap')
+			// ⚠ 读一次布局把重排逼出来。不读的话，同一个元素连着两次点击
+			//   class 没变化 → 动画不会重放，表现是「第二下没反应」
+			void btn.offsetWidth
+			btn.classList.add('tap')
+		}
+
+		if (this.starTaps >= CONFIG.easterEgg.tapsToUnlock) this.setStarUnlocked(true)
+	}
+
+	/** 星空苹果解没解锁。**请一律读这个**，不要去翻 world.settings / unlock.json */
+	get starUnlocked() {
+		return !!this._starUnlocked
+	}
+
+	/**
+	 * 设置解锁状态。
+	 *
+	 * @param {boolean} on
+	 * @param {{silent?: boolean}} [opt] silent：启动时按已存的状态恢复，**不放星尘** ——
+	 *   开程序的一瞬间屏幕边上闪一下星空，玩家会以为点到了什么
+	 */
+	setStarUnlocked(on, opt = {}) {
+		const v = !!on
+		if (v === this._starUnlocked) return
+		this._starUnlocked = v
+
+		// 落盘（单独一个小文件，跨得过「重新开始」）。
+		// ⚠ 不写进 world.settings：那个虽然扛得住「重置」，
+		//   但「重新开始」会把整个存档文件删掉（save.js 里 clear()），
+		//   彩蛋会跟着一起没 —— 而用户要的是「永久解锁」
+		try {
+			window.pet?.saveUnlock?.({ star: v })
+		} catch (e) {
+			console.error('[unlock] 写解锁状态失败:', e)
+		}
+
+		// 罐子的流光配色。⚠ 默认态写在 index.html 的 class="donate locked" 上，
+		// 不是启动时由 JS 补 —— 补的话读到状态之前那一两帧罐子是金色的，
+		// 正好是「未解锁应当是蓝紫」的反面
+		this.el.btnDonate?.classList.toggle('locked', !v)
+
+		// 投放面板和图鉴都是**整块重建**的，重建一次就跟着变了
+		this.refreshFeed()
+		if (this.view.codexOpen) this.refreshCodex()
+
+		if (opt.silent) return
+		this._playStarfield()
+		this._flashHint(v ? '罐子亮回了金色 —— 投放里多了一样东西' : '')
+	}
+
+	/**
+	 * 放一遍解锁星尘（屏幕四周，10 秒淡入淡出）。
+	 *
+	 * ⚠ 走 class + 强制重排，不能直接改 style.opacity：同一个元素上连着解锁两次时，
+	 *   第二次 class 没变化 → 动画不会重放，表现是「第二次解锁屏幕上什么都没有」。
+	 *   `void el.offsetWidth` 就是读一次布局、把重排同步逼出来
+	 */
+	_playStarfield() {
+		const el = this.el.starfield
+		if (!el) return
+		clearTimeout(this.starTimer)
+		el.classList.remove('hidden', 'on')
+		void el.offsetWidth
+		el.classList.add('on')
+		// 动画本身 10 秒（见 style.css），这里多留半秒再收，
+		// 免得动画最后一帧还没落地就被 display:none 掐掉
+		this.starTimer = setTimeout(() => {
+			el.classList.add('hidden')
+			el.classList.remove('on')
+		}, 10500)
+	}
+
 	/**
 	 * 设置卡片开 / 关。和捐款卡片完全同一套 —— 同样是屏幕正中一张小卡，
 	 * 同样**只接管卡片自己**那点面积（见 _overCard）。
@@ -1759,7 +1909,8 @@ export class UI {
 			this.el.keeperRows.append(row)
 		}
 
-		const FOOD_NAME = { apple: '苹果', gold: '金苹果' }
+		// FOOD_NAME 是模块级的那一张（见文件上方）—— 投放提示、投放面板、
+		// 图鉴、养蝇人卡片都读它。以前这里另有一份，改一个食物名字要改三处
 		// 「卖哪档」的名字取自 **valueTiers**（售价分档），
 		// 不是 market.rarity（体重档）。和数据面板上显示的是同一份定义 ——
 		// 各抄一份的话迟早会出现「面板写着稀有、这里找不到稀有」
@@ -2030,15 +2181,23 @@ export class UI {
 				// 两个名字只差一个字，别按错
 				this.setTool(this.view.tool === 'squirt' ? 'none' : 'squirt')
 				break
-			case 'KeyR':
-				// 烤制工具只有在买过之后才切得动。setTool 里也会拦一道，
-				// 这里提前拦是为了不闪一下再弹回来
-				if (this.world.shopLevel('roast') > 0 && this.world.shopLevel('roast') < 3) {
-					this.setTool(this.view.tool === 'roast' ? 'none' : 'roast')
-				} else {
+			case 'KeyR': {
+				// R = 「举起点火器」。连着按两下是开→关（和别的快捷键一致）。
+				// 升到喷火枪之后再按 R 举的是**喷火枪** —— 和上一版
+				// 「一颗按钮跟着档位改名」是同一套手感，只是现在鼠标点工具栏
+				// 那颗可以直接指定要哪一把
+				//
+				// ⚠ 「已经举着」要认**两个 id**：只判最高档的话，
+				//   玩家拿着打火机按 R 会跳到喷火枪，而不是把手里的收起来
+				const lv = this.world.shopLevel('roast')
+				if (lv < 1) {
 					this._flashHint('先去商店买打火机')
+					break
 				}
+				const held = this.view.tool === 'lighter' || this.view.tool === 'flamer'
+				this.setTool(held ? 'none' : lv >= 2 ? 'flamer' : 'lighter')
 				break
+			}
 			case 'Space':
 				e.preventDefault()
 				this.togglePause()
@@ -2059,6 +2218,24 @@ export class UI {
 		// 写死的话改了 shop 里的 price，这句话就成了假话
 		if (tool === 'squirt' && !this.world.hasShopItem('squirt')) {
 			this._flashHint(`先去商店买喷水枪（${formatMoney(shopItem('squirt')?.price ?? 0)}）`)
+			return
+		}
+
+		// 点火器那两颗同理。⚠ 喷火枪的提示要把「两步」说清楚 ——
+		// 玩家看到一颗灰着的「喷火枪」时最容易以为是钱不够，
+		// 其实是得先有打火机（它俩是一条升级链，不是两件并列的商品）
+		const burnChain = chainOf('roast') ?? []
+		if (tool === 'lighter' && this.world.shopLevel('roast') < 1) {
+			const t0 = burnChain[0]
+			if (!t0) return
+			this._flashHint(`先去商店买${t0.name}（${formatMoney(t0.price)}）`)
+			return
+		}
+		if (tool === 'flamer' && this.world.shopLevel('roast') < 2) {
+			const t0 = burnChain[0]
+			const t1 = burnChain[1]
+			if (!t0 || !t1) return
+			this._flashHint(`要先买${t0.name}，再花 ${formatMoney(t1.price)} 升级到${t1.name}`)
 			return
 		}
 
@@ -2304,7 +2481,10 @@ export class UI {
 		fx.tool = tool
 		fx.x = this.view.mouse.x
 		fx.y = this.view.mouse.y
-		fx.level = this.view.roastLevel ?? 0
+		// 大火焰还是小火焰。⚠ 这里以前推的是一个 `level` 数字（档位 0~3），
+		//   因为烤制链当时有三档；现在只有打火机 / 喷火枪两档，
+		//   而它们各自是一个 tool id —— 一个布尔就够了
+		fx.big = tool === 'flamer'
 		fx.len = this.view.squirt ? this.view.squirt.len : 0
 		fx.angle = this.view.squirt ? this.view.squirt.angle : 0
 		fx.radius = this.view.broom ? this.view.broom.r : 0
@@ -2312,11 +2492,11 @@ export class UI {
 		fx.down = this.mouseDown
 		this.clothScrubbed = false
 
-		if (tool === 'roast') {
-			// 火苗：**举着就冒**（那是「手里有个火源」本身的样子），
-			// 按住时更旺。等级决定大小和密度
+		if (tool === 'lighter' || tool === 'flamer') {
+			// 火苗：**举着就冒**（那是「手里有个火源」本身的样子）。
+			// 两档的差别只有大小和密度，由 fx.big 一个布尔表达
 			fx.on = true
-			fx.rate = fx.level >= 2 ? F.flameRateBig : F.flameRate
+			fx.rate = fx.big ? F.flameRateBig : F.flameRate
 		} else if (tool === 'squirt') {
 			fx.on = true
 			fx.rate = this.mouseDown ? F.squirtRate : F.squirtIdleRate
@@ -2533,10 +2713,13 @@ export class UI {
 	 *   `extra` 是可选的**第二行**（放大镜那六个档位小按钮在用）。
 	 *   给了就换行显示 —— 那一行是「这一件商品的设置」，不是又一件商品
 	 */
-	_shopRow({ name, desc, buttons, gold = false, extra = null }) {
+	_shopRow({ name, desc, buttons, gold = false, arcane = false, extra = null }) {
 		const row = document.createElement('div')
 		// `.wrap` 让 `extra` 掉到下一行（见 style.css）
-		row.className = 'shop-item' + (gold ? ' feed-item-gold' : '') + (extra ? ' wrap' : '')
+		// `arcane` 和 `gold` 是同一件事的两种配色（紫 / 金），互斥 ——
+		// 真同时给了也只会叠两个 class，CSS 里后者赢，不会画出第三种颜色
+		row.className =
+			'shop-item' + (gold ? ' feed-item-gold' : '') + (arcane ? ' feed-item-arcane' : '') + (extra ? ' wrap' : '')
 
 		const nameEl = document.createElement('span')
 		nameEl.className = 'shop-name'
@@ -2583,18 +2766,44 @@ export class UI {
 		return box
 	}
 
-	/** 按分类表把若干行分组渲染进某个列表容器 */
-	_renderCats(container, cats, rowFor) {
+	/**
+	 * 按分类表把若干行分组渲染进某个列表容器。**商店和投放共用这一个**。
+	 *
+	 * @param {string} group 这一块是谁（`'shop'` / `'feed'`）。只用来给折叠状态
+	 *   拼一个键 —— 两张表的 `cat.id` 目前不重叠，但那是巧合不是契约
+	 */
+	_renderCats(container, cats, rowFor, group) {
 		container.innerHTML = ''
 		for (const cat of cats) {
-			const group = document.createElement('div')
-			group.className = 'shop-cat'
+			const key = group + ':' + cat.id
+			const groupEl = document.createElement('div')
+			groupEl.className = 'shop-cat'
 			// 分类名挂个 dataset，自检靠它核对「商品有没有落在正确的组里」
-			group.dataset.cat = cat.id
+			groupEl.dataset.cat = cat.id
 
-			const title = document.createElement('div')
-			title.className = 'shop-cat-name'
-			title.textContent = cat.name
+			// 标题现在是**折叠按钮**，不再是纯文字。
+			//
+			// ⚠ 用 `.cat-toggle` 这个**新类**，不要直接改 `.shop-cat-name` ——
+			//   图鉴那两张小标题（`_codexSection`）用的是同一个类名，
+			//   改了的话图鉴的标题会跟着多出悬停底色和手指指针
+			const title = document.createElement('button')
+			title.type = 'button'
+			title.className = 'shop-cat-name cat-toggle'
+			const label = document.createElement('span')
+			label.textContent = cat.name
+			const caret = document.createElement('span')
+			caret.className = 'caret'
+			caret.textContent = '▾'
+			title.append(label, caret)
+
+			// ⚠ 点一下**只切 class、不重建**。重建的话 `.shop-cats` 的滚动位置
+			//   会跳回顶端（它有 max-height + overflow-y: auto）——
+			//   玩家折一个靠下的分类，视野会突然弹回最上面那一条
+			title.addEventListener('click', () => {
+				if (this.collapsedCats.has(key)) this.collapsedCats.delete(key)
+				else this.collapsedCats.add(key)
+				this._applyCatFold(groupEl, key)
+			})
 
 			const rows = document.createElement('div')
 			rows.className = 'shop-cat-rows'
@@ -2610,9 +2819,24 @@ export class UI {
 			// 看起来像「加载失败了」
 			if (!any) continue
 
-			group.append(title, rows)
-			container.append(group)
+			// 建的时候就带上折叠态 —— 状态在 UI 实例上，不在 DOM 上
+			this._applyCatFold(groupEl, key)
+			groupEl.append(title, rows)
+			container.append(groupEl)
 		}
+	}
+
+	/**
+	 * 把折叠状态写进 DOM。**唯一**的写入点 —— 建的时候和点的时候都走它。
+	 *
+	 * ⚠ 折叠状态存在 `this.collapsedCats`（一个 Set）里，**不能挂在 DOM class 上**：
+	 *   `_renderCats` 每次都 `container.innerHTML = ''` 重建，而 `refreshStats()`
+	 *   在**钱一变**就同时调 `refreshShop()` + `refreshFeed()`。
+	 *   状态挂 class 上的话，钱一动折叠就自己弹回去 ——
+	 *   而这个 bug 只在「玩着玩着卖了一只蝇」的时候出现，看着完全随机
+	 */
+	_applyCatFold(groupEl, key) {
+		groupEl.classList.toggle('collapsed', this.collapsedCats.has(key))
 	}
 
 	/**
@@ -2623,7 +2847,7 @@ export class UI {
 	 * **卡片打开时**才被调用 —— 和罐中列表那种每 0.15 秒刷一次的情况不一样。
 	 */
 	refreshShop() {
-		this._renderCats(this.el.shopList, CONFIG.market.shopCats, (id) => this._shopRowFor(id))
+		this._renderCats(this.el.shopList, CONFIG.market.shopCats, (id) => this._shopRowFor(id), 'shop')
 	}
 
 	/** 按 id 造出商店里的一行。认不出来返回 null */
@@ -2694,10 +2918,16 @@ export class UI {
 		}
 		buttons.push(buy)
 
+		// 还没买时显示第一级的名字，买了就显示当前档的 ——
+		// 「打火机 Lv.1」比光写「打火机」更能说明这是条升级链
+		//
+		// ⚠ 取当前档走 `chainTier`（越界返回 null），**不要直接写 `chain[lv - 1]`**。
+		//   等级是存档里的裸数字，链被改短之后它可能越界；而这一行跑在
+		//   渲染循环里（ui.update → refreshStats → refreshShop），
+		//   抛出去会连整个主循环一起打死 —— 1.18.0 的「读档后空屏」就是这么来的
+		const cur = this.world.chainTier(id, lv)
 		return this._shopRow({
-			// 还没买时显示第一级的名字，买了就显示当前档的 ——
-			// 「打火机 Lv.1」比光写「打火机」更能说明这是条升级链
-			name: lv > 0 ? `${chain[lv - 1].name} Lv.${lv}` : chain[0].name,
+			name: cur ? `${cur.name} Lv.${lv}` : chain[0].name,
 			desc: next ? next.desc : '已经是最好的了',
 			buttons,
 		})
@@ -2716,10 +2946,6 @@ export class UI {
 		const world = this.world
 		const lv = world.shopLevel('roast')
 
-		// 渲染层要按档位画不同的火苗（打火机橙火 / 喷火枪蓝焰），
-		// 但它读不到 world —— 所以在这里把等级**推**到 view 上
-		this.view.roastLevel = lv
-
 		const hasNet = world.hasShopItem('net')
 		this.el.btnNet.classList.toggle('locked', !hasNet)
 		this.el.btnNet.title = hasNet
@@ -2735,20 +2961,29 @@ export class UI {
 			? '按住左键喷水，冲掉地面上的尸体 / 污渍 / 蛹壳。滚轮改水线长短，Shift+滚轮转方向（W）'
 			: `要先在商店买下喷水枪（${formatMoney(shopItem('squirt')?.price ?? 0)}）才能用`
 
-		const btn = this.el.btnRoast
-		btn.classList.toggle('hidden', lv <= 0)
-		if (lv <= 0) return
-
-		const tier = CONFIG.market.roastChain[lv - 1]
-		btn.textContent = tier.name
-		btn.title =
-			lv >= 3
-				? `${tier.desc}。点一下在屏幕上摆一个烤炉`
-				: `${tier.desc}。按住鼠标对着地上的烤串烤（R）`
-
-		// lv3 时这颗按钮不再是「工具」，而是「摆一个炉子」——
-		// 把 active 状态清掉，免得看着像还拿着什么
-		if (lv >= 3) btn.classList.remove('active')
+		// —— 点火的两颗（打火机 / 喷火枪）——
+		//
+		// ⚠ 两颗**一直显示**，没买是 `.locked`（置灰 + 虚线框）但**仍然可点** ——
+		//   点下去 setTool 会拦下来并说明原因。做成 disabled 或 hidden 的话，
+		//   玩家会以为按钮坏了、或者根本不知道自己错过了什么。
+		//   这和捕虫网 / 喷水枪是同一套
+		//
+		// ⚠ 名字和价格一律从 CONFIG.market.roastChain 取，不在这里另抄一份 ——
+		//   抄了的话改了配置界面就成了假话
+		const burnChain = chainOf('roast') ?? []
+		const burnPairs = [
+			[this.el.btnLighter, lv >= 1, burnChain[0], 0],
+			[this.el.btnFlamer, lv >= 2, burnChain[1], 1],
+		]
+		for (const [btn, owned, tier, idx] of burnPairs) {
+			if (!btn || !tier) continue
+			btn.classList.toggle('locked', !owned)
+			btn.title = owned
+				? `${tier.desc}。按住左键对着成虫扫过去（R）`
+				: idx === 0
+					? `要先在商店买下${tier.name}（${formatMoney(tier.price)}）才能用`
+					: `要先买下${burnChain[0].name}，再花 ${formatMoney(tier.price)} 升级到${tier.name}`
+		}
 	}
 
 	/**
@@ -2760,7 +2995,25 @@ export class UI {
 	 * 这里的消耗品可以反复买，按钮永远不会变成「已拥有」。
 	 */
 	refreshFeed() {
-		this._renderCats(this.el.feedList, CONFIG.market.feedCats, (id) => this._feedRowFor(id))
+		// ⚠ 只改**食物那一组**的 items，其他组原样透传。
+		//   `_renderCats` 靠 `group + ':' + cat.id` 拼折叠状态的键，
+		//   重建一个新对象没问题；但把 jar / oven 那几组也过一遍 filter，
+		//   迟早会漏掉一个 —— 而漏掉的表现是那一整组**静默消失**
+		const cats = CONFIG.market.feedCats.map((c) =>
+			c.id === 'food' ? { ...c, items: this.unlockedFoodIds() } : c,
+		)
+		this._renderCats(this.el.feedList, cats, (id) => this._feedRowFor(id), 'feed')
+	}
+
+	/**
+	 * 现在该出现在**投放面板和图鉴**里的食物 id。
+	 *
+	 * ⚠ 抽成一个方法而不是在两边各写一次 filter：这是「什么算已解锁」的
+	 *   **唯一定义**。抄一份的话，自检里那两条「图鉴画了几格 = 配置里有几项」
+	 *   的断言会跟着一起漂 —— 而它们恰恰就是用来抓这种漂移的
+	 */
+	unlockedFoodIds() {
+		return CONFIG.market.feedCats[0].items.filter((id) => id !== 'star' || this.starUnlocked)
 	}
 
 	/** 按 id 造出投放弹窗里的一行。认不出来返回 null */
@@ -2783,6 +3036,19 @@ export class UI {
 				unit: foodPrice('gold'),
 				gold: true,
 			},
+			// 星空苹果：彩蛋解锁之后才出现（过滤在 unlockedFoodIds 里，不在这里）。
+			// 概率从 config 现算，不写死 —— 调了 nebulaFromStar 这里跟着变
+			star: {
+				name: '星空苹果',
+				short: '幼虫吃出「星云」',
+				desc:
+					`只有**幼虫**吃得出「星云」：每只幼虫一辈子只骰一次，` +
+					`${(CONFIG.mutation.nebulaFromStar * 100).toFixed(0)}% 会带上。` +
+					`成虫吃它没有任何事`,
+				unit: foodPrice('star'),
+				// 紫色而不是金色 —— 和它自己的配色一致
+				arcane: true,
+			},
 			fly: {
 				name: '果蝇',
 				short: '补一批',
@@ -2797,6 +3063,19 @@ export class UI {
 				short: '罐中寿命 ×2',
 				desc: `摆一个透明玻璃罐，最多同时摆 ${CONFIG.jar.maxCount} 个。用捕虫网把果蝇网进去，在罐子里它们活得比外面久一倍`,
 				free: true,
+			},
+			// 烤炉：**花钱，但一次只买一个** —— 这是第三种形态（见下面的 single 分支）。
+			// 它从 1.18.0 起从烤制链里独立出来，挪到了这里：炉子不是「点火器的一档」，
+			// 它是一条独立的赚钱路子（装 5 只 → 进度条 → 整炉卖钱）
+			oven: {
+				name: '烤炉',
+				short: '整炉卖 ×' + CONFIG.roast.oven.mul,
+				desc:
+					`在屏幕上随便摆一个。戴手套抓最多 ${CONFIG.roast.oven.capacity} 只成虫放进去，` +
+					`进度条满了自动按 ×${CONFIG.roast.oven.mul} 卖成钱（不留尸体）。` +
+					`最多同时摆 ${CONFIG.roast.oven.maxCount} 个`,
+				unit: ovenPrice(),
+				single: true,
 			},
 		}
 
@@ -2816,6 +3095,25 @@ export class UI {
 			b.disabled = full
 			if (full) b.title = `最多同时摆 ${CONFIG.jar.maxCount} 个`
 			buttons.push(b)
+		} else if (r.single) {
+			// —— 第三种形态：花钱，但一次只买一个 ——
+			//
+			// ⚠ 复用下面那条 `[data-kind]` 委托，**不为它另开一条 [data-oven]**：
+			//   那条委托已经是「投放里的东西怎么买」的**唯一**入口，
+			//   再开一条的话「钱不够要置灰 / 撞上限要置灰」这两条规则会长出第二份
+			const cost = r.unit
+			const afford = this.world.money >= cost
+			const full = this.world.ovens.length >= CONFIG.roast.oven.maxCount
+			const b = document.createElement('button')
+			b.className = 'shop-buy'
+			b.dataset.kind = id // ⚠ 没有 data-n —— 它不是「投 N 个」
+			b.textContent = full ? '摆满了' : '摆一个 ' + formatMoney(cost)
+			b.disabled = full || !afford
+			// 「撞上限」和「钱不够」是两件事，提示要分开说 ——
+			// 早先罐子撞上限是静默的，玩家只能猜（见上面 free 分支那段注释）
+			if (full) b.title = `最多同时摆 ${CONFIG.roast.oven.maxCount} 个`
+			else if (!afford) b.title = '钱不够'
+			buttons.push(b)
 		} else {
 			for (const n of FEED_QUANTITIES) {
 				const cost = bulkPrice(r.unit, n)
@@ -2831,7 +3129,7 @@ export class UI {
 			}
 		}
 
-		return this._shopRow({ name: r.name, desc: r.short, buttons, gold: !!r.gold })
+		return this._shopRow({ name: r.name, desc: r.short, buttons, gold: !!r.gold, arcane: !!r.arcane })
 	}
 
 	/**
@@ -2847,17 +3145,24 @@ export class UI {
 	 *   画法与场上那一份共用 `render.drawFoodIcon` —— 图鉴存在的意义就是
 	 *   「让我认得出屏幕上那个是什么」，画得不一样就白做了。
 	 *
-	 * 只渲染一次（打开时），内容不会变 —— 不做「解锁 / 未发现」那一套
+	 * 只渲染一次（打开时），内容不会变。
+	 *
+	 * ⚠ 这里**有**一套「解锁」机制，只有一样东西：彩蛋解锁之前的星空苹果
+	 *   和星云基因格都**不出现**。理由是剧透 —— 图鉴一打开就写着「星云：
+	 *   吃星空苹果获得」，彩蛋在第一次开图鉴的时候就没了。
+	 *   所以它们跟着 `unlockedFoodIds()` 一起进来，走的是同一个判据。
 	 */
 	refreshCodex() {
 		const body = this.el.codexBody
 		body.innerHTML = ''
 
+		body.append(this._codexSection('食物', this.unlockedFoodIds(), (id) => this._codexFoodCell(id)))
 		body.append(
-			this._codexSection('食物', CONFIG.market.feedCats[0].items, (id) => this._codexFoodCell(id)),
-		)
-		body.append(
-			this._codexSection('基因', CONFIG.mutation.types.map((t) => t.id), (id) => this._codexGeneCell(id)),
+			this._codexSection(
+				'基因',
+				CONFIG.mutation.types.map((t) => t.id).filter((id) => id !== 'nebula' || this.starUnlocked),
+				(id) => this._codexGeneCell(id),
+			),
 		)
 	}
 
@@ -2908,12 +3213,17 @@ export class UI {
 		text.className = 'codex-text'
 		const name = document.createElement('div')
 		name.className = 'codex-name'
-		name.textContent = id === 'gold' ? '金苹果' : '苹果'
+		name.textContent = FOOD_NAME[id] ?? id
 		const desc = document.createElement('div')
 		desc.className = 'codex-desc'
-		// 文字也从 config 现算：成长倍率是唯一的区别，价格也是配置里的
+		// 文字也从 config 现算：成长倍率是唯一的区别，价格也是配置里的。
+		// ⚠ 成长倍率是**普通食物**之间的区别，星空苹果不吃这一套
+		//   （它的倍率就是 1，写「成长 ×1」等于没说），所以那一种改说真正的用途
 		const bonus = CONFIG.food.growthBonus[id] ?? 1
-		desc.textContent = `${formatMoney(foodPrice(id))} · 成长 ×${bonus}`
+		desc.textContent =
+			id === 'star'
+				? `${formatMoney(foodPrice(id))} · 幼虫吃了有 ${(CONFIG.mutation.nebulaFromStar * 100).toFixed(0)}% 长出星云`
+				: `${formatMoney(foodPrice(id))} · 成长 ×${bonus}`
 		text.append(name, desc)
 
 		cell.append(cv, text)
@@ -2942,7 +3252,16 @@ export class UI {
 		name.textContent = this._mutationEffect(t)
 		const desc = document.createElement('div')
 		desc.className = 'codex-desc'
-		desc.textContent = `${(t.chance * 100).toFixed(1)}% · ${t.adultOnly ? '只在成虫显形' : '幼虫和成虫都显形'}`
+		// ⚠ 概率那一行只对**会新发**的突变成立。星云的新发概率是 0，
+		//   写「0.0%」是个看着精确的谎：玩家会读成「几乎抽不到」，
+		//   而真相是「根本不在抽奖池里，只能吃出来」。
+		//   所以它换一条判据，把来历写明。
+		//   自检里那条配对的断言用的是同一个 t.chance > 0 分支
+		const how = t.adultOnly ? '只在成虫显形' : '幼虫和成虫都显形'
+		desc.textContent =
+			t.chance > 0
+				? `${(t.chance * 100).toFixed(1)}% · ${how}`
+				: `${t.fromStar ? '吃星空苹果获得' : '无法自然获得'} · ${how}`
 		text.append(name, desc)
 
 		cell.append(badge, text)
@@ -2961,6 +3280,9 @@ export class UI {
 		if (t.lifespanMul) bits.push(`寿命 ×${t.lifespanMul}`)
 		if (t.weightMul) bits.push(`体重 ×${t.weightMul}`)
 		if (t.valueMul) bits.push(`价值 ×${t.valueMul}`)
+		// 速度。⚠ 上面两个都是「越大越亏」的（寿命砍半、体重涨），
+		// 这个是唯一一个**纯粹的好处**，所以单独排在价值后面
+		if (t.speedMul) bits.push(`移动速度 ×${t.speedMul}`)
 		if (t.auraMul) bits.push(`附近成虫价值 ×${t.auraMul}`)
 		if (t.adultDamageMin) {
 			bits.push(`随机咬死附近的同伴（${t.adultDamageMin}~${t.adultDamageMax} 点伤害）`)
@@ -2970,6 +3292,7 @@ export class UI {
 		if (t.id === 'stone') bits.push('失去飞行')
 		if (t.id === 'crystal') bits.push('全身透明只剩描边')
 		if (t.id === 'golden') bits.push('通体金色、带闪光')
+		if (t.id === 'nebula') bits.push('身体是星云上的一扇窗（星空钉在屏幕上不动）')
 		return bits.length ? bits.join(' · ') : t.name
 	}
 

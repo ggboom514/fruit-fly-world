@@ -12,9 +12,13 @@
  *   · 自检的那个 15 秒超时**根本没机会注册**（它在 app ready 之后才跑）
  *   · 于是 `npm run selftest` **永远挂着不退出**，看起来像卡死而不是编译失败
  *
- * 这个坑已经踩过三次，每次都是在注释里顺手写了个反引号（比如想引用
- * `e.target` 这种标识符）。所以把它做成一条独立的检查：秒级出结果，
- * 而且直接指到出问题的那一行。
+ * 这个坑已经踩过**八次**，每次都是在注释里顺手写了个反引号（比如想引用
+ * `e.target` 这种标识符）。
+ *
+ * ⚠ 所以这里除了「解析一遍」，还有一条**专门盯着 main.js 自检区**的检查
+ *   （见下面 countStrayBackticks）：光靠解析器报错虽然也能发现，
+ *   但 Bun 报的是「missing )」这种指错方向的消息，得自己往回找。
+ *   直接把违规的行号打出来，一眼就到
  *
  * 跑：`bun run check`
  */
@@ -41,16 +45,59 @@ const files = [
 	...walk(join(ROOT, 'tools')),
 ]
 
+/**
+ * 自检那一大块模板字符串里，混进来的反引号。
+ *
+ * 定位方式：从 `executeJavaScript(` 那一行开始，到它对应的 `})()` 结束，
+ * 中间除了最外层那一对，**不允许再有任何反引号**（也不允许 `${`）。
+ *
+ * ⚠ 为什么不用「数一数总共几个」那种土办法：main.js 里**别处也有合法的**
+ *   反引号（`console.error` 那一句、结尾拼摘要那一串），数量对不上只会误报。
+ *   掐区间才准。
+ *
+ * @returns {{line:number, text:string}[]} 违规的行
+ */
+function countStrayBackticks(src) {
+	const lines = src.split('\n')
+	const start = lines.findIndex((l) => l.includes('executeJavaScript('))
+	if (start < 0) return []
+	const end = lines.findIndex((l, i) => i > start && l.trim() === '})()`)')
+	if (end < 0) return []
+
+	const out = []
+	for (let i = start + 1; i < end; i++) {
+		// 模板字符串里的 ${ 会在**外层**求值，同样会把这段代码搞坏
+		if (lines[i].includes('`') || lines[i].includes('${')) {
+			out.push({ line: i + 1, text: lines[i].trim() })
+		}
+	}
+	return out
+}
+
 let bad = 0
 for (const f of files) {
 	const src = readFileSync(f, 'utf8')
+	const rel = f.slice(ROOT.length + 1)
+
+	// 先单独查自检区 —— 它给出的行号比解析器的报错准得多
+	if (f.endsWith('main.js')) {
+		const stray = countStrayBackticks(src)
+		if (stray.length) {
+			bad++
+			console.log(`✗ ${rel}`)
+			console.log('  自检那块模板字符串里混进了反引号或 ${（第 ' + stray.length + ' 处）：')
+			for (const s of stray) console.log('    line ' + s.line + ': ' + s.text)
+			console.log('  把那些反引号去掉，写成普通文字即可。')
+			continue
+		}
+	}
+
 	try {
 		// 只解析、不执行。Bun 的 transpiler 在语法错误时会抛，
 		// 而且带上行号和一段上下文
 		new Bun.Transpiler({ loader: 'js' }).transformSync(src)
 	} catch (e) {
 		bad++
-		const rel = f.slice(ROOT.length + 1)
 		console.log(`✗ ${rel}`)
 		console.log('  ' + String(e.message).split('\n').slice(0, 6).join('\n  '))
 	}

@@ -38,6 +38,20 @@
 			除了这扇窗口，其余区域的鼠标事件都会穿透到桌面上。
 		-->
 		<div id="hud">
+			<!--
+				解锁彩蛋那一下的星尘。铺满整屏、只在四周可见（蒙版挖空中间）。
+
+				⚠ 它是**纯装饰**，三条硬约束：
+				   1. pointer-events: none。铺满整屏的东西一旦吃掉鼠标，
+				      桌面上的点击会整整 10 秒没有反应 —— 和悬停卡片 /
+				      投放区参考框踩过的是同一个坑
+				   2. **不能进 ui._updateInteractive() 的 need 算式**，理由同上
+				      （那个方法决定整扇窗口要不要接管鼠标）
+				   3. 挂在 #hud 里，不要直接挂 body 下 —— 透明窗口下直接挂 body
+				      的图层合成得不对（见 .donate-pop 那段注释第 3 条）
+			-->
+			<div id="starfield" class="starfield hidden"></div>
+
 			<div class="window" id="panel">
 				<!-- 标题栏：拖动区 + 最小化 / 关闭 -->
 				<div class="titlebar" id="titlebar">
@@ -106,7 +120,7 @@
 						不然收起来之后完全看不出状态（快捷键仍然直接生效）。
 					-->
 					<div class="fold collapsed" id="tools-box">
-						<button class="fold-toggle" id="btn-tools" title="展开 / 收起工具。快捷键不用展开也能直接用：G 手套 · F 拍 · N 网 · B 扫帚 · C 擦 · W 冲 · R 烤 · V 查看 · Esc 观察">
+						<button class="fold-toggle" id="btn-tools" title="展开 / 收起工具。快捷键不用展开也能直接用：G 手套 · F 拍 · N 网 · B 扫帚 · C 擦 · W 冲 · R 点火 · V 查看 · Esc 观察">
 							<span>工具</span>
 							<b id="tools-current">观察</b>
 							<span class="caret">▾</span>
@@ -137,18 +151,26 @@
 							<!--
 								喷水枪：一条可以转向、可以调长的水线，碰到「可清洁物」就直接冲掉，
 								不用像抹布那样来回滑。
-								⚠ 名字和下面那颗「喷火枪」只差一个字、还押韵，但两件事完全不同：
-								   喷**水**枪冲掉地上的脏东西，喷**火**枪把尸体烤熟卖钱。
-								   好在烤制那颗要买到打火机才出现，而且排在最后，不会挨在一起
+								⚠ 名字和下面那两颗点火器只差一个字、还押韵，但两件事完全不同：
+								   喷**水**枪冲掉地上的脏东西（按 W），
+								   喷**火**枪点着活蝇换钱（按 R）
 							-->
 							<button class="tool locked" id="btn-squirt" data-tool="squirt" title="按住左键喷水，冲掉尸体 / 污渍 / 蛹壳。滚轮改水线长度，Shift+滚轮转方向（W）。要先在商店买下喷水枪">喷水枪</button>
 							<!--
-								烤制。⚠ 默认 hidden，买到打火机（lv1）之后才出现，
-								文字和快捷键提示由 ui.refreshRoastTool() 按当前档位改。
-								lv1 打火机 / lv2 喷火枪是「按住烤」的工具，
-								lv3 烤炉则变成「点一下摆一个炉子」——同一颗按钮换行为
+								点火：打火机 / 喷火枪。
+								⚠ 从 1.18.0 起是**两颗独立的按钮**，不再是一颗「烤制」跟着
+								   档位改名。理由：一颗按钮改名时，玩家没法一眼看出
+								   「我现在到底拿着哪一档」，也没法直接切到低档那支。
+								   升级链本身没变（先买打火机 $3，再付 $8 升喷火枪），
+								   买到哪档就点亮哪一颗。
+								⚠ 两颗**一直显示**，没买是 `.locked`（置灰 + 虚线框）——
+								   不要再做成「买过才出现」：那样按钮会在工具栏里进进出出，
+								   位置来回跳。
+								name / title 全部由 ui.refreshToolButtons() 从 CONFIG 现算，
+								这里写的只是初始值
 							-->
-							<button class="tool hidden" id="btn-roast" data-tool="roast" title="">烤制</button>
+							<button class="tool locked" id="btn-lighter" data-tool="lighter" title="">打火机</button>
+							<button class="tool locked" id="btn-flamer" data-tool="flamer" title="">喷火枪</button>
 						</div>
 					</div>
 
@@ -254,9 +276,17 @@
 						<button id="btn-settings" class="donate gear" title="设置：正常模式 / 烦人模式">
 							<span class="gear-icon"></span>
 						</button>
+						<!--
+							⚠ class 里那个 `locked` 是**初始态**，指的是「星空苹果还没解锁」。
+							   它写在 HTML 上、不由 JS 补 —— 补的话，读到解锁状态之前的那
+							   一两帧罐子是金色的，正好是「未解锁应当是蓝紫」的反面。
+							   ui.setStarUnlocked() 会按真实状态把它去掉或留着。
+							   （名字容易误会：这里 locked 指的是**彩蛋**没解锁，
+							    不是这颗按钮点不动 —— 它任何时候都点得动）
+						-->
 						<button
 							id="btn-donate"
-							class="donate"
+							class="donate locked"
 							title="请我喝瓶水 —— 打开收款码。完全自愿，和游戏里的一切都无关"
 						>
 							<span class="jar-icon"></span>
@@ -293,7 +323,14 @@
 				<div class="donate-card">
 					<button id="donate-close" class="donate-close" title="关掉（Esc）">✕</button>
 					<p class="donate-slogan">自愿捐款，理性消费哦</p>
-					<img class="donate-qr" id="donate-qr" src="./assets/alipay-qr.png" alt="支付宝收款码" />
+					<!--
+						⚠ 扩展名是 .jpg 而不是 .png：这个文件的**实际字节是 JPEG**
+						   （FF D8 FF E0 开头），只是原来取了个 .png 的名字。
+						   浏览器靠内容嗅探照样能显示，所以叫 .png 也能跑 ——
+						   但那种「名字和内容对不上」的东西迟早坑人，
+						   所以按真实格式命名，改了名就顺手把这里也改了
+					-->
+					<img class="donate-qr" id="donate-qr" src="./assets/alipay-qr.jpg" alt="支付宝收款码" />
 					<p class="donate-note">支付宝扫一扫</p>
 				</div>
 			</div>

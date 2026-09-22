@@ -13,6 +13,9 @@ import { TAU, lerp, seeded } from './utils.js'
 // ⚠ 放大镜要按**价值档**筛（玩家勾的是档位，不是一个价格门槛），
 //   而分档这件事只有 market.valueTierOf 一份定义，别在这里另写一套边界
 import { valueTierOf } from './market.js'
+// 星云贴图。没加载好时 nebulaPattern() 返回 null，调用方直接跳过那一层 ——
+// 见文件末尾 foodTexture 和 nebula.js 顶部那段「失败的样子」
+import { nebulaPattern } from './nebula.js'
 
 // ====================================================================
 //  颜色小工具
@@ -131,6 +134,69 @@ function traceSmooth(ctx, pts, closed = true) {
 	}
 	const last = pts[pts.length - 1]
 	ctx.lineTo(last.x, last.y)
+}
+
+/**
+ * 把**世界锚定**的贴图铺进当前路径。星云苹果和星云生物都靠它。
+ *
+ * 原理是 Canvas 规范里的两句话，缺一不可：
+ *
+ *   · 建路径时：「the points passed to the methods, and the resulting lines
+ *     added to current default path by these methods, must be transformed
+ *     according to the current transformation matrix **before being added
+ *     to the path**」—— 路径坐标在加进去的那一刻就被 CTM 烘死了
+ *   · 填充时：「the stroke style is affected by the transformation during
+ *     painting, **even if the current default path is used**」——
+ *     样式（含 pattern）用的是**画的时候**那个 CTM，路径不再跟着动
+ *
+ * 于是：在生物自己的变换下把轮廓建好，再把 CTM 设回世界坐标系去 fill()，
+ * 轮廓还钉在虫身上，贴图却铺在世界坐标系里 —— 虫成了星云上的一扇窗，
+ * 移动的时候透出来的是星云的不同部分，而不是「贴图跟着虫一起挪」。
+ *
+ * 实测过（无头 Chromium，和 Electron 44 同一个引擎）：identity 下建一个
+ * `rect(10,10,20,20)`，再 `setTransform(2,0,0,2,0,0)` 去 fill()，
+ * 墨迹仍然落在 10,10..29,29。
+ *
+ * ⚠⚠ **只对「当前默认路径」成立，绝不能重构成 `Path2D`。**
+ *   规范里 Path2D 是「使用时」才变换的（"must be transformed according to
+ *   the current transformation matrix … when used by these methods"），
+ *   改过去贴图就会跟着虫一起转 —— 那正是不要的那个效果。
+ *   而且它**看起来是合理的**，不会有人来报 bug。别「顺手清理」成 Path2D。
+ *
+ * ⚠ `save()/restore()` **不包含当前路径**。这里靠的是「中间没人碰过路径」，
+ *   不是靠 save 把它存下来了 —— 所以调用点和建路径之间不能插任何 `beginPath()`。
+ *
+ * @param {CanvasPattern|null} pattern 图没加载好时是 null，直接跳过这一层
+ */
+function fillWorldTexture(ctx, pattern) {
+	if (!pattern) return
+	ctx.save()
+	// ⚠ 单位矩阵，不是 dpr 那个：canvas.width 是**设备像素**，
+	//   路径在构建时已经被 dpr 变换过了，两者必须落在同一个空间里。
+	//   贴图分块也按 canvas.width/height 造（见 nebula.js），口径一致
+	ctx.setTransform(1, 0, 0, 1, 0, 0)
+	ctx.fillStyle = pattern
+	ctx.fill()
+	ctx.restore()
+}
+
+/**
+ * 一只成虫的**腹部 + 胸部**合成轮廓（**不含头**）。
+ *
+ * 这两个椭圆原来在 drawFly 里散着写了两遍（颗粒裁剪、石化暗边），
+ * 星云贴图是第三个用户 —— 再来一份的话，改一处忘一处会变成
+ * 「贴图比身体大一圈」，不报错、不崩，只是假。
+ *
+ * ⚠ 腹部 / 胸部**各自单独上色**那两处不在这里收：它们是分开的两次 fill
+ *   （各带自己的亮暗渐变），合成一条路径反而填不出那个渐变。
+ *
+ * @param {number} s 体型（体长）
+ */
+function flyBodyPath(ctx, s, sex) {
+	const female = sex === 'F'
+	ctx.beginPath()
+	ctx.ellipse(-s * 0.26, 0, s * (female ? 0.34 : 0.31), s * (female ? 0.26 : 0.22), 0, 0, TAU)
+	ctx.ellipse(s * 0.07, 0, s * 0.21, s * 0.18, 0, 0, TAU)
 }
 
 // 蛆的身体轮廓系数已经搬到 config.js 的 larva.profile ——
@@ -347,6 +413,9 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 	const V = flyVisual(f)
 	const detailed = s > 13 // 太小就不画腿了，反正看不见
 	const crystal = f.mutations && f.mutations.includes('crystal')
+	// 星云的**身体贴图**。和 crystal 一样每帧直接读基因数组 ——
+	// 它们都是「这只虫现在长什么样」的判据，没有第二处状态
+	const nebula = f.mutations && f.mutations.includes('nebula')
 
 	ctx.save()
 	ctx.translate(f.x + ox, f.y + oy)
@@ -514,9 +583,7 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 	//
 	// 太小的果蝇（体长不到 13px）跳过：那个尺寸下颗粒是亚像素的，画了只是浪费
 	if (detailed) {
-		ctx.beginPath()
-		ctx.ellipse(-s * 0.26, 0, abdRx, abdRy, 0, 0, TAU)
-		ctx.ellipse(s * 0.07, 0, s * 0.21, s * 0.18, 0, 0, TAU)
+		flyBodyPath(ctx, s, f.sex)
 		speckle(ctx, f.seed, 14, -s * 0.1, 0, s * 0.4, s * 0.26, V.bodyGrainColor)
 	}
 
@@ -554,14 +621,30 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 		}
 	}
 
+	// —— 星云：把世界坐标系里的贴图，透过身体这扇窗露出来 ——
+	//
+	// ⚠ 位置是三件事一起定的：
+	//   1. 在**头之后** —— 眼睛先画完，贴图盖不住它。红眼是整只虫最认得出的
+	//      东西，盖掉之后只剩一团星云，读不出这是只果蝇
+	//   2. 形状**不含头**（flyBodyPath 只有腹 + 胸），和上面那层颗粒共用同一条 ——
+	//      那边的理由写得很清楚：「免得颗粒撒到复眼上」
+	//   3. 在**石化暗边之前** —— 石化的暗边是给「灰身体的实心边界」用的，
+	//      压在贴图上面才对
+	//
+	// ⚠ 结晶赢：它整只是 0.14 的幽灵 + 一圈炫彩边，盖一层不透明的贴图上去
+	//   会把它整个抹掉，两个效果同归于尽。判据和 drawLarva 里
+	//   「结晶优先于 translucency」一模一样 —— 更稀有、更该被一眼认出的那个赢
+	if (nebula && !crystal) {
+		flyBodyPath(ctx, s, f.sex)
+		fillWorldTexture(ctx, nebulaPattern(ctx))
+	}
+
 	// 石化的那层人工暗边。石头是有明确轮廓的硬东西，
 	// 而灰身体的亮度和浅色桌面很接近，不勾边就只是地上一块色斑
 	if (V._rim && detailed) {
 		ctx.strokeStyle = V._rim
 		ctx.lineWidth = Math.max(0.4, s * 0.022)
-		ctx.beginPath()
-		ctx.ellipse(-s * 0.26, 0, abdRx, abdRy, 0, 0, TAU)
-		ctx.ellipse(s * 0.07, 0, s * 0.21, s * 0.18, 0, 0, TAU)
+		flyBodyPath(ctx, s, f.sex)
 		ctx.stroke()
 	}
 
@@ -759,6 +842,34 @@ function drawLarva(ctx, l) {
 	// 外圈微透是「体壁薄」，结晶是「整条只剩描边」，混在一起只会两不像。
 	// 结晶更稀有、也更该被一眼认出来，所以它赢
 	const crystal = l.mutations && l.mutations.includes('crystal')
+	const nebula = l.mutations && l.mutations.includes('nebula')
+
+	// —— 星云（幼虫）——
+	//
+	// 幼虫这边比成虫省事得多：`bodyOutline()` 已经是一条现成的闭合路径
+	// （本来就是给描边用的），`traceSmooth` 刚刚把它铺成了**当前路径**，
+	// 直接 fill 就是满满一条，不需要再拼轮廓。
+	//
+	// ⚠ 结晶赢，理由和成虫那边一字不差：结晶是「整条只剩一圈描边」，
+	//   盖一层不透明的贴图上去就把它抹掉了
+	//
+	// ⚠ 这里只填贴图、**不加描边**。深紫的星云在浅色桌面上对比度本来就够，
+	//   而描边会让它和结晶幼虫长得像 —— 两者是不同突变，不该撞脸。
+	//   （真在深色桌面上糊了，那是「换一张亮一点的星云图」的事）
+	//
+	// ⚠⚠ **这一支的 `ctx.restore()` 不能省。** 函数开头（`ctx.save()` +
+	//   `ctx.translate(l.x, l.y)`）压进去了一层状态，下面那条
+	//   `ctx.rotate/scale` 也还在这一层里。直接 return 的话——
+	//   · 这一层**永远弹不出来**，而且每帧每只星云幼虫都再压一层，越堆越高
+	//   · 更要命的是**画布上的变换也留着**：后面画的每一只虫 / 食物 / 粒子
+	//     都会先被平移到这条幼虫的位置、再按它的角度转一下
+	//   表现是「虫全被钉在某个点上、跟着它一起晃」——因为那个「锚点」
+	//   就是最后画的那只星云幼虫，它一动，整屏跟着动
+	if (nebula && !crystal) {
+		fillWorldTexture(ctx, nebulaPattern(ctx))
+		ctx.restore()
+		return
+	}
 
 	if (crystal) {
 		ctx.save()
@@ -885,27 +996,21 @@ function drawShell(ctx, sh) {
 // ====================================================================
 
 /**
- * 一具尸体（也可能是烤好的）。
+ * 一具尸体。
  *
- * 尸体现在**值钱**：拍死之后能拿去烤，烤完乘倍率，再拖进出售区换钱。
- * 所以它得同时说清楚「我是什么」和「我值不值钱」两件事：
+ * 尸体仍然**值钱**（拖进出售区能按原价换钱），所以它要说清楚「我烂到几成了」——
+ * 越烂越不值钱，也越难擦。
  *
- *   - **烤过的**：整体转成焦褐（`roast.roastedSkin`），体积缩一圈
- *     （`roast.roastedScale`），而且**不再腐烂** —— 烤熟的东西不会接着烂。
- *     这是最要紧的一条：烤过还继续烂的话，玩家烤完放一会儿，
- *     同一具尸体会在「已经熟了」和「正在烂掉」之间自相矛盾
- *   - **没烤的**：照旧随时间腐烂，颜色往 corpseRotColor 走
- *
- * 生熟用**颜色**区分而不是加个图标：地上会同时躺着十几具，
- * 加图标会变成一堆噪点；整体色相一变，扫一眼就能挑出能卖的那几具
+ * ⚠ 这里原来还有一个「烤过的」分支：整体焦褐 + 体积缩一圈 + 不再腐烂。
+ *   1.18.0 起**地上的尸体不能再烤了**（点火器改成点着活蝇），所以整段删掉。
+ *   **必须连绘制一起删**：`revive()` 会把老存档里残留的 `roasted: true`
+ *   原样写回去，只删价钱里的倍率、留着这个分支的话，
+ *   那批老尸体会**全部画成焦褐色** —— 看起来像「还能烤」，其实已经不是了
  */
 function drawCorpse(ctx, r) {
 	const V = CONFIG.visual
-	const R = CONFIG.roast
-	const roasted = r.roasted
-	const s = roasted ? r.size * R.roastedScale : r.size
-	// 烤过的不再腐烂：把 rot 钉成 0，下面所有「越烂越…」的分支自然全部失效
-	const rot = roasted ? 0 : r.rot
+	const s = r.size
+	const rot = r.rot
 	// 擦过之后会「糊开」，所以一边变淡一边摊大
 	const smear = r.clean * 0.55 + rot * 0.28
 	const alpha = 1 - r.clean * 0.72
@@ -920,19 +1025,7 @@ function drawCorpse(ctx, r) {
 	// 坐标是「建的那一刻」的当前坐标系。写在 save() 之前的话它锚在世界原点，
 	// 每具尸体拿到的都是同一条横贯全屏的色带（而且各自的取色还不一样），
 	// 症状是「有几具尸体是纯黑的、有几具正常」，极难联想到渐变
-	//
-	// 烤过的用一层**沿身体短轴的渐变**（上暖下焦）而不是纯色：
-	// 纯色的话它和新鲜尸体只差一个色号，在浅色桌面上很难一眼分开，
-	// 而这两者的价钱差 1.8 倍
-	let body
-	if (roasted) {
-		const g = ctx.createLinearGradient(0, -s * 0.24, 0, s * 0.24)
-		g.addColorStop(0, R.roastedEdge)
-		g.addColorStop(1, R.roastedSkin)
-		body = g
-	} else {
-		body = mixHex(V.corpseColor, V.corpseRotColor, rot)
-	}
+	const body = mixHex(V.corpseColor, V.corpseRotColor, rot)
 
 	// 腐烂渗出来的一圈
 	if (rot > 0.12) {
@@ -959,12 +1052,18 @@ function drawCorpse(ctx, r) {
 		}
 	}
 
-	// 皱掉的翅膀。烤过的收得更拢、也更焦
-	ctx.fillStyle = roasted ? 'rgba(150, 120, 90, 0.22)' : 'rgba(205, 205, 205, 0.18)'
+	// 皱掉的翅膀。
+	//
+	// ⚠ 这两个三元原来是「烤过的收得更拢、也更焦」。尸体不能再烤之后,
+	//   两个分支都只剩「没烤过」那一支 —— 忘了改的话这里会引用一个
+	//   **已经删掉的变量**，而那是个 ReferenceError：每帧只要有尸体就抛，
+	//   整个 canvas 一帧都画不出来。
+	//   自检当时没抓到它，因为那条像素断言会把 remains 暂时清空
+	ctx.fillStyle = 'rgba(205, 205, 205, 0.18)'
 	for (const side of [-1, 1]) {
 		ctx.save()
 		ctx.translate(-s * 0.06, side * s * 0.1)
-		ctx.rotate(-side * (roasted ? 0.5 : 0.8))
+		ctx.rotate(-side * 0.8)
 		ctx.beginPath()
 		ctx.ellipse(-s * 0.26, 0, s * 0.3, s * 0.08, 0, 0, TAU)
 		ctx.fill()
@@ -1033,7 +1132,23 @@ function drawStain(ctx, r) {
  * 用直线段而不是贝塞尔曲线：掰下来的碎块本来就是有棱角的，
  * 曲线太顺滑反而显得卡通，正是要去掉的那种感觉。
  */
-function drawAppleScrap(ctx, s, skin, flesh, seedColor, seed) {
+/**
+ * 这一种食物要不要盖星云贴图。要盖就返回 pattern，否则 null。
+ *
+ * ⚠ **只有一个判据**，场上和図鉴共用 —— 图鉴存在的意义就是
+ *   「让我认得出屏幕上那个是什么」，两边画得不一样就白做了
+ *   （这条规矩是从 drawAppleScrap 上面那段注释里继承下来的）。
+ *
+ * ⚠ 每次重取一次 pattern 而不是缓存到模块变量：它内部按 ctx 缓存，
+ *   取一次只是一次 Map 查表；而自检会**临时换掉 renderer.ctx** 去做像素探针，
+ *   存到模块变量上的话，换回来的那一帧就画到别的画布上去了
+ */
+function foodTexture(ctx, type) {
+	if (type !== 'star') return null
+	return nebulaPattern(ctx)
+}
+
+function drawAppleScrap(ctx, s, skin, flesh, seedColor, seed, texture = null) {
 	const r = s * 0.5
 	const n = 7 + Math.floor(seeded(seed, 90) * 4) // 7~10 个顶点
 
@@ -1072,6 +1187,19 @@ function drawAppleScrap(ctx, s, skin, flesh, seedColor, seed) {
 	ctx.closePath()
 	ctx.fill()
 	ctx.stroke()
+
+	// —— 星云贴图：盖在果肉上、果皮之下 ——
+	//
+	// ⚠ 位置**必须正好在这里**：上面那条闭合路径就是果肉多边形，
+	//   fillWorldTexture 复用的就是它。往下挪一行，果皮那次 `trace()`
+	//   会重新 beginPath，路径一换就画到「果皮那两段弧」上去了。
+	//
+	// 果皮弧和果核画在它之后，所以星空苹果外缘仍然是一条正常的果皮 ——
+	// 「这是一块掰下来的苹果屑」这件事不被贴图吃掉。
+	//
+	// 果肉那次 stroke 比多边形大出 r*0.1（lineWidth = r*0.2、round join），
+	// 所以贴图外面天然留了一圈果肉色 —— 那正是想要的「果肉里嵌着一小块星空」
+	if (texture) fillWorldTexture(ctx, texture)
 
 	// 果皮：只沿外缘的一小段，不是包一圈
 	ctx.strokeStyle = skin
@@ -1141,7 +1269,7 @@ function drawFood(ctx, f) {
 
 	// 目前只有「苹果屑」一种画法，两种苹果共用它、只是配色不同。
 	// 要加别的**形状**就在这里按 f.type 分派，入口在 config.food.types。
-	drawAppleScrap(ctx, s, skin, flesh, palette.seed, f.seed)
+	drawAppleScrap(ctx, s, skin, flesh, palette.seed, f.seed, foodTexture(ctx, f.type))
 
 	// 霉斑：烂到 moldAt 之后逐渐长出来，位置由 seed 决定所以不会每帧乱跳
 	if (f.rot > F.moldAt) {
@@ -1276,14 +1404,15 @@ function drawParticle(ctx, p) {
 }
 
 /**
- * 往上飘的一行字（烤炉卖出的 +$x）。
+ * 往上飘的一行字（烤炉整炉结账 / 烧着的蝇烧完自动卖，都会冒）。
  *
  * ⚠ **先描边再填字**，而且描边不能省：这个字会飘过炉子、飞过的果蝇、
  *   偶尔还有玻璃罐 —— 那些底色从深褐到浅黄什么都有。只填一层金色的话，
  *   飘到亮色背景上就糊成一团，而它写的偏偏是**钱**
  */
 function drawFloatText(ctx, t) {
-	const F = CONFIG.roast.oven.float
+	// 样式在 CONFIG.floatText（两个来源共用），不是炉子那一节
+	const F = CONFIG.floatText
 	const a = t.alpha
 	if (a <= 0) return
 
@@ -1499,7 +1628,7 @@ export function drawFoodIcon(ctx, type, size, seed = 7) {
 		ctx.fill()
 	}
 
-	drawAppleScrap(ctx, size, palette.skin, palette.flesh, palette.seed, seed)
+	drawAppleScrap(ctx, size, palette.skin, palette.flesh, palette.seed, seed, foodTexture(ctx, type))
 }
 
 // ⚠ 这里原来有个 magnifierMinValue()，读 magnifier 的 `minValue` 当门槛。
@@ -1757,14 +1886,23 @@ function drawOvenFront(ctx, oven, dropHot = false) {
 	ctx.lineTo(oven.halfW - 8, -oven.halfH + 9)
 	ctx.stroke()
 
-	// 正在烤 → 炉膛里透出火光 + 下沿一条进度条。
+	// 炉里还有东西在烤 → 炉膛里透出火光。
 	//
-	// ⚠ 这两样是**两件事**，都要留：火光是「炉子在工作」的氛围，
-	//   进度条是「还剩多少」的读数。光靠火光读不出进度 ——
+	// ⚠ 火光和进度条是**两件事**：火光是「炉子在工作」的氛围，
+	//   进度条是「这只还剩多少」的读数。光靠火光读不出进度 ——
 	//   它只是透明度从 0.28 变到 0.63，在一台 150px 宽、还压着几只果蝇的
-	//   炉子上根本看不出来，而那正是「点了开烤之后到底在不在跑」的疑问
+	//   炉子上根本看不出来
+	//
+	// ⚠ 从 1.21.0 起每只各自计时，所以这里的透明度取的是**炉里最靠前的那一只**
+	//   的进度；进度条则**每条虫各画一条**（见下面那一段）。
+	//   原来那条横贯炉膛下沿的整炉进度条删掉了 —— 现在每只进度都不一样，
+	//   一条公共的槽已经表达不了任何东西
 	if (oven.roasting) {
-		const t = oven.roastProgress
+		let t = 0
+		for (const f of oven.items) {
+			if (f.roastLeft === null || !(f.roastTotal > 0)) continue
+			t = Math.max(t, clamp(1 - f.roastLeft / f.roastTotal, 0, 1))
+		}
 		ctx.globalAlpha = 0.28 + t * 0.35
 		const g = ctx.createRadialGradient(0, oven.halfH * 0.2, 2, 0, oven.halfH * 0.2, oven.halfW)
 		g.addColorStop(0, O.glowColor)
@@ -1773,28 +1911,34 @@ function drawOvenFront(ctx, oven, dropHot = false) {
 		ctx.beginPath()
 		ctx.roundRect(-oven.halfW, -oven.halfH, oven.w, oven.h, 8)
 		ctx.fill()
+	}
 
-		// —— 进度条 ——
-		// 底槽**一直画**（哪怕进度是 0）：有槽才看得出「这里有个进度条」，
-		// 否则头一帧只有个空炉子，玩家不知道该盯着哪儿
-		ctx.globalAlpha = 1
-		const barW = oven.w - O.barInset * 2
-		const barX = -oven.halfW + O.barInset
-		const barY = oven.halfH - O.barInset - O.barHeight
-		const r = O.barHeight / 2
+	// —— 每只虫各一条小进度条，画在它自己头顶 ——
+	//
+	// 底槽**一直在**（哪怕进度是 0）：有槽才看得出「这只排上队了」，
+	// 否则刚放进去那一下会像个没动静的空炉子
+	ctx.globalAlpha = 1
+	const bw = O.barWidth
+	const bh = O.barHeight
+	const br = bh / 2
+	for (const f of oven.items) {
+		if (f.roastLeft === null || !(f.roastTotal > 0)) continue
+		const p = clamp(1 - f.roastLeft / f.roastTotal, 0, 1)
+		const bx = f.x - bw / 2
+		const by = f.y - O.barOffsetY
 
 		ctx.fillStyle = O.barTrackColor
 		ctx.beginPath()
-		ctx.roundRect(barX, barY, barW, O.barHeight, r)
+		ctx.roundRect(bx, by, bw, bh, br)
 		ctx.fill()
 
 		// ⚠ 进度不到 1px 时不画 —— 圆角半径是 barHeight/2，宽度比它小的圆角矩形
 		//   在 canvas 上会画出一个奇怪的豆子，而且每帧都在变
-		const filled = barW * t
+		const filled = bw * p
 		if (filled >= 1) {
 			ctx.fillStyle = O.barColor
 			ctx.beginPath()
-			ctx.roundRect(barX, barY, filled, O.barHeight, Math.min(r, filled / 2))
+			ctx.roundRect(bx, by, filled, bh, Math.min(br, filled / 2))
 			ctx.fill()
 		}
 	}
@@ -1813,7 +1957,9 @@ function drawOvenFront(ctx, oven, dropHot = false) {
 }
 
 // 这里原本有一个 drawRoastProgress()：一圈绕着目标的进度环，
-// 配合「按住鼠标烤 5 秒」。改成**接触即烤**之后进度这个概念就不存在了
-// （碰到的那一帧就熟），整块删掉。
-// 工具光标那一圈火苗还在（见 drawToolCursor 的 'roast' 分支），
-// 它标示的是**作用半径**，和计时无关，所以留着。
+// 配合「按住鼠标烤 5 秒」。两代机制之前就删掉了。
+//
+// ⚠ 这句注释原来还写着「工具光标那一圈火苗还在（见 drawToolCursor 的 'roast' 分支）」——
+//   `drawToolCursor` 早就整个删掉了（工具图案全改粒子），那句话是死引用。
+//   点火现在的视觉是**火焰粒子**：手里的火苗见 world._emitOneParticle，
+//   烧着的蝇身上那一路见 world._emitBurnFx。这里没有任何要画的东西

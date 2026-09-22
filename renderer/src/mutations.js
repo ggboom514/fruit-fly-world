@@ -167,6 +167,26 @@ export function weightMulOf(list) {
 }
 
 /**
+ * 移动速度倍率（星云 ×2），同样连乘。
+ *
+ * ⚠ 和 valueMulOf / weightMulOf 一样，**在消费点乘**，绝不写进
+ *   `Fly.targetSpeed` / `Larva.speedScale` 那些字段 ——
+ *   那些赋值点有三四处（构造函数、飞 / 走切换、窜的间歇、罐子里、孵化），
+ *   漏一处就会变成「星云蝇在**某些时候**飞得和普通一样快」：
+ *   不报错、不崩，只是某条路径上效果消失了。
+ *   entities.js 里 speedScale / panicMul 那两段注释说的是同一件事
+ */
+export function speedMulOf(list) {
+	if (!Array.isArray(list)) return 1
+	let m = 1
+	for (const id of list) {
+		const t = BY_ID[id]
+		if (t && typeof t.speedMul === 'number') m *= t.speedMul
+	}
+	return m
+}
+
+/**
  * 这组基因是不是「要发光吸引同伴」的那种（点石成金）。
  * 抽出来是因为 world 的光环 pass 每帧都要问一遍
  */
@@ -222,4 +242,4 @@ export function allMutationIds() {
 //   这正是「携带者」该有的样子：自己没显出来，但会传给孩子。
 //
 // · **突变没有位置效应**。现实里基因在染色体上、会连锁，这里每种突变
-//   独立分离。屏幕上一共四种突变，连锁只会让玩家更难看出规律。
+//   独立分离。屏幕上一共五种突变，连锁只会让玩家更难看出规律。

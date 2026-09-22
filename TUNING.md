@@ -66,7 +66,15 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 爬行速度 | `config.js` | `walk.speed` | 58 px/s |
 | 走一阵停一下的节奏 | `config.js` | `walk.boutMin` / `boutMax` / `pauseChance` | 0.7~2.6 秒 / 0.45 |
 | 飞完落地走的概率 | `config.js` | `behavior.landChance` | 0.45 |
-| …闻到食物时落地的概率 | `config.js` | `behavior.landChanceNearFood` | 0.7 |
+| …已经飞到果子跟前时落地的概率 | `config.js` | `behavior.landChanceNearFood` | 0.7 |
+| **离果子多近才算「跟前」** | `config.js` | `behavior.foodLandRadius` | 90 px |
+
+> ⚠ `foodLandRadius` 决定的是**在哪儿落地**，不是要不要落地。
+> 调大到接近 `food.flyScentRadius`（600px）的话，果蝇会在刚闻到味道的那一瞬间
+> 就落地 —— 而那是离果子最远的地方，接下来只能**一路爬过去**。
+> 实测调到 600px 时落点中位 593px、落地后还要爬 10 秒；
+> 90px 时落点中位 83px、爬 1.4 秒就吃上了。
+> `bun run sim` 里有一条断言盯着这个（判据是「落地后还要爬几秒」）。
 
 ## 食物
 
@@ -135,7 +143,7 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 
 | 想改什么 | 字段 | 现在 |
 | --- | --- | --- |
-| 打火机多密 / 火苗多长 | `fx.flameRate` / `flameLife` | 34 颗每秒 / 0.34 秒 |
+| 打火机**手里**多密 / 火苗多长 | `fx.flameRate` / `flameLife` | 34 颗每秒 / 0.34 秒 |
 | 喷火枪（更密更长） | `fx.flameRateBig` / `flameLifeBig` | 62 颗每秒 / 0.5 秒 |
 | 扫帚空转 / 真扫 | `fx.broomIdleRate` / `broomRate` / `broomLife` | 5 / 26 颗每秒 / 0.6 秒 |
 | 喷水枪空转 / 真喷 | `fx.squirtIdleRate` / `squirtRate` / `squirtLife` | 12 / 78 颗每秒 / 0.45 秒 |
@@ -163,26 +171,79 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 罐中飞得多快 | `config.js` | `jar.flySpeedMin` / `Max` | 60 ~ 150 px/s |
 | 尸体多久开始掉价 / 掉多久 | `config.js` | `roast.decayStartMs` / `decaySpanMs` | 5 分钟后开始，15 分钟掉到底 |
 | 掉到几成 | `config.js` | `roast.decayTo` | 0.1（剩一成） |
-
-> ⚠ **炉子和打火机是两条不同的路**，改的时候别串了：
->
-> | | 打火机 / 喷火枪 | 烤炉（lv3） |
-> | --- | --- | --- |
-> | 输入 | 地上已有的**尸体** | 手套抓 **5 只活蝇**塞进去 |
-> | 操作 | 拿着工具**碰到**就熟 | 装满**自动**开烤，等进度条 |
-> | 产出 | 一具烤好的尸体，**要自己拖去出售区** | **直接到账**，地上不留东西 |
-> | 掉价 | 吃 `decayStartMs` 那 5 分钟宽限 | 不吃 —— 没有等待期 |
->
-> 炉子那条改造过：以前它也是往地上掉 5 具烤好的尸体，玩家还得一只只捡去卖，
-> 等于「点一次开烤」后面跟着五次重复劳动。现在它的定位是**省事**。
-| 烤炉尺寸 / 装几只 / 最多几个 | `config.js` | `roast.oven` | — |
-| 烤炉进度条粗细 / 离边多远 | `config.js` | `roast.oven.barHeight` / `barInset` | 6 px / 10 px |
-| 进度条颜色 | `config.js` | `roast.oven.barColor` / `barTrackColor` | 橙 `#ffb454` / 半黑底槽 |
-| 卖出金额飘多久 / 飘多快 | `config.js` | `roast.oven.float.life` / `rise` | 1.5 秒 / 34 px/s |
-| 一炉多个数字错开多久 | `config.js` | `roast.oven.float.delayStep` | 110 ms（第 n 只延后 n× 这个） |
-| 飘字颜色 / 字号 | `config.js` | `roast.oven.float.color` / `font` | 金色 `#ffd76a` / 粗体 12px |
 | 尸体 / 污渍多久烂透 | `config.js` | `remains.rotTime` / `rotTimeStain` | 6 / 4 分钟 |
 | 擦新鲜 / 擦烂的要多用力 | `config.js` | `wipeScrubFresh` / `wipeScrubRotten` | 70 / 300 px |
+
+## 点火（打火机 / 喷火枪）
+
+⚠ **从 1.18.0 起，这两把烧的是活着的成虫**，不再是地上的尸体。
+碰一下就点着 → 带着火焰惊慌乱飞 → 烧满时长后**自动按倍率卖掉**，不留尸体。
+
+| 想改什么 | 文件 | 字段 | 现在 |
+| --- | --- | --- | --- |
+| 打火机烧多久 / 倍率 / 价格 | `config.js` | `market.roastChain[0].burnMs` / `.mul` / `.price` | 5 秒 / ×1.2 / $3 |
+| 喷火枪同上 | `config.js` | `market.roastChain[1]` 同名三个字段 | 3 秒 / ×1.5 / 再 $8 |
+| 判定「指针底下有活蝇」的半径 | `config.js` | `market.roastChain[].pickRadius` | 打火机 26 px / **喷火枪 60 px** |
+| 烧着的蝇有多慌 | `config.js` | `roast.burnPanicMul` | 2.4（乘在挥手受惊之上） |
+
+> ⚠ `burnMs` 是**烧多久**（不是「按住多久」）。按住只是「一路扫过去」，
+> 每只只吃一次倍率由 `world.ignite` 里的判重保证 —— 反复蹭同一只**不会**刷新倒计时。
+>
+> ⚠ `pickRadius` 是**按档**的，不是共用一个：喷火枪「有一小圈范围」就是靠
+> 它比打火机大一圈表达的。读数走 `world.burnRadiusFor(tool)`，
+> **按手里那把查、不是按等级**（买到喷火枪之后回头拿打火机，半径要跟着手里那把走）。
+>
+> ⚠ 两把枪**都是单目标**（只点着半径内最近的那一只），不是「圈里全烧」。
+> 想改成范围攻击：`ui._useTool` 里那一行换成遍历 `world.flies` 收集再逐个
+> `ignite` —— 但那样喷火枪会变成清屏工具，倍率得一起重调。
+>
+> ⚠ 想加第三档点火器：`roastChain` 里加一条 + `index.html` 里加一颗
+> `data-tool` 按钮 + `ui.refreshToolButtons` 里补一对映射。三处都要，漏了不报错。
+
+## 烤炉
+
+| 想改什么 | 文件 | 字段 | 现在 |
+| --- | --- | --- | --- |
+| 价格（在**投放 → 其他**里买） | `config.js` | `market.prices.oven` | $5 |
+| 尺寸 / 装几只 / 最多几个 | `config.js` | `roast.oven.width` / `height` / `capacity` / `maxCount` | 150×108 / 5 只 / 3 个 |
+| **每只**烤多久 / 倍率 | `config.js` | `roast.oven.roastMs` / `mul` | 8 秒 / ×1.8 |
+| 进度条尺寸 / 画在虫上方多高 | `config.js` | `roast.oven.barWidth` / `barHeight` / `barOffsetY` | 20×3 px / 往上 7 px |
+| 进度条颜色 | `config.js` | `roast.oven.barColor` / `barTrackColor` | 橙 `#ffb454` / 半黑底槽 |
+| 同一帧出锅的多个数字错开多久 | `config.js` | `roast.oven.float.delayStep` | 110 ms（第 n 只延后 n× 这个） |
+
+> ⚠ 从 1.21.0 起炉子是**每只各自计时、各自到账**：放进去就开始烤，
+> 谁先烤满谁先冒钱走人，**不用等装满**。
+> 所以 `roastMs` 是**单只**的时长，不是整炉的；`delayStep` 只在
+> 「同一帧里恰好有好几只同时烤满」时才起作用（连着拖进去的、或者存档读回来的）。
+>
+> ⚠ 每只的状态挂在**虫身上**（`Fly.roastLeft` / `roastTotal`），不在炉子上 ——
+> 炉子级的 `roastTimer` / `roastTotal` 已经删了。`roastLeft` 用 **null** 表示
+> 「没在烤」，**不是 0**：0 是「这一帧刚好烤满、该结账了」那个瞬间的值，
+> 两者混起来的话结算那一帧分不出「刚烤好的」和「压根没进过炉子的」。
+
+## 卖出金额的飘字（炉子 / 烧蝇共用）
+
+| 想改什么 | 文件 | 字段 | 现在 |
+| --- | --- | --- | --- |
+| 飘多久 / 飘多快 | `config.js` | `floatText.life` / `rise` | 1.5 秒 / 34 px/s |
+| 颜色 / 字号 / 描边 | `config.js` | `floatText.color` / `font` / `stroke` | 金色 `#ffd76a` / 粗体 12px |
+| 屏幕上最多同时挂几个 | `config.js` | `floatText.maxCount` | 60 |
+
+> ⚠ 这几项**故意放在顶层**，不在 `roast.oven` 里 —— 炉子和点火两条路都在用，
+> 挂在炉子下面的话，改炉子飘字颜色会莫名其妙改到烧蝇。
+
+> ⚠ **点火器和烤炉是两条不同的路**，改的时候别串了：
+>
+> | | 打火机 / 喷火枪 | 烤炉 |
+> | --- | --- | --- |
+> | 输入 | 场上**活着的成虫**（碰到就点着） | 手套抓 **5 只活蝇**塞进去 |
+> | 操作 | 拿工具**扫过去**，一只一只点 | 装满**自动**开烤，等进度条 |
+> | 产出 | 每只**单独**结账，一边烧一边冒钱 | **整炉一起**结账 |
+> | 掉价 | 不吃 —— 没有等待期 | 不吃 |
+>
+> ⚠ **地上的尸体两条路都不认**。它现在只能按原价卖掉、或者拿抹布擦掉。
+> 那套「拿打火机烤尸体、再拖去出售区」的玩法在 1.18.0 整个取消了 ——
+> `Remains` 上的 `roasted` / `roastMul` 两个字段也一起删了。
 
 ## 钱和商品
 
@@ -198,7 +259,8 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 烤制链每级价格 | `config.js` | `market.roastChain[]` | — |
 | 养蝇人两级价格 | `config.js` | `market.keeperChain[]` | $2 → $5 |
 | 养蝇人配置项 | `config.js` | `market.keeperOptions` | 投什么 / 投几个 / 卖哪档 / 多久查一次 |
-| 投放单价 | `config.js` | `market.prices` | 苹果 $0.001 / 金苹果 $0.01 / 投蝇 $0.005 |
+| 投放单价 | `config.js` | `market.prices` | 苹果 $0.001 / 金苹果 $0.01 / 星空苹果 $1 / 投蝇 $0.005 |
+| 罐子要点几下才解锁星空苹果 | `config.js` | `easterEgg.tapsToUnlock` | 10 |
 | 放大镜勾哪几档才高光 | `config.js` | `market.magnifier.tiers` | `rare` / `epic` / `legendary` / `mythic` |
 
 > 放大镜那一项是**多选**：六档价值档各一颗按钮，勾哪几档就亮哪几档，一档不勾也允许
@@ -214,12 +276,22 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 
 | 想改什么 | 文件 | 字段 | 现在 |
 | --- | --- | --- | --- |
-| 各突变的**新发**概率和效果 | `config.js` | `mutation.types[]` | 疯狂 2.9% / 点石成金 3% / 石化 2% / 结晶 1.1% |
+| 各突变的**新发**概率和效果 | `config.js` | `mutation.types[]` | 疯狂 2.9% / 点石成金 3% / 石化 2% / 结晶 1.1% / 星云 **0** |
 | 遗传率 | `config.js` | `mutation.inheritChance` | 0.2（单方这一路 20%、双方 36%） |
+| 幼虫吃星空苹果长出星云的概率 | `config.js` | `mutation.nebulaFromStar` | 0.1 |
+| 星云的价值 / 速度倍率 | `config.js` | `mutation.types[]` 里 nebula 那条 | `valueMul: 1.2` / `speedMul: 2` |
 
 > 「新发」是每颗卵自己骰的、和父母无关；「遗传」是父母带了的往下一代传。
 > **子代最终带上某个突变的概率是两条路取并集** —— 所以实测是单方约 22%、
 > 双方约 38%，比上面那两个数各高一点（高出来的是新发那一路）。
+>
+> ⚠ **星云是这条规律唯一的例外**：它的 `chance` 是 **0**（不在新发抽奖池里），
+> 所以实测正好是干净的 20% / 36%。它唯一的来源是**幼虫吃星空苹果**，
+> 每只幼虫一辈子只骰一次（见 `world._updateFeeding`）。
+> 拿到之后**照常能遗传**，和别的突变没区别。
+>
+> ⚠ 别顺手把 `chance: 0` 删掉 —— 删了是 `undefined < x` 恒为 false，照样能跑，
+> 但下一个人得自己琢磨「这是本意还是巧合」。sim 里有两条断言钉着它。
 
 > 每个突变的效果就是它自己那个对象的几个字段：`valueMul`（售价倍率）、`weightMul`（体重倍率）、`lifespanMul`（寿命倍率）、`adultDamageMin/Max`（疯狂咬人）…… 改数值不用动 `mutations.js`。
 
@@ -245,7 +317,8 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | `market.rarity[].id` | 存档里存的是这些 id。名字（`name`）随便改，id 改了老存档会对不上（不会崩，但设置会丢） |
 | `market.valueTiers[].id` | 同上 —— 养蝇人「卖哪档」存的就是它 |
 | `mutation.types[].id` | 基因名，存档里存着 |
-| `food.types` | 只有 `apple` 一项，**金苹果是刻意不在里面的**（它走另一条路）。往里加会同时影响投放区和价格表 |
+| `food.types` | 只有 `apple` 一项，**金苹果和星空苹果是刻意不在里面的**（它们走另一条路，只能花钱买）。往里加会同时影响投放区和价格表，还会**白送彩蛋** —— sim 里有两条断言分别钉着这两样 |
+| `renderer/assets/star-nebula.png` | 星云贴图，**打包的硬依赖**（`package.json` 的 `files` 里那个 `renderer/**/*` 覆盖到了）。谁要是把 glob 收窄了，失败形态是**静默 404**：不报错、不抛，只是星空苹果变成一块纯紫果肉 —— 看着像美术选择 |
 | `main.js` 的自检 | 那一大段住在模板字符串里，**里面不能出现反引号或 `${`** —— 混进去会让整个文件加载失败、自检静默挂住，屏幕上只开出一个空窗口 |
 | `tools.fx` 里的 `Life` 系列 | 单位是**毫秒**。写成秒（`0.34`）不会报错，只会让那个特效整个看不见 |
 | `body.tool-active` 这个 CSS 类 | **不要加回来**。它配的 CSS 是 `cursor: none`，而自绘的工具光标已经全删了 —— 加回来会让拿着工具时屏幕上**一个指针都没有**。自检里有一条断言专门盯着这个 |
@@ -284,3 +357,31 @@ bun run selftest   # 真的开一个窗口把 UI 跑一遍；读写的是 save.s
 | 突变怎么遗传、怎么叠加 | `renderer/src/mutations.js` |
 | 存档格式 | `renderer/src/save.js` |
 | 窗口、托盘、鼠标穿透 | `main.js` |
+
+---
+
+## 界面上的文案在哪改
+
+### ⚠ 先记住这一条：**大部分说明文字不在任何「文案文件」里，是现算的**
+
+因为写死的文案改了数值就会变成假话，而图鉴正是玩家拿来「查这个世界有什么」的地方。
+所以查到某句说明时，先想一下它是不是从 `config.js` 拼出来的 —— 是的话，
+**改 config 里的数值/名字，那句话自动跟着变**，不用动界面代码。
+
+| 想改什么 | 文件 | 位置 |
+| --- | --- | --- |
+| **图鉴**分几组、组名（「食物」「基因」） | `renderer/src/ui.js` | `refreshCodex()` |
+| 图鉴里食物那格的名字 | `renderer/src/ui.js` | `_codexFoodCell()` 里的 `name.textContent` |
+| 图鉴里食物那格的说明（价格 · 成长 ×N） | —— | **现算**，改 `config.js` 的 `market.prices.food` / `food.growthBonus` |
+| 图鉴里基因胶囊上的字（⚡ 疯狂） | —— | **现算**，改 `config.js` 的 `mutation.types[].icon` / `.name` |
+| 图鉴里基因那格的效果句 | `renderer/src/ui.js` | `_mutationEffect()` ← 纯措辞只有这里要手改 |
+| 图鉴里基因那格的概率行 | `renderer/src/ui.js` | `_codexGeneCell()` 里的 `desc.textContent` |
+| 工具按钮的**显示名**和**悬停提示** | `renderer/index.html` | 每颗 `<button class="tool" data-tool="…" title="…">显示名</button>` |
+| 工具面板那行的快捷键总提示 | `renderer/index.html` | `fold-toggle id="btn-tools"` 的 `title` |
+| 烤制按钮的名字和提示 | —— | **现算**，改 `config.js` 的 `roastChain[].name` / `.desc`；「点一下摆一个 / 按住烤」那句后缀在 `ui.js` 的 `refreshToolButtons()` |
+| 商店里每件商品的说明 | `config.js` | `market.shop[].desc`、`roastChain[].desc`、`keeperChain[].desc` |
+| 操作失败时的提示条 | `renderer/src/ui.js` | 搜 `_flashHint(` —— 例如「抹布要按住来回滑动才擦得掉」 |
+
+> 加一件新工具时，**三个地方都要动**：`index.html` 里加按钮、
+> 那行快捷键总提示补一个键、`ui.js` 的 `_onKey` 里加一个 `case`。
+> 漏掉哪个都不会报错，只是那个入口不存在。
