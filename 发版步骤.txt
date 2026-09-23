@@ -143,10 +143,14 @@ version.json：
 
 
 ------------------------------------------------------------
-第 7 步 · 传网盘
+第 7 步 · 传两个地方
 ------------------------------------------------------------
 
-把这四个拖进夸克：
+下载有**两条路**，主推夸克（国内快），GitHub Releases 当备用。
+
+=== 7a 夸克网盘（主）===
+
+把这四个拖进夸克的分享文件夹：
 
     dist\FruitFlyWorld-Setup-1.29.0.exe            安装版（推荐）
     dist\FruitFlyWorld-Setup-1.29.0.exe.blockmap   增量差分包
@@ -159,6 +163,28 @@ version.json：
 ⚠ blockmap 现在没用上，但**别省**：少传了以后想加增量更新就只能重传全部历史版本。
 
 ⚠ **不要传 win-unpacked\ 和 builder-*.yml**，那是中间产物，白让人多下几百 MB。
+
+⚠ **如果夸克的分享链接变了**（删了重建、或者换了文件夹，链接就会变）：
+   第 4 步那条 `bun run manifest` 要用**新链接**重跑一遍，
+   否则玩家的「去下载」还开着旧地址。改完 push + 催缓存，就这两下。
+
+=== 7b GitHub Releases（备用）===
+
+浏览器打开：
+
+    https://github.com/ggboom514/fruit-fly-world/releases/new
+
+1. Choose a tag 里输入 v1.29.0 → 点「Create new tag: v1.29.0 on publish」
+2. Release title 填：果蝇世界 1.29.0
+3. 描述框里写这一版改了什么（可以直接抄清单里那句 note）
+4. 把下面三个文件拖进最下面「Attach binaries」那个框：
+     dist\FruitFlyWorld-Setup-1.29.0.exe
+     dist\FruitFlyWorld-Setup-1.29.0.exe.blockmap
+     dist\FruitFlyWorld-1.29.0.exe
+5. 点 Publish release
+
+⚠ 要传 220MB 左右，可能等几分钟。
+⚠ 说明.txt **不用**传这里 —— Release 页面自己就是说明。
 
 ⚠ 旧版本的安装包可以从 dist\ 里删掉，也可以留在网盘上（老链接别急着删，
    万一有人还在下）。
@@ -259,5 +285,9 @@ version.json：
     # 6. 浏览器打开一次，催缓存
     #    https://purge.jsdelivr.net/gh/ggboom514/fruit-fly-world@main/version.json
 
-    # 7. 传网盘：Setup.exe + .blockmap + 说明.txt + 免安装.exe
-    #    （version.json 不传）
+    # 7. 传两个地方
+    #    夸克网盘（主）：Setup.exe + .blockmap + 说明.txt + 免安装.exe
+    #    GitHub Releases（备用）：
+    #      https://github.com/ggboom514/fruit-fly-world/releases/new
+    #      tag 填 v1.29.0，拖三个安装文件进去（说明.txt 不用）
+    #    （version.json 哪儿都不传）

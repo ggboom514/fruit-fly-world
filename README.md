@@ -10,12 +10,26 @@
 
 ## 下载玩
 
-到 [**Releases**](../../releases) 页面下载最新的：
+**主下载 —— 夸克网盘**（国内快，推荐）
+
+> <https://pan.quark.cn/s/f3b6f346c0dd?pwd=3Y1D>
+
+**备用 —— GitHub Releases**（夸克打不开时，或者你在海外时用）
+
+> <https://github.com/ggboom514/fruit-fly-world/releases>
+
+两个地方放的是**同一份文件**：
 
 | 文件 | 说明 |
 | --- | --- |
 | `FruitFlyWorld-Setup-x.y.z.exe` | 安装版。可以自己选安装目录，会建桌面和开始菜单快捷方式 |
 | `FruitFlyWorld-x.y.z.exe` | 免安装版。双击就跑，不写注册表 |
+
+> ⚠ GitHub 的下载在国内经常很慢甚至断，所以主推夸克。
+> 游戏里那颗「去下载」按钮打开的也是**夸克**（地址写在 `version.json` 里）。
+>
+> ⚠ 夸克分享链接**换过一次**。要是哪天主链接失效了，看下面
+> 「换下载链接，但不想重新打包」—— 改 `version.json` 就行，不用重发安装包。
 
 ### 怎么知道有没有新版本
 
@@ -321,18 +335,27 @@ bun run dist
 
 分两件事：**把安装包传上去**，和**告诉老玩家有新版本**。
 
-#### ① 传什么
+#### ① 传什么、传到哪
+
+传**两个地方**：
+
+- **夸克网盘**（主）：直接拖进分享文件夹，然后把分享链接复制出来
+- **GitHub Releases**（备用）：`https://github.com/ggboom514/fruit-fly-world/releases/new`
+  → 填 tag（比如 `v1.29.0`）→ 把下面三个文件拖进「Attach binaries」→ Publish
 
 | 文件 | 要不要传 | 说明 |
 | --- | --- | --- |
 | `FruitFlyWorld-Setup-x.y.z.exe` | ✅ | 安装版，大多数人下这个 |
 | `FruitFlyWorld-Setup-x.y.z.exe.blockmap` | ✅ | 增量更新的差分文件。现在没用上，但少传了以后想加会**只能重传全部历史版本** |
 | `FruitFlyWorld-x.y.z.exe` | ✅ | 免安装版，给不想装的人 |
-| `说明.txt` | ✅ | 仓库根目录那份，给下载的人看的 |
+| `说明.txt` | ✅ | 仓库根目录那份，给下载的人看的。⚠ 网盘要传，**Releases 不用**（Release 页面自己就是说明） |
 | `win-unpacked/`、`builder-*.yml` | ❌ | 中间产物，传上去只是让人多下几百 MB |
 
-> ⚠ **`version.json` 不传网盘。** 它是给**程序**抓的，而网盘不给程序抓 ——
-> 它要待在 git 仓库里，走 raw 链接。见下一节。
+> ⚠ **`version.json` 哪儿都不传。** 它是给**程序**抓的，而网盘不给程序抓 ——
+> 它要待在 git 仓库里，走 CDN 链接。见下一节。
+>
+> ⚠ 网盘分享链接**换过一次**（`0e1344d09eba` → `f3b6f346c0dd`）。换链接之后
+> 记得重新跑一次 `bun run manifest`，否则玩家的「去下载」还开着旧链接。
 
 #### ② 更新检查怎么工作
 
