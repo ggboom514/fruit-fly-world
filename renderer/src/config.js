@@ -1843,7 +1843,7 @@ export const CONFIG = {
 		//   换网盘链接时正常只需要改 version.json 里的 url（那条不用重新打包），
 		//   这里跟着改只是为了让**下次打包**不带旧地址。
 		//   它平时根本用不上 —— 清单里永远有 url，游戏优先用清单里那个
-		downloadPage: 'https://pan.quark.cn/s/f3b6f346c0dd?pwd=3Y1D',
+		downloadPage: 'https://pan.quark.cn/s/ada296ba0615?pwd=ahH3',
 
 		// 启动后**静默**查一次。查不到就算了，不弹任何东西 ——
 		// 桌宠启动时弹一个「检查更新失败」是最讨人厌的做法

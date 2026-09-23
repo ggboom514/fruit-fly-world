@@ -12,7 +12,7 @@
 
 **主下载 —— 夸克网盘**（国内快，推荐）
 
-> <https://pan.quark.cn/s/f3b6f346c0dd?pwd=3Y1D>
+> <https://pan.quark.cn/s/ada296ba0615?pwd=ahH3>
 
 **备用 —— GitHub Releases**（夸克打不开时，或者你在海外时用）
 
