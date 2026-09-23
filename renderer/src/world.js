@@ -145,7 +145,39 @@ export class World {
 		this.magnifierTiers = magnifierDefaultTiers()
 
 		this.stats = this._freshStats()
+
+		/**
+		 * 这一局里**出现过**的突变 id（图鉴拿它决定哪一格点亮）。
+		 *
+		 * ⚠ 名字叫 seen 而不是 owned：一只带「疯狂」的虫只要**出生**过就算数，
+		 *   哪怕它当场就被同类咬死 —— 图鉴记的是「这个世界里有这种东西」，
+		 *   不是「你现在养着一只」。
+		 *
+		 * ⚠ **不是世界状态，不进 serialize()**（那份字段表是手写的，不加就进不去）。
+		 *   它的真身在 UI 那边、落在 unlock.json 里，因为「见过」要跨得过
+		 *   「重新开始」。这里只是个**当场的收件箱**：世界往里丢，
+		 *   app.js 每帧把它抽干、交给 ui 去合并和落盘
+		 *
+		 * ⚠ 必须是普通 Array，不能是 Set —— 同 config.js 里那条注释
+		 *
+		 * ⚠ 也**不在 reset() 里清**：它是「本场运行观察到的事件」，
+		 *   和这一局养了什么没关系。清的话，重置那一瞬间还没被抽干的记录会丢
+		 */
+		this.seenGenes = []
+
 		this.reset()
+	}
+
+	/**
+	 * 记下「这些基因在这个世界里出现过」。认不出来的 id 照收 ——
+	 * 过滤是 UI 那边的事（它只管点亮配置里存在的格子）。
+	 */
+	_noteGenes(genes) {
+		if (!Array.isArray(genes)) return
+		for (const id of genes) {
+			if (typeof id !== 'string' || !id) continue
+			if (!this.seenGenes.includes(id)) this.seenGenes.push(id)
+		}
 	}
 
 	/**
@@ -329,6 +361,9 @@ export class World {
 		if (this.atPopCap) return null
 		const f = new Fly(x, y, sex, rarity, mutations)
 		this.flies.push(f)
+		// ⚠ 在撞上限的 early return **之后**才记：没真正生出来的不算「见过」。
+		//   这一句是成虫的唯一入口，买来的 / 网进罐子的 / 开局那几只都从这里过
+		this._noteGenes(f.mutations)
 		return f
 	}
 
@@ -354,6 +389,7 @@ export class World {
 		if (this.atPopCap) return null
 		const l = new Larva(x, y, shape, clutch, mutations)
 		this.larvae.push(l)
+		this._noteGenes(l.mutations) // 同上：幼虫也带基因，见 addFly 那段
 		return l
 	}
 
@@ -371,6 +407,9 @@ export class World {
 		const e = new Egg(x, y, scale, shape, clutch, hatchBase, mutations)
 		this.eggs.push(e)
 		this.stats.eggsLaid++
+		// 卵也算 —— 「养成过」包括了还没孵出来的那一段。
+		// 不放这一句的话，一窝刚产下就被吃掉的卵会整窝漏记
+		this._noteGenes(e.mutations)
 		return e
 	}
 
@@ -1244,6 +1283,10 @@ export class World {
 					l.starRolled = true
 					if (!hasMutation(l.mutations, 'nebula') && Math.random() < CONFIG.mutation.nebulaFromStar) {
 						l.mutations = [...l.mutations, 'nebula']
+						// ⚠ 这里也要记一笔：星云是**在一只已经存在的幼虫身上现场长出来的**，
+						//   不走 addLarva / spawnEgg 那三个入口。漏了这一句的后果很隐蔽 ——
+						//   玩家吃出星云、图鉴那一格却还是灰的，看起来像「彩蛋坏了」
+						this._noteGenes(l.mutations)
 					}
 				}
 			}

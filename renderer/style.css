@@ -158,13 +158,16 @@ body.dragging * {
  *   所以 pointer-events: auto，而且**不能**像 #starfield 那样铺满整屏：
  *   铺满整屏的图层一旦吃掉鼠标，桌面点击会整个没反应
  *
- * 位置钉在右下角（任务栏正上方）。样式照 .jar-window 那一套 ——
- * 半透明 + 描边 + backdrop-filter，一眼看得出是同一套 UI
+ * 样式照 .jar-window 那一套 —— 半透明 + 描边 + backdrop-filter，
+ * 一眼看得出是同一套 UI。
+ *
+ * ⚠ 位置**不在这里写**（原来写的是 right/bottom），left/top 全交给
+ *   ui._placeHandle()。它是可拖的，而 fixed 元素同时给了 right 和 left
+ *   会按「过约束」规则丢掉一个 —— 表现是拖动时跳一下，很难查。
+ *   默认位置（右下角）现在由 _defaultHandlePos() 算
  */
 .panel-handle {
 	position: fixed;
-	right: 14px;
-	bottom: 14px;
 	z-index: 26;
 	display: flex;
 	align-items: center;
@@ -2300,6 +2303,38 @@ body.booting .inspect {
 /* 突变格子里那枚胶囊（.gene-badge）自己带颜色，这里只保证它不被挤扁 */
 .codex-cell .gene-badge {
 	flex: none;
+}
+
+/*
+ * 还没拿到的那几格（没解锁的星空苹果、还没养出来过的突变）。
+ *
+ * ⚠ 说明文字那两行的「？？？」是 **JS 写上去的**，不是 CSS 藏的 ——
+ *   display:none 掉的话格子会矮一截，网格里一整行跟着变高变矮。
+ *   这里只负责**颜色**。
+ *
+ * ⚠ 图标和胶囊只能靠 `filter: grayscale()` 盖：胶囊的颜色是
+ *   _codexGeneCell 内联写上去的（style.color / borderColor），
+ *   在 CSS 里改 color 是盖不过内联样式的。filter 作用在渲染结果上，
+ *   内联色也一起被去色 —— 这是唯一盖得住的办法
+ */
+.codex-cell.locked {
+	background: rgba(255, 255, 255, 0.02);
+}
+
+.codex-cell.locked .codex-name {
+	color: rgba(230, 224, 214, 0.42);
+}
+
+.codex-cell.locked .codex-desc {
+	color: rgba(200, 190, 175, 0.3);
+}
+
+.codex-cell.locked .codex-icon {
+	filter: grayscale(1) opacity(0.35);
+}
+
+.codex-cell.locked .gene-badge {
+	filter: grayscale(1) opacity(0.5);
 }
 
 /*

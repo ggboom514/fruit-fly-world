@@ -379,6 +379,9 @@ bun run selftest   # 真的开一个窗口把 UI 跑一遍；读写的是 save.s
 | 图鉴里基因胶囊上的字（⚡ 疯狂） | —— | **现算**，改 `config.js` 的 `mutation.types[].icon` / `.name` |
 | 图鉴里基因那格的效果句 | `renderer/src/ui.js` | `_mutationEffect()` ← 纯措辞只有这里要手改 |
 | 图鉴里基因那格的概率行 | `renderer/src/ui.js` | `_codexGeneCell()` 里的 `desc.textContent` |
+| 图鉴里**没拿到**那两行占位符（？？？）、以及置灰的样式 | `renderer/src/ui.js` / `renderer/style.css` | 常量 `CODEX_HIDDEN`，样式 `.codex-cell.locked` |
+| 图鉴里食物有几格 | —— | **现算**，改 `config.js` 的 `market.feedCats` 里 `id: 'food'` 那组的 `items`（`ui._allFoodIds()`） |
+| 图鉴里基因的**点亮条件** | `renderer/src/ui.js` | `seenGene()` ← 突变是「出生过」，食物是 `starUnlocked` |
 | 工具按钮的**显示名**和**悬停提示** | `renderer/index.html` | 每颗 `<button class="tool" data-tool="…" title="…">显示名</button>` |
 | 工具面板那行的快捷键总提示 | `renderer/index.html` | `fold-toggle id="btn-tools"` 的 `title` |
 | 烤制按钮的名字和提示 | —— | **现算**，改 `config.js` 的 `roastChain[].name` / `.desc`；「点一下摆一个 / 按住烤」那句后缀在 `ui.js` 的 `refreshToolButtons()` |

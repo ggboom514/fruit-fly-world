@@ -51,6 +51,14 @@ const FEED_QUANTITIES = [1, 10]
  */
 const FOOD_NAME = { apple: '苹果', gold: '金苹果', star: '星空苹果' }
 
+/**
+ * 图鉴里灰格子拿来说明那两行占位符。
+ *
+ * ⚠ 抽成常量而不是就地写三遍字面量：自检要断言「灰格里没有数字和百分号」，
+ *   它得能引用**同一份**字符串，不然改一个字（？→ ?）断言就会假绿
+ */
+const CODEX_HIDDEN = '？？？'
+
 export class UI {
 	/**
 	 * @param {import('./world.js').World} world
@@ -99,6 +107,16 @@ export class UI {
 		 *   别各自去翻存档 —— 两份状态总有一天会变成「图鉴里有、投放里没有」
 		 */
 		this._starUnlocked = false
+		/**
+		 * 已经**见过**的突变 id。图鉴拿它决定哪一格是亮的。
+		 *
+		 * 和 `_starUnlocked` 一样是**跨局**状态：落在 unlock.json 里，
+		 * 点「重新开始」不会清掉。真值来源是这里，外面只准通过
+		 * `seenGene(id)` 读
+		 *
+		 * ⚠ 用普通数组不用 Set —— 同 world.js / config.js 里那两条注释
+		 */
+		this._seenGenes = []
 		/**
 		 * 这一轮连点了几下捐款罐子。**只在内存里** ——
 		 * 它问的是「刚才连点了几下」，跨会话记住没有意义
@@ -153,6 +171,16 @@ export class UI {
 		this._jarPos = null
 		this._jarPlaced = null // 上一次真正写进 style 的位置，没变就不碰 DOM
 		this._jarSkipClick = false // 刚拖完，下一次 click 不算「点标题条」
+
+		// 收起之后那个把手的位置。null = 还没摆过，_placeHandle 会给个默认（右下角）。
+		//
+		// ⚠ 和上面那两个不同，这一个**会存进 `world.settings.handlePos`**
+		//   —— 玩家特意把把手拖开，多半是因为右下角挡着他别的东西，
+		//   下次启动又弹回原地等于白拖。它不影响模拟，所以放在 settings 里
+		//   最省事：那条持久化管道本来就是现成的，不用为一块界面状态新开文件
+		this._handlePos = null
+		this._handlePlaced = null // 上一次真正写进 style 的位置，没变就不碰 DOM
+		this._handleSkipClick = false // 刚拖完，下一次 click 不算「点一下叫回面板」
 
 		this._cacheDom()
 		this._bindEvents()
@@ -299,13 +327,23 @@ export class UI {
 
 		// —— 窗口控制 ——
 		this.el.btnMin.addEventListener('click', () => this.setPanelAway(true))
-		// 收起之后右下角那个把手：点一下叫回来。
+		// 收起之后那个把手：点一下叫回来。
 		//
-		// ⚠ 用 click 而不是 mouseenter —— 鼠标扫过屏幕右下角（关窗口、点托盘）
+		// ⚠ 用 click 而不是 mouseenter —— 鼠标扫过屏幕角落（关窗口、点托盘）
 		//   是常事，扫一下就弹一整个面板出来会很烦
-		this.el.handle.addEventListener('click', () => this.setPanelAway(false))
+		//
+		// ⚠ 把手上**还挂着拖动**（_enableHandleDrag），所以拖完那一下不算点击，
+		//   否则把把手挪个位置就会顺手把面板叫回来。和 jarHead 是同一套写法
+		this.el.handle.addEventListener('click', () => {
+			if (this._handleSkipClick) {
+				this._handleSkipClick = false
+				return
+			}
+			this.setPanelAway(false)
+		})
 		this._enableDrag()
 		this._enableJarDrag()
+		this._enableHandleDrag()
 
 		this.el.top.addEventListener('click', () => window.pet?.toggleAlwaysOnTop())
 		this.el.through.addEventListener('click', () => window.pet?.toggleClickThrough())
@@ -700,6 +738,10 @@ export class UI {
 		// 把手反过来：收起时才出现
 		this.el.handle.classList.toggle('hidden', !on)
 
+		// ⚠ 必须在**摘掉 .hidden 之后**摆位：display:none 时 offsetWidth 是 0，
+		//   那时候算出来的「右下角」是错的
+		if (on) this._placeHandle()
+
 		// ⚠ 收起 / 展开都会改变「指针底下有没有东西」，必须重新判定要不要接管鼠标。
 		//   少了这一句，收起之后那一下点击会穿到桌面上；展开之后面板反而点不动
 		this._updateInteractive()
@@ -838,6 +880,114 @@ export class UI {
 		win.style.top = top + 'px'
 	}
 
+	/**
+	 * 拖动「收起面板之后留的那个把手」。
+	 *
+	 * 写法和 _enableJarDrag 一字不差（包括那个 3px 阈值），理由也一样：
+	 * 把手**同时**是一个按钮，手抖一下不该让「点一下叫回面板」失灵。
+	 * 区别只有一个 —— 松手时把位置**存进存档**，见 _rememberHandlePos()。
+	 */
+	_enableHandleDrag() {
+		const el = this.el.handle
+		let dragging = false
+		let moved = false
+		let startX = 0
+		let startY = 0
+		let origLeft = 0
+		let origTop = 0
+
+		el.addEventListener('mousedown', (e) => {
+			if (e.button !== 0) return
+			const r = el.getBoundingClientRect()
+			origLeft = r.left
+			origTop = r.top
+			startX = e.clientX
+			startY = e.clientY
+			dragging = true
+			moved = false
+			document.body.classList.add('dragging')
+			e.preventDefault() // 别让它变成选文字
+		})
+
+		window.addEventListener('mousemove', (e) => {
+			if (!dragging) return
+			if (!moved && Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) < 3) return
+			moved = true
+			this._handlePos = { x: origLeft + (e.clientX - startX), y: origTop + (e.clientY - startY) }
+			this._placeHandle()
+		})
+
+		window.addEventListener('mouseup', () => {
+			if (!dragging) return
+			dragging = false
+			document.body.classList.remove('dragging')
+			// 拖完那一下不算点击 —— 否则挪个位置就会顺手把面板叫回来
+			this._handleSkipClick = moved
+			if (moved) this._rememberHandlePos() // ⚠ 故意打破测试点
+		})
+	}
+
+	/**
+	 * 把把手的位置落进存档。
+	 *
+	 * ⚠ 存进 `world.settings` 而不是新开一个文件：那条管道本来就是给偏好用的
+	 *   （`annoying` 就在里面），而且 serialize / restore 都是现成的，
+	 *   老存档缺这个键也只是拿不到位置、不影响别的。
+	 *   代价是**点「重新开始」会跟着存档一起没**，把手回右下角 —— 见 README
+	 */
+	_rememberHandlePos() {
+		if (!this._handlePos || !this.world) return
+		this.world.settings.handlePos = {
+			x: Math.round(this._handlePos.x),
+			y: Math.round(this._handlePos.y),
+		}
+	}
+
+	/**
+	 * 把把手摆到 this._handlePos，并夹在屏幕内。
+	 *
+	 * 第一次出现时给一个默认位置：**右下角**（就是原来 CSS 里那个 right/bottom），
+	 * 除非存档里有玩家上次拖到的位置 —— 有就用那个。
+	 *
+	 * ⚠ 位置不写死在 CSS 里（那样拖动会和 right/bottom 打架）。
+	 *   这一条和 _placeJarWindow 一样，left/top 全部由这里写。
+	 */
+	_placeHandle() {
+		const el = this.el.handle
+		// ⚠ display:none 时 offsetWidth 是 0，算出来的位置是垃圾 —— 必须挡在前面。
+		//   理由和 _overHandle() 里那一句一模一样
+		if (el.classList.contains('hidden')) return
+
+		const w = el.offsetWidth
+		const h = el.offsetHeight
+		if (!this._handlePos) this._handlePos = this._savedHandlePos() ?? this._defaultHandlePos(w, h)
+
+		const left = clamp(this._handlePos.x, 0, Math.max(0, window.innerWidth - w))
+		const top = clamp(this._handlePos.y, 0, Math.max(0, window.innerHeight - h))
+		if (this._handlePlaced && this._handlePlaced.x === left && this._handlePlaced.y === top) return
+		this._handlePlaced = { x: left, y: top }
+		el.style.left = left + 'px'
+		el.style.top = top + 'px'
+	}
+
+	/** 右下角，也就是加拖动之前 CSS 里那个位置 */
+	_defaultHandlePos(w, h) {
+		return { x: window.innerWidth - w - 14, y: window.innerHeight - h - 14 }
+	}
+
+	/**
+	 * 存档里记下的把手位置。没有 / 被手改坏了都返回 null（退回默认）。
+	 *
+	 * ⚠ 两个分量都要查 `isFinite`：存档是玩家能直接编辑的 JSON，
+	 *   一个 `"x": "abc"` 会让 clamp 算出 NaN，窗口就会跑到一个点不到的地方
+	 */
+	_savedHandlePos() {
+		const p = this.world?.settings?.handlePos
+		if (!p || typeof p !== 'object') return null
+		if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return null
+		return { x: p.x, y: p.y }
+	}
+
 	// ---------------------------------------------------------- 鼠标
 
 	_onMove(e) {
@@ -860,8 +1010,13 @@ export class UI {
 
 	_onDown(e) {
 		if (e.button !== 0) return
-		// 点在工具栏上不算「使用工具」，否则想换工具会先误拍一下
-		if (e.target.closest && e.target.closest('#panel')) return
+		// 点在工具栏上不算「使用工具」，否则想换工具会先误拍一下。
+		//
+		// ⚠ `#panel-handle` 也要一起排除，而它**不在 #panel 里**（收起之后
+		//   #panel 整个 display:none，把手必须活得下去）。漏掉它的症状有两个：
+		//   拿着工具点把手会**顺带用一次工具**；把手底下正好有只虫时，
+		//   点把手会**把它拎起来** —— 两样都不报错，只是手感莫名其妙
+		if (e.target.closest && e.target.closest('#panel, #panel-handle')) return
 
 		// 按在一个「现在拎得动」的东西上 → 把它拎起来。
 		//
@@ -1678,6 +1833,51 @@ export class UI {
 		return !!this._starUnlocked
 	}
 
+	/** 这一格突变点亮了没有（图鉴用）。见过一次就永久算数 */
+	seenGene(id) {
+		return this._seenGenes.includes(id)
+	}
+
+	/**
+	 * 把世界刚观察到的突变并进来。**有新的才落盘**。
+	 *
+	 * 由 app.js 每帧从 `world.seenGenes` 抽干之后调用 —— 世界那边只管攒，
+	 * 不认识 IPC。见 world.js 里 `seenGenes` 那段注释
+	 */
+	noteSeenGenes(ids) {
+		if (!Array.isArray(ids)) return
+		let added = false
+		for (const id of ids) {
+			if (typeof id !== 'string' || !id) continue
+			if (this._seenGenes.includes(id)) continue
+			this._seenGenes.push(id)
+			added = true
+		}
+		if (!added) return
+		this._persistUnlock()
+		if (this.view.codexOpen) this.refreshCodex()
+	}
+
+	/** 启动时按 unlock.json 恢复。**不落盘** —— 刚落盘的正是这份数据 */
+	setSeenGenes(ids) {
+		this._seenGenes = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : []
+	}
+
+	/**
+	 * 把解锁状态整个写下去。**这是唯一的落盘点。**
+	 *
+	 * ⚠ 必须一次把 `star` 和 `seen` **都**发过去：主进程那边是白名单整份覆写，
+	 *   只发一个键的话另一个会被静默抹掉（不报错、不崩，只是图鉴慢慢变空）。
+	 *   所以别再往 `window.pet.saveUnlock` 里塞别的东西 —— 一律走这里
+	 */
+	_persistUnlock() {
+		try {
+			window.pet?.saveUnlock?.({ star: !!this._starUnlocked, seen: this._seenGenes.slice() })
+		} catch (e) {
+			console.error('[unlock] 写解锁状态失败:', e)
+		}
+	}
+
 	/**
 	 * 设置解锁状态。
 	 *
@@ -1690,15 +1890,13 @@ export class UI {
 		if (v === this._starUnlocked) return
 		this._starUnlocked = v
 
-		// 落盘（单独一个小文件，跨得过「重新开始」）。
+		// 落盘（单独一个小文件，跨得过「重新开始」）。走 _persistUnlock，
+		// 由它一起把 seen 也带上 —— 见那个方法上的警告
+		//
 		// ⚠ 不写进 world.settings：那个虽然扛得住「重置」，
 		//   但「重新开始」会把整个存档文件删掉（save.js 里 clear()），
 		//   彩蛋会跟着一起没 —— 而用户要的是「永久解锁」
-		try {
-			window.pet?.saveUnlock?.({ star: v })
-		} catch (e) {
-			console.error('[unlock] 写解锁状态失败:', e)
-		}
+		this._persistUnlock()
 
 		// 罐子的流光配色。⚠ 默认态写在 index.html 的 class="donate locked" 上，
 		// 不是启动时由 JS 补 —— 补的话读到状态之前那一两帧罐子是金色的，
@@ -3089,7 +3287,22 @@ export class UI {
 	 *   的断言会跟着一起漂 —— 而它们恰恰就是用来抓这种漂移的
 	 */
 	unlockedFoodIds() {
-		return CONFIG.market.feedCats[0].items.filter((id) => id !== 'star' || this.starUnlocked)
+		return this._allFoodIds().filter((id) => id !== 'star' || this.starUnlocked)
+	}
+
+	/**
+	 * 配置里**全部**食物 id，不管解没解锁。
+	 *
+	 * 图鉴要的是这一份（没解锁的也画出来、只是置灰），
+	 * 而投放面板要的是上面那份过滤过的 —— 两个用途都合理，所以**
+	 * 谁也别抄谁**：这里出错的表现是「图鉴少一格」或「投放里冒出个买不了的」。
+	 *
+	 * ⚠ 按 `id === 'food'` 找，不写死 `feedCats[0]`：顺序是配置说了算的，
+	 *   哪天有人在前面插一组「装饰品」，下标 0 就不再是食物了
+	 */
+	_allFoodIds() {
+		const cat = CONFIG.market.feedCats.find((c) => c.id === 'food')
+		return cat && Array.isArray(cat.items) ? cat.items.slice() : []
 	}
 
 	/** 按 id 造出投放弹窗里的一行。认不出来返回 null */
@@ -3223,20 +3436,26 @@ export class UI {
 	 *
 	 * 只渲染一次（打开时），内容不会变。
 	 *
-	 * ⚠ 这里**有**一套「解锁」机制，只有一样东西：彩蛋解锁之前的星空苹果
-	 *   和星云基因格都**不出现**。理由是剧透 —— 图鉴一打开就写着「星云：
-	 *   吃星空苹果获得」，彩蛋在第一次开图鉴的时候就没了。
-	 *   所以它们跟着 `unlockedFoodIds()` 一起进来，走的是同一个判据。
+	 * ⚠ **全部都画出来**，包括没解锁 / 没见过的 —— 那些置灰、说明换成「？？？」。
+	 *   见下面两个 cell 构造器里的 `locked`。
+	 *
+	 *   这里原来写的是「未解锁的干脆不渲染」（理由是保护彩蛋）。改成现在这样
+	 *   是因为用户要「图鉴得看得出这个世界一共有多少东西」。剧透改由
+	 *   **藏说明文字**来兜：灰格子留得住「有这么个东西」，
+	 *   留不住「它干什么、怎么拿」。
+	 *
+	 * ⚠ 所以这个列表**不随解锁状态变** —— 解锁只是让格子从灰变亮。
+	 *   自检里那两条「格子数 = 配置里有几项」盯着这一点
 	 */
 	refreshCodex() {
 		const body = this.el.codexBody
 		body.innerHTML = ''
 
-		body.append(this._codexSection('食物', this.unlockedFoodIds(), (id) => this._codexFoodCell(id)))
+		body.append(this._codexSection('食物', this._allFoodIds(), (id) => this._codexFoodCell(id)))
 		body.append(
 			this._codexSection(
 				'基因',
-				CONFIG.mutation.types.map((t) => t.id).filter((id) => id !== 'nebula' || this.starUnlocked),
+				CONFIG.mutation.types.map((t) => t.id),
 				(id) => this._codexGeneCell(id),
 			),
 		)
@@ -3262,14 +3481,27 @@ export class UI {
 		return wrap
 	}
 
-	/** 一格食物：左边画出来，右边名字 + 说明 */
+	/**
+	 * 一格食物：左边画出来，右边名字 + 说明。
+	 *
+	 * 没解锁的（眼下只有星空苹果）照样画，但整格置灰、说明换成「？？？」——
+	 * **名字留着**，玩家得知道图鉴里有这么个位置
+	 */
 	_codexFoodCell(id) {
 		const V = CONFIG.visual
 		if (!V.food[id]) return null // 认不出来的食物类型
 
+		// 只有星空苹果有「拥有」这回事：其余的开局就能买。
+		// ⚠ 判据和投放面板共用 starUnlocked，不另起一套
+		const locked = id === 'star' && !this.starUnlocked
+
 		const cell = document.createElement('div')
 		cell.className = 'codex-cell'
 		cell.dataset.food = id
+		if (locked) {
+			cell.classList.add('locked')
+			cell.dataset.locked = '1'
+		}
 
 		// ⚠ canvas 的**位图尺寸**要乘 dpr，CSS 尺寸由 .codex-icon 给。
 		//   只设属性不设样式的话，高分屏上会显示成一个巨大的方块
@@ -3296,8 +3528,10 @@ export class UI {
 		// ⚠ 成长倍率是**普通食物**之间的区别，星空苹果不吃这一套
 		//   （它的倍率就是 1，写「成长 ×1」等于没说），所以那一种改说真正的用途
 		const bonus = CONFIG.food.growthBonus[id] ?? 1
-		desc.textContent =
-			id === 'star'
+		// ⚠ 灰格连价格都不给：价格本身也是「怎么拿」的一部分
+		desc.textContent = locked
+			? CODEX_HIDDEN
+			: id === 'star'
 				? `${formatMoney(foodPrice(id))} · 幼虫吃了有 ${(CONFIG.mutation.nebulaFromStar * 100).toFixed(0)}% 长出星云`
 				: `${formatMoney(foodPrice(id))} · 成长 ×${bonus}`
 		text.append(name, desc)
@@ -3306,14 +3540,26 @@ export class UI {
 		return cell
 	}
 
-	/** 一格基因：胶囊 + 一句效果说明 + 出现概率 */
+	/**
+	 * 一格基因：胶囊 + 一句效果说明 + 出现概率。
+	 *
+	 * ⚠ 「见过」= 你的世界里**出生过**带这种突变的虫（卵和幼虫都算），
+	 *   见过一次就永久点亮。真值来源是 `seenGene(id)`（存在 unlock.json 里），
+	 *   不是「现在养着几只」
+	 */
 	_codexGeneCell(id) {
 		const t = CONFIG.mutation.types.find((m) => m.id === id)
 		if (!t) return null
 
+		const locked = !this.seenGene(id)
+
 		const cell = document.createElement('div')
 		cell.className = 'codex-cell'
 		cell.dataset.gene = id
+		if (locked) {
+			cell.classList.add('locked')
+			cell.dataset.locked = '1'
+		}
 
 		const badge = document.createElement('span')
 		badge.className = 'gene-badge'
@@ -3325,7 +3571,6 @@ export class UI {
 		text.className = 'codex-text'
 		const name = document.createElement('div')
 		name.className = 'codex-name'
-		name.textContent = this._mutationEffect(t)
 		const desc = document.createElement('div')
 		desc.className = 'codex-desc'
 		// ⚠ 概率那一行只对**会新发**的突变成立。星云的新发概率是 0，
@@ -3334,10 +3579,20 @@ export class UI {
 		//   所以它换一条判据，把来历写明。
 		//   自检里那条配对的断言用的是同一个 t.chance > 0 分支
 		const how = t.adultOnly ? '只在成虫显形' : '幼虫和成虫都显形'
-		desc.textContent =
-			t.chance > 0
-				? `${(t.chance * 100).toFixed(1)}% · ${how}`
-				: `${t.fromStar ? '吃星空苹果获得' : '无法自然获得'} · ${how}`
+		// ⚠ 灰格**两行都换成「？？？」**，不是只藏一行：
+		//   这里上面一行是效果（「价值 ×2」）、下面一行是来历（概率 / 吃星空苹果）。
+		//   两样都是「怎么拿、有什么用」，正是要藏的东西 ——
+		//   留着任何一行，「星云这一格写着 0.0%」就等于把彩蛋写在图鉴里了
+		if (locked) {
+			name.textContent = CODEX_HIDDEN
+			desc.textContent = CODEX_HIDDEN
+		} else {
+			name.textContent = this._mutationEffect(t)
+			desc.textContent =
+				t.chance > 0
+					? `${(t.chance * 100).toFixed(1)}% · ${how}`
+					: `${t.fromStar ? '吃星空苹果获得' : '无法自然获得'} · ${how}`
+		}
 		text.append(name, desc)
 
 		cell.append(badge, text)

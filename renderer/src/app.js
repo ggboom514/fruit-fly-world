@@ -119,6 +119,15 @@ function frame(now) {
 			try {
 				world.update(rawDt)
 				ui.update(rawDt)
+				// 世界这一帧里出生了哪些突变 → 交给 ui 去合并并落盘。
+				//
+				// ⚠ 每帧抽一次，而不是开定时器：长度检查是 O(1)，比一个 timer
+				//   便宜，而且**不会漏掉「刚出生就死掉」的虫** —— 它们可能
+				//   活不过一个定时器的间隔，而图鉴要记的正是「出现过」
+				if (world.seenGenes.length) {
+					ui.noteSeenGenes(world.seenGenes)
+					world.seenGenes.length = 0
+				}
 			} catch (e) {
 				reportFrameError('模拟 / 界面', e)
 			}
@@ -145,6 +154,8 @@ window.addEventListener('resize', () => {
 	// 罐中果蝇小窗的位置是像素坐标，窗口变小之后可能整个跑到屏幕外，
 	// 得夹回来（_placeJarWindow 内部会顺带把结果夹进可视区）
 	ui._placeJarWindow()
+	// 把手同理 —— 它是可以拖到屏幕任何地方的，缩小窗口时更容易整个跑到外面
+	ui._placeHandle()
 })
 
 // 方便在 DevTools 里临时调参数玩：window.__pet.world / .view / .config
@@ -185,6 +196,10 @@ window.__pet = { world, view, renderer, ui, save, config: CONFIG, swatterHeadAt,
 	// ⚠ silent：启动时按已解锁恢复，不该在开程序的那一瞬间放一遍星尘
 	try {
 		const res = await window.pet?.loadUnlock?.()
+		// 见过的突变也在同一个文件里。⚠ 先灌 seen 再设 star：setStarUnlocked
+		// 会走 _persistUnlock 把**两个键一起**写下去，反过来的话
+		// 这一拍会把刚读出来的 seen 用空数组覆盖掉
+		ui.setSeenGenes(res?.data?.seen)
 		ui.setStarUnlocked(!!res?.data?.star, { silent: true })
 	} catch (e) {
 		console.error('[unlock] 读解锁状态失败，按未解锁处理:', e)

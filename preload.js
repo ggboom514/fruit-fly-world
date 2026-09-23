@@ -41,15 +41,22 @@ contextBridge.exposeInMainWorld('pet', {
 	/** 删掉存档（「重新开始」时用） */
 	clearSave: () => ipcRenderer.invoke('pet:clear-save'),
 
-	// —— 彩蛋解锁 ——
+	// —— 跨局进度（彩蛋解锁 + 图鉴见过哪些突变） ——
 	//
 	// ⚠ 和存档**分开两个文件**：存档会被「重新开始」删掉，
-	//   而解锁要跨过那一步。详见主进程里 unlockFile() 那段注释
+	//   而这两样要跨过那一步。详见主进程里 unlockFile() 那段注释
 
-	/** 读解锁状态。没解锁过返回 {ok:true, data:{}} */
+	/** 读跨局进度。没解锁过返回 {ok:true, data:{}} */
 	loadUnlock: () => ipcRenderer.invoke('pet:load-unlock'),
 
-	/** 写解锁状态。只认 {star: boolean} 一个键（主进程会筛） */
+	/**
+	 * 写跨局进度。主进程会筛白名单，**只认 `star` 和 `seen` 两个键**，
+	 * 其余的丢掉 —— 而且**不报错**：加了新字段却没同步改主进程那张白名单的话，
+	 * 表现是「写进去了但读不回来」，很难查。
+	 *
+	 * ⚠ 两个键**一起发**，别只发一个：主进程是整份覆写，只发 `star`
+	 *   会把 `seen` 抹掉。渲染侧统一走 `ui._persistUnlock()`
+	 */
 	saveUnlock: (data) => ipcRenderer.invoke('pet:save-unlock', data),
 
 	/** 主进程要退出了，让渲染进程赶紧存一次 */

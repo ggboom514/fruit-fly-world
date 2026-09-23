@@ -1307,14 +1307,74 @@ function runSelfTest() {
 					return { ok: false, reason: '指针压在把手上，窗口却不接管鼠标 —— 那一下点击会落到桌面上，把手点不动' }
 				}
 
+				// —— 把手可以拖动，而且位置记进存档 ——
+				//
+				// ⚠ 顺序要紧：这一段必须在「点一下叫回面板」**之前**，
+				//   因为它要验证「拖完那一下不算点击」—— 拖完面板必须还是收着的。
+				//   先点一次的话面板就回来了，再拖也没得测
+				{
+					const before = handle.getBoundingClientRect()
+					const sx = before.left + before.width / 2
+					const sy = before.top + before.height / 2
+
+					// 真的派发 Mouse 事件，不是直接调方法 —— 绑在 window 上的
+					// mousemove / mouseup 监听器只有这样才会跑到
+					const fire = (target, type, x, y) =>
+						target.dispatchEvent(
+							new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, button: 0 }),
+						)
+
+					fire(handle, 'mousedown', sx, sy)
+					fire(window, 'mousemove', sx - 40, sy - 40)
+					const mid = handle.getBoundingClientRect()
+					if (Math.abs(mid.left - before.left) < 20) {
+						return {
+							ok: false,
+							reason: '拖动时把手没跟着走：left ' + before.left + ' → ' + mid.left,
+						}
+					}
+					// 松手：mouseup 之后浏览器会补一个 click（真实点击的规范顺序），
+					// 这里手动补上，专门验「拖完那一下不算点击」
+					fire(window, 'mouseup', sx - 40, sy - 40)
+					handle.click()
+
+					if (!hud.classList.contains('panel-away')) {
+						return { ok: false, reason: '把把手拖了一下，面板却被叫回来了 —— 拖动那一下被当成了点击' }
+					}
+
+					// 位置要落到 world.settings 里（它跟着存档走）
+					const saved = pet.world.settings.handlePos
+					if (!saved || !Number.isFinite(saved.x) || !Number.isFinite(saved.y)) {
+						return {
+							ok: false,
+							reason: '拖完把手之后 world.settings.handlePos 没写上：' + JSON.stringify(saved),
+						}
+					}
+					if (Math.abs(saved.x - mid.left) > 2 || Math.abs(saved.y - mid.top) > 2) {
+						return {
+							ok: false,
+							reason:
+								'存下来的把手位置和实际位置对不上：存 ' +
+								JSON.stringify(saved) + '、实际 ' +
+								JSON.stringify({ x: mid.left, y: mid.top }),
+						}
+					}
+
+					// 拖到屏幕左上角外面 → 必须被夹回可视区，
+					// 否则把手会跑到点不到的地方，面板就再也叫不回来了
+					pet.ui._handlePos = { x: -500, y: -500 }
+					pet.ui._placeHandle()
+					const clamped = handle.getBoundingClientRect()
+					if (clamped.left < 0 || clamped.top < 0) {
+						return {
+							ok: false,
+							reason: '拖出屏幕的把手没有被夹回来：left=' + clamped.left + ' top=' + clamped.top,
+						}
+					}
+				}
+
 				// 点一下把手 → 面板回来、把手收起来
 				handle.click()
-				if (hud.classList.contains('panel-away')) {
-					return { ok: false, reason: '点了把手，panel-away 类还在' }
-				}
-				if (!visible(panel)) return { ok: false, reason: '点了把手面板没回来' }
-				if (visible(handle)) return { ok: false, reason: '面板回来了，把手却还露着' }
-				pet.ui._updateInteractive()
 
 				// —— 穿透才是主开关 ——
 				//
@@ -3464,12 +3524,14 @@ function runSelfTest() {
 						return { ok: false, reason: '点了图鉴按钮但弹窗没有出现' }
 					}
 
-					// 食物格：数量 = 配置里那两种，而且每一格都画了东西
+					// 食物格：**配置里有几种就画几格**，一格不少。
+					//
+					// ⚠ 这里**不能**再用 unlockedFoodIds()。那是投放面板的口径
+					//   （未解锁的星空苹果根本不出现）；图鉴要的是「全都画出来，
+					//   没拿到的置灰」。两个口径都是对的，用错了才会有问题 ——
+					//   用投放那份，图鉴会少一格而没人发现
 					const foodCells = cbody.querySelectorAll('[data-food]')
-					// ⚠ 期望值走 unlockedFoodIds() —— 星空苹果在解锁之前
-					//   **故意不在图鉴里出现**（剧透）。拿 config 的原始列表比，
-					//   会在每个没解锁的玩家那里都红一条，而那是正确行为
-					const wantFoods = pet.ui.unlockedFoodIds()
+					const wantFoods = pet.ui._allFoodIds()
 					if (foodCells.length !== wantFoods.length) {
 						return {
 							ok: false,
@@ -3489,41 +3551,151 @@ function runSelfTest() {
 								reason: '食物格「' + cell.dataset.food + '」的画布是空的 —— 一格白的',
 							}
 						}
+						// 灰格也要画东西 —— 「置灰」是 CSS 的 filter，不是不画。
+						// 画布空白的话，玩家看到的是一个空洞，不是「还没拿到的东西」
 					}
 
-					// 突变格：数量 = CONFIG.mutation.types，而且每格都带一枚胶囊
+					// 星空苹果：**解锁前也必须画出来**，只是带 locked。
+					// 这一条守的是「别哪天又把它 filter 掉了」
+					{
+						const starCell = cbody.querySelector('[data-food="star"]')
+						if (!starCell) {
+							return { ok: false, reason: '图鉴里没有星空苹果那一格 —— 它应当一直在，只是没解锁时置灰' }
+						}
+						// ⚠ 名字要留着：藏起来的话玩家看不出这一格是什么东西
+						const starName = starCell.querySelector('.codex-name')
+						if (!starName || !starName.textContent.includes('星空苹果')) {
+							return { ok: false, reason: '星空苹果那格没写名字' }
+						}
+						const starLocked = starCell.classList.contains('locked')
+						if (starLocked === pet.ui.starUnlocked) {
+							return {
+								ok: false,
+								reason:
+									'星空苹果那格的灰态和解锁状态对不上：locked=' + starLocked +
+									'、starUnlocked=' + pet.ui.starUnlocked,
+							}
+						}
+						// 灰的时候说明必须藏掉 —— 那句话写着「吃星空苹果长出星云」，
+						// 正是彩蛋本身
+						if (starLocked && !starCell.textContent.includes('？？？')) {
+							return { ok: false, reason: '星空苹果还没解锁，说明却没藏起来' }
+						}
+					}
+
+					// 突变格：数量 = CONFIG.mutation.types，一格不少。
+					//
+					// ⚠ 查之前先把「见过哪些」摆成一个**已知状态**。
+					//   不摆的话，灰的是哪几格取决于这一局随机骰出了什么突变
+					//   （开局那几只走 rollDeNovo）—— 断言就成了掷骰子：
+					//   全都被见过时「灰格」一个都不剩，循环体一次都不跑，
+					//   整个 for 循环变成**空转**，而它会显示成绿色通过。
+					//   （实测踩过：把 locked 写死成 false，自检照样全绿）
+					//
+					// ⚠ 直接改私有字段是自检的常规手段（别处也有 starTaps = 0），
+					//   查完必须**还原**，否则后面那几条断言看到的是被改过的状态
+					const savedSeen = pet.ui._seenGenes.slice()
+					pet.ui._seenGenes = ['crystal']
+					pet.ui.refreshCodex()
+
 					const geneCells = cbody.querySelectorAll('[data-gene]')
-					// ⚠ 期望值要排掉星云 —— 它在解锁之前**故意不出现**（剧透），
-					//   和星空苹果同一条规矩。拿 config 的原始长度去比，
-					//   会在每个没解锁的玩家那里都红一条，而那是**正确行为**
-					const shownGenes = pet.config.mutation.types.filter(
-						(t) => t.id !== 'nebula' || pet.ui.starUnlocked,
-					)
-					if (geneCells.length !== shownGenes.length) {
+					if (geneCells.length !== pet.config.mutation.types.length) {
 						return {
 							ok: false,
-							reason: '图鉴里列了 ' + geneCells.length + ' 种基因，应当是 ' + shownGenes.length + ' 种',
+							reason:
+								'图鉴里列了 ' + geneCells.length + ' 种基因，应当是 ' +
+								pet.config.mutation.types.length + ' 种',
 						}
 					}
 					for (const cell of geneCells) {
 						const badge = cell.querySelector('.gene-badge')
 						if (!badge) return { ok: false, reason: '基因格「' + cell.dataset.gene + '」里没有徽章' }
 						const t = pet.config.mutation.types.find((m) => m.id === cell.dataset.gene)
+						// 名字（徽章）**灰格也要留着** —— 藏起来的话玩家看不出
+						// 这一格是「还不知道是什么」还是「压根没有这一格」
 						if (!badge.textContent.includes(t.name)) {
 							return {
 								ok: false,
 								reason: '基因格「' + cell.dataset.gene + '」上写的是「' + badge.textContent + '」，应当是「' + t.name + '」',
 							}
 						}
-						// 概率也得是配置里那个数 —— 写死的话改了 chance 图鉴就在说假话
-						const pct = (t.chance * 100).toFixed(1) + '%'
-						if (!cell.textContent.includes(pct)) {
+
+						// ⚠ 灰态必须**和 seenGene 对得上**。这一条是唯一能抓住
+						//   「判据写反了 / 永远不锁」的断言 —— 光靠下面那两条
+						//   「灰格写了？？？」，在「所有格子都不灰」时会一次都不跑、
+						//   直接绿着通过
+						const isLocked = cell.classList.contains('locked')
+						if (isLocked !== !pet.ui.seenGene(cell.dataset.gene)) {
 							return {
 								ok: false,
-								reason: '基因格「' + cell.dataset.gene + '」上没有出现概率 ' + pct,
+								reason: '基因格「' + cell.dataset.gene + '」的灰态和 seenGene 对不上：locked=' +
+									isLocked + '、seen=' + pet.ui.seenGene(cell.dataset.gene),
+							}
+						}
+
+						// 亮格和灰格的差别，就在这里分开查
+						if (isLocked) {
+							// 灰格 = 还没见过。**效果和概率一个字都不许露** ——
+							// 露了就等于把图鉴当成剧透手册
+							if (!cell.textContent.includes('？？？')) {
+								return {
+									ok: false,
+									reason: '基因格「' + cell.dataset.gene + '」是灰的，却没写「？？？」',
+								}
+							}
+							if (cell.textContent.includes('%')) {
+								return {
+									ok: false,
+									reason: '灰格「' + cell.dataset.gene + '」把概率漏出来了：' + cell.textContent,
+								}
+							}
+							if (!cell.dataset.locked) {
+								return { ok: false, reason: '灰格「' + cell.dataset.gene + '」没有 data-locked 标记' }
+							}
+						} else {
+							// 亮格 = 见过，必须给出真数值
+							//
+							// ⚠ 概率那一行只对**会新发**的突变成立（星云的新发概率是 0，
+							//   写「0.0%」是谎），所以沿用 _codexGeneCell 里同一条分支
+							if (cell.textContent.includes('？？？')) {
+								return {
+									ok: false,
+									reason: '基因格「' + cell.dataset.gene + '」是亮的，却还写着「？？？」',
+								}
+							}
+							const pct = (t.chance * 100).toFixed(1) + '%'
+							const want = t.chance > 0 ? pct : t.fromStar ? '吃星空苹果获得' : '无法自然获得'
+							if (!cell.textContent.includes(want)) {
+								return {
+									ok: false,
+									reason: '基因格「' + cell.dataset.gene + '」上没有出现「' + want + '」',
+								}
 							}
 						}
 					}
+
+					// ⚠ 灰的亮的分开**数一遍**。上面那个 for 里两条分支各自成立，
+					//   但「一个灰的都没有」时两条都白跑 —— 数一遍才能把
+					//   「锁定判据整个失效」变成红的。
+					//   摆进去的 seen 只有 crystal 一个，所以这里期望 1 亮 4 灰
+					const nLocked = [...geneCells].filter((el) => el.classList.contains('locked')).length
+					const wantLocked = pet.config.mutation.types.length - 1
+					if (nLocked !== wantLocked) {
+						return {
+							ok: false,
+							reason:
+								'只知道「见过结晶」一种突变，图鉴里却有 ' + nLocked +
+								' 格是灰的（应当是 ' + wantLocked + ' 格）',
+						}
+					}
+					const crystalCell = cbody.querySelector('[data-gene="crystal"]')
+					if (!crystalCell || crystalCell.classList.contains('locked')) {
+						return { ok: false, reason: '见过结晶，图鉴里那一格却是灰的' }
+					}
+
+					// 查完了，把 seen 还原 —— 后面还有断言要看真实状态
+					pet.ui._seenGenes = savedSeen
+					pet.ui.refreshCodex()
 
 					pet.ui._onKey({ code: 'Escape' })
 					if (!cpop.classList.contains('hidden')) {
@@ -3531,6 +3703,42 @@ function runSelfTest() {
 					}
 				} catch (e) {
 					return { ok: false, reason: '图鉴流程失败: ' + e.message }
+				}
+
+				// —— 「见过」这条链路：world 记 → 主循环抽干 → ui 点亮 ——
+				//
+				// ⚠ 分两段查，因为它是**两个进程/两层之间**的接力，
+				//   任何一段断了症状都一样（图鉴那一格永远灰着），
+				//   但修的地方完全不同：前半段在 world.js，后半段在 app.js
+				try {
+					const g = 'stone'
+					// 先把这一格按灭，确保后面查到的「亮了」是这一次造成的
+					pet.ui._seenGenes = pet.ui._seenGenes.filter((id) => id !== g)
+					pet.world.seenGenes.length = 0
+
+					const probe = pet.world.addFly(12, 12, 'M', 'normal', [g])
+					if (!probe) return { ok: false, reason: '自检造不出探针果蝇（撞上限了？）' }
+
+					// 前半段：世界有没有把它收进收件箱
+					if (!pet.world.seenGenes.includes(g)) {
+						return { ok: false, reason: '世界没记下刚出生的突变 —— addFly 里少了一次 _noteGenes' }
+					}
+
+					// 后半段：主循环把它交给 ui 了没有。
+					// ⚠ 抽干发生在 app.js 的 frame() 里，所以必须**真的等一帧**
+					await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
+					if (!pet.ui.seenGene(g)) {
+						return {
+							ok: false,
+							reason: '世界记下了突变，主循环却没把它交给图鉴 —— app.js 里那段 drain 断了',
+						}
+					}
+
+					// 探针果蝇不该留在世界里影响后面那些数虫子的断言
+					const i = pet.world.flies.indexOf(probe)
+					if (i >= 0) pet.world.flies.splice(i, 1)
+				} catch (e) {
+					return { ok: false, reason: '「见过」链路失败: ' + e.message }
 				}
 
 				// —— 结晶成虫的外观：**真的去数像素** ——
@@ -4575,24 +4783,85 @@ function runSelfTest() {
 						}
 					}
 
-					// 图鉴：解锁之后星云基因格才出现
+					// 图鉴：解锁之后那两格**从灰变亮**。
+					//
+					// ⚠ 它们解锁前**也在**（只是带 .locked），所以这里不能像以前那样
+					//   查「出现了没有」—— 那样无论解锁成功与否都会绿。
+					//   要查的是**灰态翻转了**，这才是解锁真正做的事
 					pet.ui.setCodexOpen(true)
 					pet.ui.refreshCodex()
 					const eggGeneCells = [...eggCodex.querySelectorAll('[data-gene]')]
-					if (!eggGeneCells.some((el) => el.dataset.gene === 'nebula')) {
+					const nebulaCell = eggGeneCells.find((el) => el.dataset.gene === 'nebula')
+					if (!nebulaCell) {
 						pet.ui.setCodexOpen(false)
-						return { ok: false, reason: '解锁之后图鉴里仍然没有星云那一格' }
+						return { ok: false, reason: '图鉴里没有星云那一格' }
 					}
-					if (!eggCodex.querySelector('[data-food="star"]')) {
+					// ⚠ 星云那格**不跟着解锁变亮** —— 食物认「解锁了没有」，
+					//   基因认「养出来过没有」，是两条判据（用户要的正是这个）。
+					//   所以这里查的是**判据本身**，不是「解锁之后它该亮了」
+					if (nebulaCell.classList.contains('locked') !== !pet.ui.seenGene('nebula')) {
 						pet.ui.setCodexOpen(false)
-						return { ok: false, reason: '解锁之后图鉴里仍然没有星空苹果那一格' }
+						return {
+							ok: false,
+							reason: '星云那格的灰态和 seenGene 对不上：locked=' +
+								nebulaCell.classList.contains('locked') +
+								'、seen=' + pet.ui.seenGene('nebula'),
+						}
+					}
+					// 顺带把「见过就点亮」这条机制整个走一遍：
+					// 塞一条 seen 进去 → 那一格必须立刻从灰变亮
+					pet.ui.noteSeenGenes(['nebula'])
+					pet.ui.refreshCodex()
+					const nebulaAfter = eggCodex.querySelector('[data-gene="nebula"]')
+					if (nebulaAfter.classList.contains('locked')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '记下「见过星云」之后，图鉴那一格还是灰的' }
+					}
+					if (nebulaAfter.textContent.includes('？？？')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '点亮之后星云那格还写着「？？？」' }
+					}
+					const eggStarCell = eggCodex.querySelector('[data-food="star"]')
+					if (!eggStarCell) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '图鉴里没有星空苹果那一格' }
+					}
+					if (eggStarCell.classList.contains('locked')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '彩蛋都解开了，星空苹果那一格还是灰的' }
+					}
+					// 解锁之后说明也得露出来 —— 灰的时候那两行是「？？？」
+					if (eggStarCell.textContent.includes('？？？')) {
+						pet.ui.setCodexOpen(false)
+						return { ok: false, reason: '星空苹果解锁了，说明却还写着「？？？」' }
 					}
 					pet.ui.setCodexOpen(false)
 
-					// 星云的图鉴措辞**不能**是「0.0%」—— 那是句看着精确的谎话
-					const nebulaTxt = eggGeneCells.find((el) => el.dataset.gene === 'nebula').textContent
+					// 星云的图鉴措辞**不能**是「0.0%」—— 那是句看着精确的谎话。
+					// ⚠ 用刚点亮的那一份：灰格上写的是「？？？」，查不出措辞对不对
+					const nebulaTxt = nebulaAfter.textContent
 					if (nebulaTxt.includes('0.0%')) {
 						return { ok: false, reason: '星云那一格写着「0.0%」—— 它不在抽奖池里，应当说来历' }
+					}
+					if (!nebulaTxt.includes('吃星空苹果获得')) {
+						return { ok: false, reason: '星云那一格没写来历（应当是「吃星空苹果获得」）' }
+					}
+
+					// 「见过」也得**读得回来** —— 和上面 star 那条同一个道理。
+					// ⚠ 这一条顺带守住白名单：主进程那张表漏掉 seen 的话，
+					//   渲染侧照写不误、拿不到任何错误，只有这里会红
+					const seenBack = await window.pet.loadUnlock()
+					if (!seenBack || !seenBack.ok || !Array.isArray(seenBack.data?.seen)) {
+						return { ok: false, reason: 'seen 写下去之后读不回来（主进程白名单里是不是漏了 seen？）' }
+					}
+					if (!seenBack.data.seen.includes('nebula')) {
+						return { ok: false, reason: '读回来的 seen 里没有 nebula：' + JSON.stringify(seenBack.data.seen) }
+					}
+					// ⚠ 反过来还要查一遍：**写 star 不能把 seen 抹掉**。
+					//   两个键是同一份文件里的邻居，主进程整份覆写 ——
+					//   只发一个键的那个调用点会造成静默的数据丢失
+					if (!seenBack.data.star) {
+						return { ok: false, reason: '写 seen 之后 star 反而没了 —— 两个键没有一起落盘' }
 					}
 					pet.world.money = moneyBeforeEgg
 					eggTaps = need
@@ -4859,12 +5128,16 @@ function backupFile() {
 }
 
 /**
- * 彩蛋解锁状态，**单独一个文件**。
+ * 跨局的进度，**单独一个文件**。现在装两样：
+ *
+ *   `star`  —— 彩蛋（星空苹果 / 星云）解锁了没有
+ *   `seen`  —— 图鉴里「见过」的突变 id（出生过就算，见 world.seenGenes）
  *
  * ⚠ 为什么不塞进存档里：存档是「这一局养了什么」，玩家点「重新开始」
- *   会把它整个删掉（见 save.js 的 clear()）。而解锁是**跨局**的 ——
- *   重开一局之后彩蛋又锁上，玩家只会觉得「我上次明明解开了，坏了」，
- *   而且没有任何提示告诉他为什么。用户要的是「永久解锁」。
+ *   会把它整个删掉（见 save.js 的 clear()）。而这两样都是**跨局**的 ——
+ *   重开一局之后彩蛋又锁上、图鉴又全灰，玩家只会觉得
+ *   「我上次明明解开了，坏了」，而且没有任何提示告诉他为什么。
+ *   用户要的是「永久」。
  *
  * ⚠ 自检读写的是另一个文件，理由和 saveFile 一字不差：
  *   自检跑的是临时造出来的世界，不能把玩家的真状态顶掉
@@ -4931,21 +5204,31 @@ ipcMain.handle('pet:load', () => {
 	}
 })
 
-ipcMain.handle('pet:load-unlock', () => {
-	try {
-		return { ok: true, data: JSON.parse(fs.readFileSync(unlockFile(), 'utf8')) }
-	} catch {
-		// 文件不存在就是「还没解锁」—— 这是**正常路径**，不是错误，别打日志。
-		// 每个新玩家第一次启动都会走到这里
-		return { ok: true, data: {} }
-	}
-})
+// 文件不存在就是「还没解锁 / 还没见过任何突变」—— 这是**正常路径**，
+// 不是错误。每个新玩家第一次启动都会走到这里，所以不打日志
+ipcMain.handle('pet:load-unlock', () => ({ ok: true, data: readUnlock() }))
 
 ipcMain.handle('pet:save-unlock', (_e, data) => {
 	// ⚠ 只认白名单里的键。这是全项目**唯一**一条「渲染进程给什么就写什么」的路，
 	//   不筛的话它可以被拿来往这个文件里塞任意结构（渲染进程是页面，
 	//   页面是会被 XSS 影响的那一层 —— 主进程不该无条件相信它）
-	const safe = { star: !!(data && data.star) }
+	//
+	// ⚠ 白名单不完整是**静默失败**：这里漏掉一个键，渲染进程照写不误、
+	//   拿不到任何错误，只有那个字段永远存不下来。加字段时**必须同步改这里**
+	//
+	// ⚠ 单个键的写入**保留文件里已有的值**（下面是「载荷里没有就沿用旧的」）。
+	//   因为写是整个文件覆写：只发 {star} 的调用点会把 seen 抹成空。
+	//   渲染侧已经收敛成 _persistUnlock() 一处、两个键一起发，
+	//   这里再兜一道 —— 它守的是「以后有人加了第三个调用点」这种情况
+	const old = readUnlock()
+	const safe = {
+		star: data && 'star' in data ? !!data.star : !!old.star,
+		seen: Array.isArray(data && data.seen)
+			? cleanSeenList(data.seen)
+			: Array.isArray(old.seen)
+				? cleanSeenList(old.seen)
+				: [],
+	}
 	try {
 		fs.writeFileSync(unlockFile(), JSON.stringify(safe), 'utf8')
 		return { ok: true }
@@ -4954,6 +5237,26 @@ ipcMain.handle('pet:save-unlock', (_e, data) => {
 		return { ok: false, reason: e.message }
 	}
 })
+
+/** 读 unlock.json。读不出来就是空的 —— 那是**正常路径**，不打日志 */
+function readUnlock() {
+	try {
+		const d = JSON.parse(fs.readFileSync(unlockFile(), 'utf8'))
+		return d && typeof d === 'object' ? d : {}
+	} catch {
+		return {}
+	}
+}
+
+/**
+ * 洗一遍「见过的突变」清单。
+ *
+ * ⚠ 上限 64：这是渲染进程递过来的数组，不封顶的话它可以被拿来
+ *   往这个文件里灌一个几百 MB 的字符串数组
+ */
+function cleanSeenList(list) {
+	return list.filter((id) => typeof id === 'string' && id && id.length <= 64).slice(0, 64)
+}
 
 ipcMain.handle('pet:clear-save', () => {
 	for (const f of [saveFile(), backupFile(), saveFile() + '.tmp']) {
