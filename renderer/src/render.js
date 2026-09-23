@@ -350,7 +350,9 @@ function flySilhouette(s, sex) {
  * （那边也没有，mixHex 是 RGB-only 的）
  */
 function crystalRim(ctx, f, s) {
-	const t = performance.now() / 1000
+	// ⚠ 时间从 `f.frozenNow` 里取（图鉴图标会定死它），没有才退回实时。
+	//   见 drawFly 的 JSDoc —— 不限死的话每次打开图鉴这圈彩虹的色相都不一样
+	const t = (f.frozenNow ?? performance.now()) / 1000
 	const g = ctx.createLinearGradient(-s * 0.62, 0, s * 0.45, 0)
 	const shift = t * 70 + f.seed * 0.6
 	for (let i = 0; i <= 5; i++) {
@@ -377,9 +379,15 @@ function crystalRim(ctx, f, s) {
  * 位置由 seed 固定（不然每帧乱跳，像雪花噪点），
  * 但**亮度**跟着时间走，所以是「有几个点在轮流亮」。
  * 用 seeded 而不是 Math.random() 的理由和 speckle 完全一样
+ *
+ * ⚠ 时间从 `f.frozenNow` 里取（图鉴图标会定死它），没有才退回实时。
+ *   ⚠ 这里有一条 `if (tw <= 0.25) continue` —— 某一瞬间**可能 5 颗全暗**，
+ *   图鉴图标要是取实时时间，会有相当一部分概率画出一只「没有闪光」的金蝇。
+ *   所以 `drawFlyIcon` 挑的那个定值必须验过：自检里有一条断言金蝇格
+ *   真的有亮黄像素
  */
 function drawGoldSparkle(ctx, f, s) {
-	const t = performance.now() / 1000
+	const t = (f.frozenNow ?? performance.now()) / 1000
 	const n = 5
 	for (let i = 0; i < n; i++) {
 		const a = seeded(f.seed, i + 300) * TAU
@@ -407,12 +415,23 @@ function drawGoldSparkle(ctx, f, s) {
 /**
  * @param {number} ox 额外的 x 偏移。罐中果蝇的 f.x 是相对罐心的偏移，
  *   得加上罐子自己的位置才能落到屏幕上
+ *
+ * ⚠ `f.frozenNow` 是**只有图鉴图标会设**的字段（`drawFlyIcon` 里定死一个数），
+ *   实体对象永远不带。作用是让「吃 performance.now() 的那几处效果」
+ *   （结晶的流光色相、金蝇的闪光、疯狂的眼部呼吸）停下来 ——
+ *   不然每开一次图鉴颜色都不一样，自检也没法断言。
+ *   不设就退回 `performance.now()`，也就是场上那只的实时表现
  */
 function drawFly(ctx, f, ox = 0, oy = 0) {
 	const s = f.size
 	const V = flyVisual(f)
 	const detailed = s > 13 // 太小就不画腿了，反正看不见
 	const crystal = f.mutations && f.mutations.includes('crystal')
+	// 疯狂的**眼部泛光**。和 crystal / nebula 同一个路子：直接读基因数组。
+	//
+	// ⚠ 特意**不用**调色板标记（`_gold` / `_rim` 那种）。这个文件自己的分工是：
+	//   调色板管「整只换一套颜色」，叠加效果直接读基因 —— 泛光属于后者
+	const berserk = f.mutations && f.mutations.includes('berserk')
 	// 星云的**身体贴图**。和 crystal 一样每帧直接读基因数组 ——
 	// 它们都是「这只虫现在长什么样」的判据，没有第二处状态
 	const nebula = f.mutations && f.mutations.includes('nebula')
@@ -594,6 +613,52 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 	ctx.beginPath()
 	ctx.ellipse(s * 0.3, 0, s * 0.13, s * 0.14, 0, 0, TAU)
 	ctx.fill()
+
+	// —— 疯狂：双眼泛着红光 ——
+	//
+	// 疯狂是**唯一一个完全不动长相**的突变（只改行为：咬同类、寿命减半）。
+	// 不给他一个看得见的标记，玩家就只能靠「哪只在咬人」去认 —— 而认出来的时候
+	// 通常已经晚了。这一圈光是纯加了给人看的。
+	//
+	// ⚠ 画在复眼**之前**：眼睛会把渐变中心盖掉，只留下一圈环形柔光 ——
+	//   这才是「泛光」该有的样子。画在之后就是在眼球上糊一块红的
+	//
+	// ⚠ 用 `fill()` 不用 `stroke()`。文件 1451-1500 那节写死了「给填充形状勾边
+	//   一律不要」，唯一的例外是结晶，并且明写了别拿它当先例
+	//
+	// ⚠ 整段 save/restore 兜着，而且**显式设 globalAlpha**：
+	//   结晶在上面把 globalAlpha 设成了 0.14 留到函数末尾才还原，
+	//   金蝇的闪光结尾又硬写 1（不是还原上一个值）。不自己兜住的话，
+	//   「结晶 + 疯狂」那只的光会淡到看不见
+	//
+	// ⚠ 石化 / 结晶 + 疯狂时**照样画**。疯狂是行为突变，认不出来就白做了；
+	//   STONE_PALETTE 那句「红眼一留、去色就白做了」讲的是眼睛的**底色**，
+	//   和「额外加一道光」不是一回事。这条是**定下来的**，别当成 bug 改回去
+	if (berserk) {
+		const t = (f.frozenNow ?? performance.now()) / 1000
+		// 呼吸：狂躁的暗示。频率和疯狂咬人的间隔（16~36 秒）无关 ——
+		// 那是行为节奏，这个是心跳
+		const pulse = 0.5 + 0.5 * Math.sin(t * 4.2 + f.seed)
+		ctx.save()
+		ctx.globalAlpha = 1
+		for (const side of [-1, 1]) {
+			const ex = s * 0.33
+			const ey = side * s * 0.085
+			// ⚠ 半径和浓度都调过一轮。第一版（0.18 + pulse*0.07 / 中间 stop 0.32）
+			//   自检量出来只比普通蝇红 1.32 倍 —— 而普通蝇自带红眼和暗红头，
+			//   本就有一份底色。太贴边的话，相位或抗锯齿稍微一动就会掉到阈值以下
+			const r = s * (0.21 + pulse * 0.09)
+			const g = ctx.createRadialGradient(ex, ey, s * 0.04, ex, ey, r)
+			g.addColorStop(0, 'rgba(255, 118, 88, 0.85)')
+			g.addColorStop(0.45, 'rgba(230, 74, 58, 0.5)')
+			g.addColorStop(1, 'rgba(226, 72, 58, 0)')
+			ctx.fillStyle = g
+			ctx.beginPath()
+			ctx.arc(ex, ey, r, 0, TAU)
+			ctx.fill()
+		}
+		ctx.restore()
+	}
 
 	// 复眼：红底上一个偏上前方的高光 + 压暗的边缘 =「鼓起来的球面」。
 	// 每只眼单独建渐变 —— 两只眼在 y 上差了 0.17s，共用一个的话
@@ -1629,6 +1694,82 @@ export function drawFoodIcon(ctx, type, size, seed = 7) {
 	}
 
 	drawAppleScrap(ctx, size, palette.skin, palette.flesh, palette.seed, seed, foodTexture(ctx, type))
+}
+
+/**
+ * 把**一只突变果蝇**画在一个小画布里（图鉴的基因格在用）。
+ *
+ * ⚠ 和 `drawFoodIcon` 是**同一个契约**，别搞混：
+ *   · 调用方负责把 ctx 的原点移到格子中心（并清干净上一帧）
+ *   · 这里**不管 dpr、不管清屏、不管 translate**
+ *   · 内部会用 `createRadialGradient`，所以必须在 translate **之后**调
+ *
+ * ⚠ 复用 `drawFly` 而不是另写一套画法：那是果蝇唯一的绘制入口 ——
+ *   图鉴存在的意义就是「让玩家认得出屏幕上那只是什么」，
+ *   画得和场上不一样的话，这个意义就没了。
+ *
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {string[]} mutations 要展示的基因组合
+ * @param {number} size 体长（像素），和 Fly.size 一个口径。
+ *   ⚠ **不要给 13 以下** —— drawFly 里 `detailed = s > 13`，
+ *   低于它腿、复眼渐变、石化暗边会一起消失，图标就和场上那只长得不一样了
+ * @param {number} [seed] 固定随机种子。
+ *   ⚠ **必须是个有限数**：缺了会让结晶那圈彩虹拼出 `hsl(NaN,…)` ——
+ *   非法颜色串，`strokeStyle` 赋值被**静默忽略**、沿用上一个颜色（见文件开头那节）
+ * @param {boolean} [silhouette] true = 只画一个暗影（图鉴里「还没见过」的格子）。
+ *   ⚠ 暗影**只取决于 size 和 sex，和基因无关** —— 这是它最本质的性质，
+ *   自检靠它断言「所有灰格长得一模一样」
+ */
+export function drawFlyIcon(ctx, mutations, size, seed = 7, silhouette = false) {
+	// —— 没见过的那几格：一个认不出品种的暗影 ——
+	//
+	// ⚠ 用的是**很淡的浅灰**，不是纯黑。弹窗底色本身是深色
+	//   （#1b1917 上叠 2% 白），纯黑形状对它的对比度只有 1.1:1，
+	//   字面意义上的「看不见」—— 那就和这一格不存在没区别了
+	if (silhouette) {
+		ctx.fillStyle = 'rgba(226, 214, 190, 0.13)'
+		traceSmooth(ctx, flySilhouette(size, 'F'))
+		ctx.fill()
+		return
+	}
+
+	// ⚠ 时间**定死**。结晶的流光色相、金蝇的闪光、疯狂的眼部呼吸都吃时间，
+	//   取实时的话每次打开图鉴都长得不一样，自检也没法断言。
+	//   这个值挑的是「金蝇那 5 颗闪点至少亮 2 颗」的相位 ——
+	//   闪点有 `if (tw <= 0.25) continue`，运气不好会 5 颗全暗，
+	//   画出一只没有闪光的金蝇。自检里有一条断言金蝇格真的有亮黄像素
+	const FROZEN_NOW = 0
+
+	// ⚠ 这个对象的字段**一个都不能少**，而且缺失的后果是「静默画错」不是「报错」：
+	//   · wingPhase 缺 → Math.sin(undefined)=NaN → ctx.rotate(NaN) 被规范忽略
+	//     → 两片翅膀摊平成一根棍
+	//   · gaitPhase / legPhase 缺 → 腿的端点全是 NaN → 六条腿整段消失
+	//   · x / y / angle 缺 → translate(NaN) 被忽略，虫会画到上一个变换的位置
+	//   mode:'walk' + pausing:true 是标准静止姿态：六足全部落地、翅膀收拢
+	const fake = {
+		x: 0,
+		y: 0,
+		angle: 0,
+		size,
+		seed,
+		sex: 'F',
+		mode: 'walk',
+		laying: false,
+		pausing: true,
+		wingPhase: 0,
+		gaitPhase: 0,
+		legPhase: 0,
+		mutations,
+		frozenNow: FROZEN_NOW,
+	}
+
+	// ⚠ 横向偏置。这个数**不是**「body 的包围盒中心」那么简单 ——
+	//   第一版按 body 算（收拢翅尖 -0.75s、头 +0.43s，重心偏左 0.16s）
+	//   补了 0.16s，结果自检的包围盒断言当场红：**疯狂的眼部泛光被裁掉了**。
+	//   泛光半径最大到 0.30s，右边界其实是 +0.73s 而不是 +0.43s，
+	//   于是整个图形几乎本来就居中 —— 再往右推 0.16s 就顶出去了。
+	//   现在按「body + 泛光」一起算，留一点点右偏让虫身不至于贴左边
+	drawFly(ctx, fake, size * 0.06, 0)
 }
 
 // ⚠ 这里原来有个 magnifierMinValue()，读 magnifier 的 `minValue` 当门槛。

@@ -4274,8 +4274,9 @@ const roastProblems = []
 
 	// —— 4. 烤炉：容量 5，装满自动开烤，8 秒后整炉卖钱 ——
 	//
-	// ⚠ 炉子从 1.18.0 起**不在烤制链上了** —— 它是一件 $5 的独立商品
-	//   （投放 → 其他，见 market.prices.oven），所以这里**不再需要设等级**。
+	// ⚠ 炉子从 1.18.0 起**不在烤制链上了**，所以这里**不需要设等级**。
+	//   1.27.0 起它是商店里的一件买断道具（`market.shop` 里 oven 那条），
+	//   摆的时候直接调 dropOven()，**和钱无关** —— 所以这里也不用管钱。
 	//   时长和倍率都从 CONFIG.roast.oven 直接读
 	const oven = w.dropOven()
 	if (!oven) roastProblems.push('dropOven 没造出炉子')
@@ -4579,11 +4580,13 @@ const roastProblems = []
 	const cw = new World(W, H)
 	cw.reset()
 	const prices = chain.map((t) => t.price)
-	// ⚠ 这个 11 是**手写的字面量**，故意不写 `reduce` 自己的结果 ——
+	// ⚠ 这个 13 是**手写的字面量**，故意不写 `reduce` 自己的结果 ——
 	//   它守的是「玩家实际要付多少钱」这件事。从 chain 现算等于不测：
-	//   改价格时它会跟着一起变，永远绿
-	if (Math.abs(prices.reduce((a, b) => a + b, 0) - 11) > 1e-9) {
-		roastProblems.push(`两档价格合计 ${prices.reduce((a, b) => a + b, 0)}，应当是 11`)
+	//   改价格时它会跟着一起变，永远绿。
+	//   ⚠ 所以**调价调到这条变红是正常的** —— 把 13 改成新的合计即可，
+	//     但改之前先想一眼「这个总价是不是自己想要的」（$3 打火机 + $10 喷火枪）
+	if (Math.abs(prices.reduce((a, b) => a + b, 0) - 13) > 1e-9) {
+		roastProblems.push(`两档价格合计 ${prices.reduce((a, b) => a + b, 0)}，应当是 13`)
 	}
 	if (chain.length !== 2) {
 		roastProblems.push(`烤制链有 ${chain.length} 档，应当是 2（炉子已经挪去投放了）`)
@@ -5235,12 +5238,24 @@ const geneProblems = []
 		const rate = withAny / TRIALS
 		// 「至少中一种」的准确值，不是概率之**和** ——
 		// 各种突变是独立骰的，所以要用 1 - Π(1-p) 算并集。
-		// 拿和当期望会偏高（9.0% vs 实际的 8.7%），是个很容易顺手写错的地方
+		// 拿和当期望会偏高（8.9% vs 实际的 8.7%），是个很容易顺手写错的地方
+		//
+		// ⚠ 期望值从 chance 现算，所以这条断言验的是「实测和配置一致」，
+		//   不锁具体数值 —— 调 chance 不会把它弄红
 		const want = 1 - MUTATION_TYPES.reduce((s, t) => s * (1 - t.chance), 1)
 		console.log(`  野生型双亲 ${TRIALS} 次产卵：新发突变出现率 ${(rate * 100).toFixed(1)}%（期望约 ${(want * 100).toFixed(1)}%）`)
 		if (!(Math.abs(rate - want) < 0.02)) {
 			geneProblems.push(`新发突变率是 ${(rate * 100).toFixed(1)}%，期望约 ${(want * 100).toFixed(1)}%`)
 		}
+
+		// —— 只报数，**不卡** ——
+		//
+		// ⚠ 「一颗卵有多普通」是玩家真正感觉到的那个数（四个 chance 的乘积），
+		//   但它是个**手感值**，不是正确性标准：用户随时可能要求调大调小。
+		//   钉死它的话，每次调 chance 都要先来这里改常量 —— 那是噪音。
+		//   所以只打印出来，让人一眼看见「这次改动把普通率挪到哪了」。
+		//   见 config.js 里 mutation 那一段的说明
+		console.log(`  一颗卵是普通蝇的概率：${((1 - want) * 100).toFixed(2)}%（四个 chance 的乘积）`)
 
 		// ⚠ 星云**永远不能**从新发里冒出来 —— 它唯一的来源是幼虫吃星空苹果。
 		//   这一条比上面那条更直接：上面那条看的是**总**发生率，

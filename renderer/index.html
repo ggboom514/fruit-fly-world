@@ -368,6 +368,20 @@
 						</button>
 					</div>
 					<p class="donate-note" id="settings-note">点一下切换，立刻就生效</p>
+
+					<!--
+						检查更新。⚠ 真正发请求的是**主进程**（见 preload.js 那段注释），
+						这里只管显示结论。
+
+						⚠ 没配 `CONFIG.update.manifestUrl` 时这一行会显示「未配置」，
+						   而不是藏起来 —— 藏起来的话，作者本人在开发时看不出这条没接上
+					-->
+					<div class="update-row">
+						<span class="update-version" id="update-version">版本 —</span>
+						<button class="update-btn" id="update-check" disabled>检查更新</button>
+					</div>
+					<p class="donate-note update-msg" id="update-msg"></p>
+					<button class="update-get hidden" id="update-get">有新版本，去下载</button>
 				</div>
 			</div>
 
@@ -533,9 +547,15 @@
 				   一上来就该看得见全部。想改成渐进解锁的话，加一个「见过没有」的
 				   集合、再把没见过的画成问号即可，但那是另一个功能。
 
-				内容由 ui.refreshCodex() 渲染：食物格子是**真的画出来的**
-				（每格一个小 canvas，复用 render.js 的 drawFoodIcon），
-				突变格子复用现成的 .gene-badge 胶囊。
+				内容由 ui.refreshCodex() 渲染。**食物格和基因格现在都是
+				「左边一张小 canvas、右边文字」**：食物调 render.js 的
+				drawFoodIcon，突变调同一文件的 drawFlyIcon（两边都是把场上
+				真正的画法复用一遍，图鉴才认得出屏幕上那只是什么）。
+
+				突变那格底下还挂着一枚 .gene-badge 胶囊（名字和颜色），
+				它在 .codex-text **里面**、不是格子的第三个 flex 子元素 ——
+				格子内容只有 132px，胶囊最长的「◆ 点石成金」就有 74px，
+				和 34px 的画像并列的话文字列会被挤成竖条。
 			-->
 			<div id="codex-pop" class="donate-pop wide hidden">
 				<div class="donate-card shop-card">
@@ -611,6 +631,21 @@
 
 		<!-- 暂停提示 -->
 		<div id="pause-badge" class="badge pause hidden">已暂停</div>
+
+		<!--
+			成就横幅。达成时从屏幕中上方滑入、停一会儿、再滑回去。
+
+			⚠ 复用的是 `.badge` 那一套定位（fixed / top / 居中），所以它天然
+			   落在**屏幕中上方**、也白拿了「启动界面里自动藏起来」那条规则。
+			   动画是自己的一整段（入场 + 停 + 出场），见 style.css。
+
+			⚠ icon 是可选的 —— 后四个财富成就没有图标（用户没给图），
+			   那几条 `hidden` 掉，只留文字。空 img 会显示成一个破图标
+		-->
+		<div id="achievement" class="badge achievement hidden">
+			<img id="achievement-icon" class="achievement-icon hidden" alt="" />
+			<span id="achievement-text" class="achievement-text"></span>
+		</div>
 
 		<!--
 			数据面板：**拿着「查看」工具点一下成虫**弹出（V），钉在虫旁边直到玩家关掉

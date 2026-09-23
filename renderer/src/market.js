@@ -204,14 +204,7 @@ export function flyPrice() {
 	return CONFIG.market.prices.spawnFly
 }
 
-/**
- * 摆一个烤炉的单价。
- *
- * ⚠ 它**没有**份数：烤炉一次只买一个（上限是 `CONFIG.roast.oven.maxCount`），
- *   所以不需要 bulkPrice 那一套，也不该被塞进 `prices.food` ——
- *   那张表是按「食物类型」索引的，塞进去会让 `Object.keys(prices.food)`
- *   在 UI 和断言里凭空多出一个不是食物的键
- */
-export function ovenPrice() {
-	return CONFIG.market.prices.oven
-}
+// ⚠ 这里删掉过 `ovenPrice()`。烤炉从 1.27.0 起是商店里的**一次性道具**
+//   （见 CONFIG.market.shop 里 oven 那条），不再是按次收费的消耗品，
+//   所以「摆一个多少钱」这个问题不存在了 —— 价格走 shopItem('oven').price，
+//   而投放面板里那一行是免费的「摆一个」，和玻璃罐同一个形态。

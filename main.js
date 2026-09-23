@@ -20,8 +20,9 @@
  *        （仍在桌面之上）。Electron 没有「往下推」这个 API，见 sinkToBottom()
  */
 
-const { app, BrowserWindow, ipcMain, globalShortcut, screen, Menu } = require('electron')
+const { app, BrowserWindow, ipcMain, globalShortcut, screen, Menu, shell } = require('electron')
 const { execFile } = require('child_process')
+const http = require('http') // 只在 --selftest 里用：起一个本地小服务器喂版本清单
 const path = require('path')
 const fs = require('fs')
 
@@ -40,6 +41,15 @@ const FLUSH_TIMEOUT = 900
 
 /** @type {BrowserWindow|null} */
 let win = null
+
+/**
+ * 自检期间那个喂版本清单的本地小服务器。正常运行时**永远是 null**。
+ *
+ * ⚠ 它要活到渲染进程那段自检跑完为止，不能在 selfTestUpdate 里 close ——
+ *   关掉之后不再接受新连接，渲染进程那边再 fetch 就是「连不上」，
+ *   而那会被读成「检查更新坏了」，红得莫名其妙
+ */
+let testServer = null
 
 let interactive = false // 渲染进程要求接管鼠标（指针在 UI 上，或手持工具）
 let clickThroughEnabled = true // 穿透总开关
@@ -214,6 +224,113 @@ function pipeRendererLogs() {
 	})
 }
 
+/**
+ * 「检查更新」有一半跑在**主进程**里（fetch / 版本比较 / 协议白名单），
+ * 渲染进程那段自检够不着它们 —— 所以这里起一个本地的小 HTTP 服务器，
+ * 把版本清单喂进去，走一遍真路。
+ *
+ * ⚠ 必须是**本地服务器**，不能拿一个真网址去试：
+ *   ① 自检要在没网的机器上也是绿的
+ *   ② 真网址的内容会变 —— 作者明天发个新版本，这条断言当场就红了，
+ *      而且红得毫无道理
+ *
+ * 服务器**不在这里关**（见 testServer 那段注释），留给 done() 收尾
+ */
+function selfTestUpdate() {
+	return new Promise((resolve) => {
+		// ⚠ 清单里的 url 要用**本机**地址，不能在文件里写死一个假域名：
+		//   渲染进程那段自检要断言「去下载记下的就是这个地址」，
+		//   写死的话两边各说各的，谁也不知道对不对得上
+		let base = ''
+		const bodies = () => ({
+			'/newer.json': { version: '99.0.0', url: base + '/dl', note: '自检用的假清单' },
+			'/newer-nourl.json': { version: '99.0.0' }, // 故意不给 url，验兜底页
+			'/older.json': { version: '0.0.1' },
+		})
+		const server = http.createServer((req, res) => {
+			const p = String(req.url).split('?')[0]
+			const table = bodies()
+			if (p === '/html') {
+				// ⚠ GitHub Pages 这类静态托管的 404 页是 **200 + 一段 HTML**。
+				//   不单独兜住的话，JSON.parse 抛出去就只剩一句没法解释的「检查更新失败」
+				res.writeHead(200, { 'Content-Type': 'text/html' })
+				res.end('<html><body>404 Not Found</body></html>')
+				return
+			}
+			if (table[p]) {
+				res.writeHead(200, { 'Content-Type': 'application/json' })
+				res.end(JSON.stringify(table[p]))
+				return
+			}
+			res.writeHead(404)
+			res.end('nope')
+		})
+
+		server.on('error', (e) => resolve({ ok: false, reason: '起不了本地测试服务器: ' + e.message }))
+		server.listen(0, '127.0.0.1', async () => {
+			// 端口是 listen 之后才定的（0 = 让系统随便挑一个没占用的），
+			// 所以清单里那个 url 只能到这儿才拼得出来
+			base = 'http://127.0.0.1:' + server.address().port
+			const fail = (reason) => resolve({ ok: false, reason })
+			try {
+				// ① 版本号比大小。
+				//    ⚠ 这条是**核心**：字符串直接比的话 '1.9.0' > '1.10.0'
+				//      （'9' > '1'），从 1.9 升到 1.10 的人就永远收不到提示，
+				//      而且表现只是「检查更新说已是最新」，完全没有报错
+				if (!(compareVersions('1.10.0', '1.9.0') > 0)) {
+					return fail('版本比较错了：1.10.0 应当比 1.9.0 新（说明是按字符串比的）')
+				}
+				if (compareVersions('1.9.0', '1.10.0') >= 0) return fail('版本比较错了：1.9.0 不该比 1.10.0 新或相等')
+				if (compareVersions('1.27.1', '1.27.1') !== 0) return fail('两份一样的版本号却没判成相等')
+				if (compareVersions('1.27', '1.27.0') !== 0) return fail('1.27 和 1.27.0 应当算同一个版本')
+				if (!(compareVersions('2.0.0', '1.99.99') > 0)) return fail('主版本号更大却没判成更新')
+				// 段数不一样时，缺的那几段按 0 算：1.0.0.1 比 1.0.0 新，但 1.27 就是 1.27.0
+				if (!(compareVersions('1.0.0.1', '1.0.0') > 0)) return fail('多一段补丁号的版本号没判成更新')
+				if (compareVersions('1.0.0.0', '1.0.0') !== 0) return fail('末尾多一段 0 的版本号应当算相等')
+
+				// ② 真的发一次请求：清单取得到，而且 99.0.0 确实比当前版本新
+				const got = await fetchManifest(base + '/newer.json')
+				if (!got.ok) return fail('清单取不回来: ' + got.reason)
+				if (compareVersions(got.data.version, app.getVersion()) <= 0) {
+					return fail('本地那份 99.0.0 的清单竟然不比当前版本（' + app.getVersion() + '）新')
+				}
+
+				// ③ 各种坏输入。⚠ 每一种都要落到**不同的** reason 上 ——
+				//    全都退化成 'network' 的话，玩家看到的那句话就永远没法定位问题
+				const cases = [
+					[base + '/older.json', 'ok'],
+					[base + '/html', 'not-json'],
+					[base + '/nope.json', 'http-404'],
+					['', 'no-url'],
+					['file:///C:/Windows/win.ini', 'bad-url'],
+					['javascript:alert(1)', 'bad-url'],
+					['这不是一个网址', 'bad-url'],
+				]
+				for (const [url, want] of cases) {
+					const r = await fetchManifest(url)
+					const actual = r.ok ? 'ok' : r.reason
+					if (actual !== want) {
+						return fail('fetchManifest(' + JSON.stringify(url) + ') 得到 ' + actual + '，应当是 ' + want)
+					}
+				}
+
+				// ④ 协议白名单。⚠ 这条是**安全**断言，不是功能断言：
+				//    openExternal 的地址是**页面**递过来的，而页面是会被 XSS 影响的那一层。
+				//    放行 file: 的话，页面那层就能拿它去开任何本地文件
+				for (const bad of ['file:///C:/Windows/System32/calc.exe', 'javascript:alert(1)', 'ms-settings:']) {
+					if (isSafeUrl(bad)) return fail('isSafeUrl 放行了 ' + bad)
+				}
+				if (!isSafeUrl('https://example.com/x')) return fail('isSafeUrl 把正常的 https 地址拒了')
+
+				testServer = server
+				resolve({ ok: true, info: { base, current: app.getVersion() } })
+			} catch (e) {
+				resolve({ ok: false, reason: '检查更新自检抛了: ' + e.message })
+			}
+		})
+	})
+}
+
 function runSelfTest() {
 	pipeRendererLogs()
 
@@ -221,12 +338,33 @@ function runSelfTest() {
 	const done = (code, message) => {
 		if (finished) return
 		finished = true
+		// 本地测试服务器要收掉，不然 app.exit 之前事件循环里还挂着一个 listener
+		if (testServer) {
+			try {
+				testServer.close()
+			} catch {}
+			testServer = null
+		}
 		console.log(message)
 		app.exit(code)
 	}
 
 	win.webContents.once('did-finish-load', async () => {
 		try {
+			// 主进程那一半先验（fetch / 版本比较 / 协议白名单）。
+			// ⚠ 服务器要一直开着给下面渲染进程那段用，所以不在这里关
+			const update = await selfTestUpdate()
+			if (!update.ok) return done(1, '[selftest] 失败: ' + update.reason)
+
+			// 本地测试服务器的地址得递给渲染进程那段脚本。
+			// ⚠ 单独一次调用挂到 window 上，**不拼进**下面那个模板字面量里 ——
+			//   模板字面量里不能出现 `${`（见 countStrayBackticks 那道闸），
+			//   而拼字符串又会让整段脚本的报错变成一句没头没尾的
+			//   「Unexpected end of input」，查起来很瞎
+			await win.webContents.executeJavaScript(
+				'window.__selftestUpdateBase = ' + JSON.stringify(update.info.base),
+			)
+
 			const report = await win.webContents.executeJavaScript(`(async () => {
 				// preload 桥要是断了，置顶/穿透/退出会静默失灵，必须单独查一下
 				const bridge = window.pet
@@ -250,6 +388,10 @@ function runSelfTest() {
 					// 玩家只会觉得是运气问题，不会想到是桥断了
 					'loadUnlock',
 					'saveUnlock',
+					// 检查更新。断了的表现是设置卡上那颗按钮点下去没反应 ——
+					// 而「没反应」和「已是最新」在玩家眼里长得一模一样
+					'checkUpdate',
+					'openExternal',
 				]
 				const missingBridge = bridgeMethods.filter((k) => typeof bridge[k] !== 'function')
 				if (missingBridge.length) return { ok: false, reason: 'preload 暴露的方法不全: ' + missingBridge.join(', ') }
@@ -873,6 +1015,162 @@ function runSelfTest() {
 					return { ok: false, reason: '设置卡流程失败: ' + e.message }
 				}
 
+				// —— 设置卡：版本号 + 检查更新 ——
+				//
+				// ⚠ 这一段**不碰外网**，打的是主进程刚起的那个本地小服务器
+				//   （地址从 window.__selftestUpdateBase 拿）。用真网址试的话，
+				//   没网的机器上必红，而且对方一改内容也会红。
+				//
+				// ⚠ 也**不点**「去下载」那颗按钮 —— 点下去会真的弹出浏览器。
+				//   能验的是「它该出现时出现、该收起时收起、地址记对了」
+				let updateInfo = null
+				try {
+					const ui = pet.ui
+					const U = pet.config.update
+					if (!U || typeof U.manifestUrl !== 'string') {
+						return { ok: false, reason: 'config 里没有 update 块 —— 设置卡上那一行整个是死的' }
+					}
+					const elBtn = document.getElementById('update-check')
+					const elMsg = document.getElementById('update-msg')
+					const elGet = document.getElementById('update-get')
+					const elVer = document.getElementById('update-version')
+					if (!elBtn || !elMsg || !elGet || !elVer) {
+						return { ok: false, reason: '设置卡里检查更新那四个节点不全 —— index.html 和 ui._cacheDom 对不上' }
+					}
+					// ① 版本号：启动时搭 pet:get-state 那趟车回来的。
+					//    ⚠ 这里**自己 await 一次**，不靠构造函数里那一次 ——
+					//      那是「发射后不管」的，自检跑到这儿时它未必回来了
+					await ui._syncWindowState()
+					//    ⚠ **别写正则**：这整段脚本是套在模板字面量里的，
+					//      正则里的 \d 到了渲染进程已经变成普普通通的 d
+					//      （模板字面量会把不认识的反斜杠转义吃掉），
+					//      于是 /版本 \d+\.\d+\.\d+/ 永远匹配不上，而报错只说
+					//      「版本号没读到」—— 查起来会以为是 IPC 断了
+					const vtext = elVer.textContent
+					const vparts = vtext.startsWith('版本 ') ? vtext.slice(3).split('.') : []
+					const looksLikeVersion = vparts.length === 3 && vparts.every((p) => /^[0-9]+$/.test(p))
+					if (!looksLikeVersion) {
+						return { ok: false, reason: '设置卡上的版本号是「' + vtext + '」，没读到（应当是「版本 x.y.z」）' }
+					}
+					updateInfo = { version: vparts.join('.') }
+
+					const base = String(window.__selftestUpdateBase || '')
+					if (!base) return { ok: false, reason: '自检没拿到本地测试服务器的地址' }
+
+					const savedUrl = U.manifestUrl
+					const savedPage = U.downloadPage
+					try {
+						// ② 清单里的版本更新 → 提示 + 冒出「去下载」
+						U.downloadPage = ''
+						U.manifestUrl = base + '/newer.json'
+						await ui.checkUpdate(false)
+						if (elMsg.textContent.indexOf('99.0.0') < 0) {
+							return {
+								ok: false,
+								reason: '拿到更新的清单却没提示新版本号，那一行写的是「' + elMsg.textContent + '」',
+							}
+						}
+						if (!elMsg.classList.contains('has-new')) {
+							return { ok: false, reason: '有新版本时那一行没有加亮（.has-new）—— 和「已是最新」看着一模一样' }
+						}
+						// ⚠ 量 **computedStyle** 而不是 classList：这个项目里
+						//   **没有**通用的 .hidden{display:none}，每个 .hidden 都是
+						//   各自限定作用域的（见 style.css 那段注释）。光有类名而
+						//   漏了规则的话，按钮会从一开始就挂在卡片上、点了没反应 ——
+						//   而只查 classList 是照样绿的
+						if (getComputedStyle(elGet).display === 'none') {
+							return { ok: false, reason: '有新版本、清单里也给了 url，「去下载」却没出现' }
+						}
+						if (ui._pendingDownload !== base + '/dl') {
+							return {
+								ok: false,
+								reason: '「去下载」记的地址是「' + ui._pendingDownload + '」，应当优先用清单里的 url',
+							}
+						}
+
+						// ③ 清单里没给 url → 退回配置里的兜底页
+						U.downloadPage = base + '/fallback'
+						U.manifestUrl = base + '/newer-nourl.json'
+						await ui.checkUpdate(false)
+						if (ui._pendingDownload !== base + '/fallback') {
+							return {
+								ok: false,
+								reason: '清单里没给 url 时没有退回 downloadPage，记的是「' + ui._pendingDownload + '」',
+							}
+						}
+
+						// ④ 地址无效（给了一个不是网址的兜底页）→ 要明说，而不是留一颗点了没反应的按钮
+						U.downloadPage = '这不是网址'
+						await ui.checkUpdate(false)
+						if (getComputedStyle(elGet).display !== 'none') {
+							return { ok: false, reason: '清单和兜底页都没给出可用地址，「去下载」却还亮着 —— 点下去不会有事发生' }
+						}
+						if (elMsg.textContent.indexOf('99.0.0') < 0) {
+							return { ok: false, reason: '没有可用下载地址时，那一行应当仍然说清楚有新版本，现在写的是「' + elMsg.textContent + '」' }
+						}
+
+						// ⑤ 版本更旧 → 「已经是最新的」，而且上一次那颗按钮要收回去
+						U.manifestUrl = base + '/older.json'
+						await ui.checkUpdate(false)
+						if (elMsg.textContent.indexOf('最新的') < 0) {
+							return {
+								ok: false,
+								reason: '清单版本比当前旧，却没提示「已经是最新的」，写的是「' + elMsg.textContent + '」',
+							}
+						}
+						if (getComputedStyle(elGet).display !== 'none') {
+							return { ok: false, reason: '这次没有新版本了，「去下载」还挂在那儿 —— 点下去会开到上一个版本的地址' }
+						}
+						if (ui._pendingDownload) {
+							return { ok: false, reason: '没有新版本了，却还留着上一次的下载地址' }
+						}
+
+						// ⑥ 404 → 翻成人话。
+						//    ⚠ 这条同时守着 checkUpdate 里那个加号 / 双问号的优先级坑：
+						//      写成「加号拼 UPDATE_FAIL[reason]，再接双问号兜底」的话，
+						//      加号结合得更紧、双问号永远不触发；而 UPDATE_FAIL
+						//      里没有 'http-404' 这个键 —— 显示出来就是「检查失败：undefined」
+						U.manifestUrl = base + '/nope.json'
+						await ui.checkUpdate(false)
+						if (elMsg.textContent.indexOf('404') < 0 || elMsg.textContent.indexOf('http-404') >= 0) {
+							return {
+								ok: false,
+								reason: '404 时那一行写的是「' + elMsg.textContent + '」—— 玩家看不懂，应当说「对方返回了 HTTP 404」',
+							}
+						}
+
+						// ⑦ 地址是空的 = 功能关掉：按钮禁用，但**要说出来**。
+						//    藏起来的话，作者本人在开发时看不出这条没接上
+						U.manifestUrl = ''
+						await ui.checkUpdate(false)
+						if (!elBtn.disabled) {
+							return { ok: false, reason: '没配更新地址，那颗「检查更新」却是可点的 —— 点下去只会白闪一下' }
+						}
+						if (!elMsg.textContent) {
+							return { ok: false, reason: '没配更新地址时设置卡上一个字都不写，玩家只会以为按钮是坏的' }
+						}
+					} finally {
+						// 自己造的脏状态自己收拾（这里改的是**配置对象本身**，
+						// 后面还有好几段要读 config）
+						U.manifestUrl = savedUrl
+						U.downloadPage = savedPage
+						ui._pendingDownload = null
+						elGet.classList.add('hidden')
+					}
+
+					// ⑧ 协议白名单 —— **安全**断言，不是功能断言。
+					//    openExternal 的地址是页面那层递过来的，而页面是会被 XSS
+					//    影响的那一层；放行 file: 就等于页面能开任何本地文件
+					for (const bad of ['file:///C:/Windows/System32/calc.exe', 'javascript:alert(1)', 'ms-settings:']) {
+						const r = await window.pet.openExternal(bad)
+						if (r && r.ok) {
+							return { ok: false, reason: 'openExternal 放行了 ' + bad + ' —— 页面那层能拿它去开任何本地文件' }
+						}
+					}
+				} catch (e) {
+					return { ok: false, reason: '检查更新流程失败: ' + e.message }
+				}
+
 				// —— 重置：**三道**确认，一道比一道重 ——
 				//
 				// 三条不变式贯穿全程，每一步都要查：
@@ -889,8 +1187,11 @@ function runSelfTest() {
 					// 造一个「重置一定会抹掉」的标记
 					const beforeMoney = w6.money
 					const beforeSeen = pet.ui._seenGenes.slice()
+					// ⚠ 成就也要一起抓一份 —— 重置会把它清掉，而下面的断言还要用
+					const beforeAch = pet.ui._achievements.slice()
 					w6.money = 12.345
 					pet.ui._seenGenes = ['crystal', 'berserk']
+					pet.ui._achievements = ['crystal', 'wealth10']
 					const jarCount = w6.jars.length
 
 					// 三道卡必须都在 _overCard 的名单里 ——
@@ -1019,6 +1320,21 @@ function runSelfTest() {
 								JSON.stringify(afterReset.data.seen),
 						}
 					}
+					// 成就也要一起回零（用户要的「重置 = 真的从 0」）
+					if (pet.ui._achievements.length !== 0) {
+						return {
+							ok: false,
+							reason: '重置之后还有 ' + pet.ui._achievements.length + ' 个成就是拿到的：' +
+								JSON.stringify(pet.ui._achievements),
+						}
+					}
+					if (!Array.isArray(afterReset.data.achievements) || afterReset.data.achievements.length !== 0) {
+						return {
+							ok: false,
+							reason: '重置之后 unlock.json 里的 achievements 不是空的：' +
+								JSON.stringify(afterReset.data.achievements),
+						}
+					}
 					// 罐子的流光也要跟着回到「锁着」的配色
 					if (!document.getElementById('btn-donate').classList.contains('locked')) {
 						return { ok: false, reason: '重置之后捐款罐子没有回到「未解锁」的蓝紫配色' }
@@ -1031,7 +1347,8 @@ function runSelfTest() {
 					//   它们只要带突变，重置完图鉴立刻就是花的
 					//
 					// ⚠⚠ **必须跑很多次**，不能只看一次。
-					//   开局只有十来只，每只带上突变的概率约 8.7%（五种概率之和），
+					//   开局只有十来只，每只带上突变的概率约 8.7%
+					//   （四个 chance 的并集，即 1 - ∏(1-chance)），
 					//   所以「一次性全野生型」的概率有 **四成左右** —— 只查一次的话，
 					//   这条断言有四成的时候是**空转**的。
 					//   实测：把 rollDeNovo() 加回 world.reset()，跑一次它照样绿
@@ -1065,6 +1382,7 @@ function runSelfTest() {
 					//   「没重置过」的 seen，而那时世界已经重置了
 					w6.money = beforeMoney
 					pet.ui.setSeenGenes(beforeSeen)
+					pet.ui.setAchievements(beforeAch)
 					pet.ui._persistUnlock()
 				} catch (e) {
 					return { ok: false, reason: '重置确认流程失败: ' + e.message }
@@ -1432,6 +1750,9 @@ function runSelfTest() {
 				// 画布本身是全透明的（桌宠是覆盖层），所以实体所在处 alpha 必须是 255
 				let pupaAlpha = null
 				let pupaColor = ''
+				// 图鉴基因格那张探针画出来的红能量：[普通蝇, 疯狂蝇]。
+				// 只为了打进成功日志 —— 下次调泛光强度时能直接看到数
+				let flyIconRed = null
 				try {
 					const w3 = pet.world
 					w3.larvae.length = 0
@@ -1883,11 +2204,22 @@ function runSelfTest() {
 								'商店只渲染出 ' + shopRows + ' 件，配置里有 ' + pet.config.market.shop.length + ' 件',
 						}
 					}
-					// 警报器那一行要真的在，而且标价 $3
+					// 警报器那一行要真的在，而且标着**配置里那个价**
+					//
+					// ⚠ 期望值从 config 现算，不写死 —— 这条守的是
+					//   「按钮上的字跟着配置走」，不是「警报器卖多少钱」。
+					//   写死的话每次调价都要来改测试，而调价本身是正常操作
+					//   （下面那条「两档价格合计」是另一回事，那个是刻意写死的）
 					const alarmBtn = shopList.querySelector('[data-buy="alarm"]')
 					if (!alarmBtn) return { ok: false, reason: '商店里没有警报器这一行' }
-					if (!alarmBtn.textContent.includes('$3.000')) {
-						return { ok: false, reason: '警报器标价是「' + alarmBtn.textContent + '」，应当是 $3.000' }
+					const alarmPrice = pet.config.market.shop.find((s) => s.id === 'alarm').price
+					if (!alarmBtn.textContent.includes(alarmPrice.toFixed(3))) {
+						return {
+							ok: false,
+							reason:
+								'警报器标价是「' + alarmBtn.textContent + '」，配置里是 $' +
+								alarmPrice.toFixed(3) + ' —— 按钮上的价格没跟着配置走',
+						}
 					}
 					// 买不起时按钮必须是禁用的 —— 光靠点击时报错的话，
 					// 玩家会以为「点了没反应」
@@ -2042,6 +2374,93 @@ function runSelfTest() {
 					if (!feedPop.classList.contains('hidden')) {
 						return { ok: false, reason: '投放弹窗默认应当是关着的' }
 					}
+					// —— 食物的**财富门槛**：金苹果还没解锁那一段 ——
+					//
+					// ⚠ 这一段必须在下面那些「苹果 $0.001 / 金苹果 $0.010」的断言**之前**，
+					//   因为那些断言假定金苹果那一行在面板上 —— 而开局总财富是 0，
+					//   金苹果是锁着的。不先解锁的话，feedBtns.find(...)
+					//   会返回 undefined，报出来是「Cannot read properties of
+					//   undefined」而不是一句能看懂的话
+					pet.world.stats.earned = 0
+					pet.ui.refreshFeed()
+					// ⚠ **普通苹果不受门槛管** —— 它是口粮，开局总财富是 0 也得买得到。
+					//   哪天有人顺手把 apple 加进 foodUnlock，这条就是唯一会红的地方
+					if (pet.ui.unlockedFoodIds().join() !== 'apple') {
+						return {
+							ok: false,
+							reason: '总财富是 0 时解锁的食物是 ' + JSON.stringify(pet.ui.unlockedFoodIds()) +
+								'，应当只有 apple —— 苹果是口粮，不该有解锁门槛',
+						}
+					}
+					// 那一组**必须还在 DOM 里**
+					const foodBoxLocked = feedList.querySelector('[data-cat="food"]')
+					if (!foodBoxLocked) {
+						return { ok: false, reason: '投放弹窗里没有「食物类」这个分组' }
+					}
+					// 面板上只该有苹果 —— 金苹果锁着就不出现
+					const kindsLocked = [...foodBoxLocked.querySelectorAll('[data-kind]')].map((b) => b.dataset.kind)
+					if (kindsLocked.some((k) => k !== 'apple')) {
+						return {
+							ok: false,
+							reason: '总财富是 0，面板上却已经有能买的食物：' + JSON.stringify(kindsLocked) +
+								'（金苹果还锁着）',
+						}
+					}
+					// 金苹果锁着的时候**必须有一句话**：它安安静静躺在配置里，
+					// 玩家在过线之前完全不知道有它，到那一刻才发现凭空多了一行
+					const foodHint = foodBoxLocked.querySelector('[data-empty="food"]')
+					if (!foodHint) {
+						return {
+							ok: false,
+							reason: '金苹果还锁着，食物那一组底下却没有一句说明 —— 玩家不知道有这一样',
+						}
+					}
+					// 提示里必须**说出阈值** —— 只说「还没解锁」等于什么都没说
+					const wantNeed = pet.config.market.foodUnlock.gold
+					if (!foodHint.textContent.includes(wantNeed.toFixed(3))) {
+						return {
+							ok: false,
+							reason: '解锁提示里没写出门槛：' + JSON.stringify(foodHint.textContent) +
+								'（应当含 ' + wantNeed.toFixed(3) + '）',
+						}
+					}
+					// 还得**点名**是哪一样 —— 光说「财富到 $0.100 解锁」，
+					// 玩家不知道该期待什么
+					if (!foodHint.textContent.includes('金苹果')) {
+						return {
+							ok: false,
+							reason: '解锁提示没有点名是「金苹果」：' + JSON.stringify(foodHint.textContent),
+						}
+					}
+					// 图鉴里那一格也得是灰的 —— 两处共用 _foodLocked() 这个判据，
+					// 但**渲染路径是两条**，只在投放面板上验会漏掉图鉴那一半。
+					// ⚠ 不用把弹窗点开：refreshCodex() 是把格子画进 #codex-body 的，
+					//   那个元素一直在 DOM 里，弹窗只是把它显示出来而已
+					pet.ui.refreshCodex()
+					const codexGold = document.querySelector('[data-food="gold"]')
+					if (!codexGold || !codexGold.classList.contains('locked')) {
+						return { ok: false, reason: '金苹果还没解锁，图鉴里那一格却不是灰的' }
+					}
+
+					// 把总财富抬过门槛 —— 金苹果该出现了，那句话也该收起来
+					pet.world.stats.earned = wantNeed
+					pet.ui.refreshFeed()
+					if (pet.ui.unlockedFoodIds().join() !== 'apple,gold') {
+						return {
+							ok: false,
+							reason: '总财富到 ' + wantNeed + ' 之后，解锁的食物是 ' +
+								JSON.stringify(pet.ui.unlockedFoodIds()) + '，应当是 apple 和 gold',
+						}
+					}
+					// ⚠ 上面那句 refreshFeed() 是**整块重建 DOM** 的 ——
+					//   foodBoxLocked 现在指向的是一棵已经被丢掉的旧树。
+					//   拿它查等于在查「上一帧长什么样」，
+					//   自检里别处（下面那批 feedBtns）踩过同一个坑
+					const foodBoxOpen = feedList.querySelector('[data-cat="food"]')
+					if (foodBoxOpen && foodBoxOpen.querySelector('[data-empty="food"]')) {
+						return { ok: false, reason: '金苹果已经解锁了，食物那一组底下那句「还没解锁」还挂着' }
+					}
+
 					document.getElementById('btn-feed').click()
 					if (feedPop.classList.contains('hidden')) {
 						return {
@@ -2055,25 +2474,26 @@ function runSelfTest() {
 
 					pet.ui.refreshFeed()
 					const feedBtns = grabBtns()
-					// 3 种能买的 × 2 档 = 6，加上烤炉那**一个** = 7。
+					// 每种食物 2 档 + 果蝇 2 档，再加上烤炉那**一个**。
 					//
-					// ⚠ 烤炉和上面三种不一样：它花钱但**一次只买一个**，
-					//   所以没有 data-n，一个 id 只出一个按钮。
-					//   玻璃罐那一行**不在这 7 个里** —— 它免费，没有 [data-kind]，
-					//   走的是 [data-jar]
+					// ⚠ 烤炉和别的都不一样：它是免费**摆一个**，所以没有 data-n，
+					//   一个 id 只出一个按钮。而且 1.27.0 起**要先在商店买断**
+					//   才会出现 —— 没买时这一行整个不渲染。
+					//   玻璃罐那一行也不在这几个里：它没有 [data-kind]，走 [data-jar]
+					//
 					// ⚠ 按钮数**从 ui.unlockedFoodIds() 现算**，不写死。
 					//   写死的话，彩蛋解锁之后这里会变成 9 和 7 对不上，
-					//   而那是**正确行为** —— 断言会在玩家解锁的那一刻变红。
-					//   食物类：每种食物 2 档；其他类：果蝇 2 档 + 烤炉 1 个
-					//   （玻璃罐免费、没有 [data-kind]，不在这几个里）
+					//   而那是**正确行为** —— 断言会在玩家解锁的那一刻变红
 					const unlockedFoods = pet.ui.unlockedFoodIds()
-					const wantBtns = unlockedFoods.length * 2 + 2 + 1
+					const ovenOwned = pet.world.hasShopItem('oven')
+					const wantBtns = unlockedFoods.length * 2 + 2 + (ovenOwned ? 1 : 0)
 					if (feedBtns.length !== wantBtns) {
 						return {
 							ok: false,
 							reason:
 								'投放弹窗渲染出了 ' + feedBtns.length + ' 个按钮，应当是 ' + wantBtns +
-								' 个（' + unlockedFoods.length + ' 种食物 × 2 档 + 果蝇 2 档 + 烤炉 1 个）',
+								' 个（' + unlockedFoods.length + ' 种食物 × 2 档 + 果蝇 2 档 + 烤炉 ' +
+								(ovenOwned ? '1' : '0（还没在商店买断）') + ' 个）',
 						}
 					}
 					for (const kind of [...unlockedFoods, 'fly']) {
@@ -2091,9 +2511,15 @@ function runSelfTest() {
 					//   那个循环按 key.split('-') 取 n 再和 dataset.n 比，
 					//   而烤炉按钮**根本没有 data-n**，两者都是 undefined，
 					//   于是它会「碰巧」通过。碰巧通过等于没测
+					// ⚠ 期望值跟着「买没买断」走 —— 没买时那一行**整个不渲染**
 					const ovenRow = feedBtns.filter((b) => b.dataset.kind === 'oven')
-					if (ovenRow.length !== 1) {
-						return { ok: false, reason: '投放弹窗里烤炉那一行有 ' + ovenRow.length + ' 个按钮，应当是 1 个' }
+					if (ovenRow.length !== (ovenOwned ? 1 : 0)) {
+						return {
+							ok: false,
+							reason:
+								'投放弹窗里烤炉那一行有 ' + ovenRow.length + ' 个按钮，应当是 ' +
+								(ovenOwned ? '1' : '0（还没在商店买断，那一行不该出现）') + ' 个',
+						}
 					}
 					// —— 分组：食物类 / 其他，玻璃罐在「其他」里 ——
 					//
@@ -2107,7 +2533,13 @@ function runSelfTest() {
 						// ⚠ 期望值走 unlockedFoodIds()，不是 cat.items —— 星空苹果
 						//   在解锁之前**故意不渲染**，拿 config 的原始列表去比，
 						//   会在每个没解锁的玩家那里都红一条（而那是正确行为）
-						const wantItems = cat.id === 'food' ? unlockedFoods : cat.items
+						//
+						// ⚠ 烤炉同理：「其他」那一组里它要先在商店买断才渲染，
+						//   所以这里也得跟着滤一遍 —— 滤的条件**照着规则独立写一遍**，
+						//   而不是去调 ui._feedRowHidden()：调那个等于拿实现验证自己
+						const wantItems = (cat.id === 'food' ? unlockedFoods : cat.items).filter(
+							(id) => id !== 'oven' || ovenOwned,
+						)
 						// 把行上的 id 收成一个去重集合（同一行的两个按钮会给出同一个 id）
 						const ids = new Set()
 						for (const b of box.querySelectorAll('[data-kind],[data-jar]')) {
@@ -2165,10 +2597,12 @@ function runSelfTest() {
 					if (jarStillOn && jarStillOn.disabled) {
 						return { ok: false, reason: '钱是 0 时玻璃罐被禁用了 —— 它不花钱，应当照常能摆' }
 					}
-					// 给够钱再刷一次：七个都得活过来。
+					// 给够钱再刷一次：这些都得活过来。
 					//
-					// ⚠ 10 是这几个按钮里最贵的那个（烤炉 $5）的**两倍** ——
-					//   以后把任何一件调价调到 10 以上，这里会红。
+					// ⚠ 10 这个数要**盖过投放面板里最贵的那一颗按钮**。
+					//   1.27.0 起烤炉不在这张面板上了（搬去商店买断），
+					//   所以最贵的是**星空苹果投 10 个 = $10**（要先把彩蛋解开）。
+					//   以后把任何一种食物调价调到这条线以上，这里会红。
 					//   那时改这个数，**不要**改成 100 图省事：
 					//   那样「钱刚够」和「钱多得多」就没区别了，这条断言也就不再守着边界
 					pet.world.money = 10
@@ -2178,45 +2612,152 @@ function runSelfTest() {
 					}
 					pet.world.money = 0
 
-					// —— 烤炉那一行：$5 摆一个，撞上限要置灰 ——
+					// —— 烤炉：先在商店买断，之后在投放里**免费**摆 ——
 					//
-					// ⚠ 也是**真实点击**，理由同下面玻璃罐那段：
-					//   直接调 world.buyOven() 的话，委托监听漏挂、按钮挡住、
+					// ⚠ 1.27.0 起它不再是「每摆一个收 $5」，而是和玻璃罐同形态。
+					//   所以这里要验三段：
+					//     ① 没买之前，投放面板里**根本没有那一行**
+					//     ② 商店里买得起就能买（钱不够要置灰）
+					//     ③ 买断之后出现，点了**不扣钱**、撞上限要置灰
+					//
+					// ⚠ ②③ 都是**真实点击**，理由同下面玻璃罐那段：
+					//   直接调 world.dropOven() 的话，委托监听漏挂、按钮挡住、
 					//   data-kind 写错 —— 三种坏法全都测不出来
+					const ovenCap = pet.config.roast.oven.maxCount
+					const savedOven = pet.world.shop.oven
 					pet.world.ovens.length = 0
-					pet.world.money = pet.config.market.prices.oven
+					delete pet.world.shop.oven
+
+					// ① 没买 → 那一行不渲染
 					pet.ui.refreshFeed()
-					const ovenClick = feedList.querySelector('[data-kind="oven"]')
-					if (!ovenClick) return { ok: false, reason: '烤炉那一行不见了' }
-					if (ovenClick.disabled) {
-						return { ok: false, reason: '钱刚好等于烤炉价格，按钮却是禁用的' }
-					}
-					// 按钮上要看得见价格
-					if (!ovenClick.textContent.includes('$5.000')) {
+					if (feedList.querySelector('[data-kind="oven"]')) {
 						return {
 							ok: false,
-							reason: '烤炉按钮上写的是「' + ovenClick.textContent + '」，应当含配置价 $5.000',
+							reason: '还没在商店买烤炉，投放面板里却已经有「摆一个」那一行了',
 						}
+					}
+					// ⚠ 同一组里的 jar / fly **必须还在** —— 过滤是逐项的，
+					//   写成整组过滤的话「其他」那一组会整个消失，而症状
+					//   只是「玻璃罐不见了」，很难联想到是烤炉改的
+					if (!feedList.querySelector('[data-jar]') || !feedList.querySelector('[data-kind="fly"]')) {
+						return {
+							ok: false,
+							reason: '藏烤炉的时候把同一组里的玻璃罐 / 果蝇也一起藏掉了 —— 过滤要逐项做，不能整组做',
+						}
+					}
+
+					// ② 商店里那一件：钱不够置灰，够了能买
+					//
+					// ⚠ 直接用上面那个 shopList，**不要在这里再 const 一次** ——
+					//   两处在同一个作用域里，重复声明是**语法错**，
+					//   整个注入脚本会直接不执行，报出来只有一句
+					//   「Script failed to execute」，看不到是哪一行
+					document.getElementById('btn-shop').click()
+					pet.ui.refreshShop()
+					if (!shopList.querySelector('[data-buy="oven"]')) {
+						pet.ui._onKey({ code: 'Escape' })
+						return { ok: false, reason: '商店里没有烤炉那一件 —— shopCats 里漏归类了' }
+					}
+					const ovenCost = pet.config.market.shop.find((s) => s.id === 'oven').price
+					pet.world.money = 0
+					pet.ui.refreshShop()
+					if (!shopList.querySelector('[data-buy="oven"]').disabled) {
+						return { ok: false, reason: '一分钱都没有，商店里的烤炉却还能买' }
+					}
+					pet.world.money = ovenCost
+					pet.ui.refreshShop()
+					const ovenBuy = shopList.querySelector('[data-buy="oven"]')
+					if (ovenBuy.disabled) {
+						return { ok: false, reason: '钱刚好等于烤炉价格，商店里那颗按钮却是禁用的' }
+					}
+					ovenBuy.click()
+					if (!pet.world.hasShopItem('oven')) {
+						return { ok: false, reason: '点了商店里的烤炉却没买上' }
+					}
+					if (Math.abs(pet.world.money) > 1e-9) {
+						return { ok: false, reason: '买了烤炉之后钱应当正好归零，现在是 ' + pet.world.money }
+					}
+					pet.ui._onKey({ code: 'Escape' })
+
+					// ③ 买断之后：投放里出现，点了**不扣钱**
+					//
+					// ⚠ 这里**必须放一笔钱在身上**，不能留 0。
+					//   第一版写的是 money = 0，结果「点击后又扣了 $5」这个 bug
+					//   测不出来 —— spend() 钱不够时直接返回 false、一分不扣，
+					//   钱还是 0，断言照样绿。**空转了一条断言**
+					pet.world.money = 100
+					pet.ui.refreshFeed()
+					const ovenClick = feedList.querySelector('[data-kind="oven"]')
+					if (!ovenClick) return { ok: false, reason: '商店里买过烤炉了，投放面板里却还是没有那一行' }
+					if (ovenClick.disabled) {
+						return { ok: false, reason: '一台烤炉都没摆，那颗「摆一个」却是禁用的' }
 					}
 					ovenClick.click()
 					if (pet.world.ovens.length !== 1) {
 						return { ok: false, reason: '点了烤炉按钮却没有摆出炉子（现在 ' + pet.world.ovens.length + ' 个）' }
 					}
-					if (Math.abs(pet.world.money) > 1e-9) {
-						return { ok: false, reason: '买了烤炉之后钱应当正好归零，现在是 ' + pet.world.money }
+					if (Math.abs(pet.world.money - 100) > 1e-9) {
+						return {
+							ok: false,
+							reason:
+								'摆一个烤炉前手里有 $100，摆完变成 $' + pet.world.money +
+								' —— 买断之后应当是免费的，不该再扣钱',
+						}
 					}
 					// 摆满之后必须置灰，而不是点了没反应
-					const ovenCap = pet.config.roast.oven.maxCount
-					pet.world.money = 1000
-					while (pet.world.ovens.length < ovenCap) pet.world.buyOven()
+					while (pet.world.ovens.length < ovenCap) pet.world.dropOven()
 					pet.ui.refreshFeed()
-					const ovenFull = feedList.querySelector('[data-kind="oven"]')
-					if (!ovenFull.disabled) {
+					if (!feedList.querySelector('[data-kind="oven"]').disabled) {
 						return { ok: false, reason: '烤炉摆满了（' + ovenCap + ' 个），那颗按钮却还能点' }
 					}
+					// ④ 老存档迁移：**已经摆着炉子 = 已拥有**
+					//
+					// ⚠ 这条守的是一段**沉默的**代码（world.restore 里那行
+					//   if (this.ovens.length > 0 && !this.shop.oven)）：
+					//   漏了的话，一个正摆着炉子的老玩家更新完打开投放面板，
+					//   会发现那一行**凭空消失**，得重新去商店花 $15 ——
+					//   而屏幕上明明还摆着他之前买的
+					//
+					// ⚠ 造假存档时**必须把 ovens 也一起塞进去** ——
+					//   光设 shop 是测不到这条的：判据是「有没有炉子」，
+					//   只喂 ovens，shop 那边留空，才验得到迁移真的跑了
+					pet.world.ovens.length = 0
+					delete pet.world.shop.oven
+					pet.world.dropOven()
+					const snap = JSON.parse(JSON.stringify(pet.world.serialize()))
+					if (snap.shop && snap.shop.oven) {
+						return { ok: false, reason: '造假存档时就把 shop.oven 设上了，这条断言会空转' }
+					}
+					const revived = new pet.world.constructor(pet.world.w, pet.world.h)
+					revived.restore(snap)
+					if (revived.ovens.length !== 1) {
+						return {
+							ok: false,
+							reason: '老存档里那台炉子没读回来（读回 ' + revived.ovens.length + ' 台）',
+						}
+					}
+					if (!revived.hasShopItem('oven')) {
+						return {
+							ok: false,
+							reason:
+								'老存档里摆着一台炉子、但 shop 里没有 oven —— 读档后应当自动补上（' +
+								'否则玩家更新完会发现投放面板里那一行凭空消失）',
+						}
+					}
+					// 反面：一台炉子都没有的存档**不该**凭空获得烤炉
+					pet.world.ovens.length = 0
+					delete pet.world.shop.oven
+					const bare = new pet.world.constructor(pet.world.w, pet.world.h)
+					bare.restore(JSON.parse(JSON.stringify(pet.world.serialize())))
+					if (bare.hasShopItem('oven')) {
+						return { ok: false, reason: '一台炉子都没有的存档，读档后却白得了烤炉' }
+					}
+
 					// 收拾干净
 					pet.world.ovens.length = 0
 					pet.world.money = 0
+					if (savedOven) pet.world.shop.oven = savedOven
+					else delete pet.world.shop.oven
 					pet.ui.refreshFeed()
 
 					// —— 分类折叠：折起来之后，**钱一变也不能弹回去** ——
@@ -3537,8 +4078,16 @@ function runSelfTest() {
 					if (pet.world.shopLevel('keeper') !== 1) {
 						return { ok: false, reason: '点升级之后养蝇人不是 Lv.1 —— 多半是走到 buyShopItem 那条路上了' }
 					}
-					if (pet.world.money !== 98) {
-						return { ok: false, reason: '升级扣款不对（余额 ' + pet.world.money + '，应当是 98）' }
+					// ⚠ 期望值从 config 现算，不写死 —— 这条守的是「扣的是第一级的价」，
+					//   不是「养蝇人卖多少钱」。写死的话每次调价都要来改测试
+					const keeperLv1 = pet.config.market.keeperChain[0].price
+					if (Math.abs(pet.world.money - (100 - keeperLv1)) > 1e-9) {
+						return {
+							ok: false,
+							reason:
+								'养蝇人升级扣款不对（余额 ' + pet.world.money + '，应当是 ' +
+								(100 - keeperLv1) + ' = 100 − 配置里的 $' + keeperLv1 + '）',
+						}
 					}
 
 					pet.ui.refreshShop()
@@ -3940,6 +4489,193 @@ function runSelfTest() {
 						return { ok: false, reason: '见过结晶，图鉴里那一格却是灰的' }
 					}
 
+					// —— 基因格里的**画像** ——
+					//
+					// ⚠ 这一段是在 _seenGenes = ['crystal'] 的状态下跑的：
+					//   1 格亮、4 格灰。那 4 张暗影正好用来验一条最本质的性质 ——
+					//   **暗影与基因无关**（见 render.drawFlyIcon 的 silhouette 分支）
+					// ⚠ 四个小工具**声明在两个 try 外面**：灰态和亮态两段都要用，
+					//   放进第一个 try 里的话第二段会报 "sigOf is not defined"
+					const paintOf = (cv) => cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data
+
+					/** 有墨的像素数 + 包围盒。包围盒用来抓「翅尖被裁掉」 */
+					const boxOf = (cv) => {
+						const d = paintOf(cv)
+						const w = cv.width
+						const h = cv.height
+						let minX = w
+						let maxX = -1
+						let minY = h
+						let maxY = -1
+						let painted = 0
+						for (let y = 0; y < h; y++) {
+							for (let x = 0; x < w; x++) {
+								if (d[(y * w + x) * 4 + 3] === 0) continue
+								painted++
+								if (x < minX) minX = x
+								if (x > maxX) maxX = x
+								if (y < minY) minY = y
+								if (y > maxY) maxY = y
+							}
+						}
+						return { minX, maxX, minY, maxY, painted, w, h }
+					}
+
+					/** 把「画了哪些像素、什么颜色」拼成一个字符串，用来比两张画布一不一样 */
+					const sigOf = (cv) => {
+						const d = paintOf(cv)
+						const parts = []
+						for (let i = 0; i < d.length; i += 4) {
+							if (d[i + 3] === 0) continue
+							parts.push(i, d[i], d[i + 1], d[i + 2], d[i + 3])
+						}
+						return parts.join(',')
+					}
+
+					/** 「红能量」：偏红多少。普通蝇本来就有红眼，所以只能比相对量 */
+					const redOf = (cv) => {
+						const d = paintOf(cv)
+						let e = 0
+						for (let i = 0; i < d.length; i += 4) {
+							e += Math.max(0, d[i] - (d[i + 1] + d[i + 2]) / 2) * (d[i + 3] / 255)
+						}
+						return e
+					}
+
+					try {
+						// 1) 每格都得有画布，而且**画布上真的有东西**
+						//    ⚠ 灰格也要画（暗影），所以这条对两种状态都成立
+						for (const cell of geneCells) {
+							const id = cell.dataset.gene
+							const cv = cell.querySelector('canvas')
+							if (!cv) return { ok: false, reason: '基因格「' + id + '」里没有画布' }
+							const b = boxOf(cv)
+							if (!b.painted) {
+								return { ok: false, reason: '基因格「' + id + '」的画布是空的 —— 一整格什么都没有' }
+							}
+							// 2) 不能碰到画布边缘。
+							//    ⚠ 这是「横向偏置没加、翅尖被裁掉」的**唯一把关人** ——
+							//    34px 的格子里裁掉一个多像素，肉眼基本看不出来
+							if (b.minX <= 0 || b.minY <= 0 || b.maxX >= b.w - 1 || b.maxY >= b.h - 1) {
+								return {
+									ok: false,
+									reason:
+										'基因格「' + id + '」的画像顶到画布边了（x ' + b.minX + '~' + b.maxX +
+										'，y ' + b.minY + '~' + b.maxY + '，画布 ' + b.w + '×' + b.h +
+										'）—— 多半是 drawFlyIcon 里那个横向偏置没加，翅尖被裁掉了',
+								}
+							}
+						}
+
+						// 3) **所有灰格长得一模一样**。
+						//
+						// ⚠ 这条是整段的核心。暗影只取决于体型和性别，和是哪一种突变无关 ——
+						//   哪天灰格画了真身、或者按基因改了暗影，这几张立刻互不相同。
+						//   ⚠ 比「同一格 灰 vs 亮 逐像素不同」强得多：亮格（结晶 / 金）
+						//   吃 performance.now()，两张画布天然逐像素不同，那个 bug 反而会被放过
+						const lockedCells = [...geneCells].filter((c) => c.classList.contains('locked'))
+						const lockedSigs = lockedCells.map((c) => sigOf(c.querySelector('canvas')))
+						const uniqLocked = new Set(lockedSigs).size
+						if (lockedCells.length > 1 && uniqLocked !== 1) {
+							return {
+								ok: false,
+								reason:
+									'没见过的 ' + lockedCells.length + ' 个基因格有 ' + uniqLocked +
+									' 种画法 —— 暗影应当只取决于体型和性别，和是哪一种突变无关（现在至少有格子把真身画出来了）',
+							}
+						}
+					} catch (e) {
+						return { ok: false, reason: '基因格画像（灰态）失败: ' + e.message }
+					}
+
+					// —— 亮着的基因格：各不相同，而且疯狂真的有红光 ——
+					try {
+						pet.ui._seenGenes = pet.config.mutation.types.map((t) => t.id)
+						pet.ui.refreshCodex()
+						// ⚠ refreshCodex() 是整块重建，上面那个 geneCells 已经失效了
+						const litCells = [...document.querySelectorAll('[data-gene]')]
+						const litSigs = litCells.map((c) => sigOf(c.querySelector('canvas')))
+
+						// 4) 至少有两格画得不一样。
+						//    ⚠ 没有这条，上面「灰格全一样」在「所有格子都画同一个东西」时
+						//   也会绿 —— 两条必须成对（和别处「②③ 必须成对」一个道理）
+						const uniqLit = new Set(litSigs).size
+						if (uniqLit < 2) {
+							return {
+								ok: false,
+								reason:
+									'五格全见过之后，' + litCells.length + ' 个基因格只有 ' + uniqLit +
+									' 种画法 —— 不同突变应当长得不一样',
+							}
+						}
+
+						// 4.5) 金蝇那格**真的有闪光**。
+						//
+						// 图鉴上写着「通体金色、带闪光」—— 闪光要是没画出来，
+						// 那就是一句假话，而且**不报任何错**，只能量像素。
+						//
+						// ⚠ 本来担心的是「定死的那个相位正好 5 颗闪点全暗」，
+						//   实测**不可能**：5 颗的相位两两差 2.3 弧度、铺开 9.2 弧度
+						//   （超过一整个周期），而判定条件是 sin > 0.25 ——
+						//   扫过 0~6000ms 每一毫秒都没找到一个全暗的相位。
+						//   所以这条抓的不是相位，是「闪光整个没画」（把
+						//   drawGoldSparkle 那句注掉，它当场就红）
+						//
+						// ⚠ 判据是「比金色身体更亮的淡黄」。金蝇身上最亮的颜色是
+						//   bodyColorLight #f2cc63（b=99），闪光是 #fff8d8（b=216）——
+						//   拿蓝通道当分界线最干净，金色系整个都在 100 以下
+						const goldCell = document.querySelector('[data-gene="golden"]')
+						const goldCv = goldCell && goldCell.querySelector('canvas')
+						if (!goldCv) return { ok: false, reason: '找不到金蝇那一格的画布' }
+						const gd = paintOf(goldCv)
+						let sparkle = 0
+						for (let i = 0; i < gd.length; i += 4) {
+							if (gd[i + 3] > 0 && gd[i + 2] > 150 && gd[i] > 200) sparkle++
+						}
+						if (sparkle === 0) {
+							return {
+								ok: false,
+								reason:
+									'金蝇那格一个闪光像素都没有 —— 图鉴上写着「带闪光」，画出来却没有。' +
+									'多半是 drawGoldSparkle 那句没执行，或者它的颜色 / 半径被改没了',
+							}
+						}
+
+						// 5) 疯狂的红光。
+						//    ⚠ 不能只查「有没有红色像素」：普通蝇自己就有红眼
+						//   （eyeColor #c62f22、headColor #63201c）。图鉴五格里也没有
+						//   「普通蝇」这一格可比，所以自己拿**同一个 size / seed** 画两张
+						const probe = document.createElement('canvas')
+						probe.width = 34
+						probe.height = 34
+						const pctx = probe.getContext('2d')
+						const redOfGenes = (genes) => {
+							pctx.setTransform(1, 0, 0, 1, 0, 0)
+							pctx.clearRect(0, 0, 34, 34)
+							pctx.translate(17, 17)
+							// 尺寸和种子**和基因格里的完全一致**，量的才是玩家真看到的那张
+							pet.drawFlyIcon(pctx, genes, 34 * 0.58, 7, false)
+							return redOf(probe)
+						}
+						const plainRed = redOfGenes([])
+						const berserkRed = redOfGenes(['berserk'])
+						flyIconRed = [plainRed, berserkRed]
+						if (!(plainRed > 0)) {
+							return { ok: false, reason: '普通蝇的红能量量出来是 0 —— 探针本身就没画上' }
+						}
+						if (!(berserkRed >= plainRed * 1.25)) {
+							return {
+								ok: false,
+								reason:
+									'疯狂蝇的红光不够亮：普通蝇 ' + plainRed.toFixed(0) + ' → 疯狂蝇 ' +
+									berserkRed.toFixed(0) + '（要求至少 1.25 倍）。' +
+									'眼睛那圈泛光多半没画上，或者被 globalAlpha 带淡了',
+							}
+						}
+					} catch (e) {
+						return { ok: false, reason: '基因格画像（亮态）失败: ' + e.message }
+					}
+
 					// 查完了，把 seen 还原 —— 后面还有断言要看真实状态
 					pet.ui._seenGenes = savedSeen
 					pet.ui.refreshCodex()
@@ -3986,6 +4722,325 @@ function runSelfTest() {
 					if (i >= 0) pet.world.flies.splice(i, 1)
 				} catch (e) {
 					return { ok: false, reason: '「见过」链路失败: ' + e.message }
+				}
+
+				// —— 成就 ——
+				try {
+					const savedAch = pet.ui._achievements.slice()
+					const savedSeen = pet.ui._seenGenes.slice()
+					const savedEarned = pet.world.stats.earned
+					// ⚠ 彩蛋状态也要抓 —— 下面会把它拨来拨去，
+					//   不还原的话后面「星云苹果锁着」那类断言全都会歪
+					const savedStar = pet.ui.starUnlocked
+					const banner = document.getElementById('achievement')
+					const bannerText = document.getElementById('achievement-text')
+					if (!banner || !bannerText) {
+						return { ok: false, reason: '成就横幅的 DOM 不存在（#achievement / #achievement-text）' }
+					}
+					// 横幅必须**不吃鼠标**：窗口平时是穿透的，它一旦参与捕捉，
+					// 屏幕中上方会凭空多出一块吃掉桌面点击的区域
+					if (getComputedStyle(banner).pointerEvents !== 'none') {
+						return {
+							ok: false,
+							reason: '成就横幅会吃鼠标（pointer-events: ' + getComputedStyle(banner).pointerEvents + '）—— 它应当纯展示',
+						}
+					}
+
+					// 每个成就的配置都要能对上：有 id、有文字、kind 认得出来。
+					// ⚠ 这条守的是「配置写错了」—— kind 拼错的话那条成就**永远不会触发**，
+					//   而不会报任何错
+					for (const a of pet.config.achievements) {
+						if (!a.id || !a.text) return { ok: false, reason: '成就配置缺 id 或 text：' + JSON.stringify(a) }
+						if (a.kind === 'mutation' && !a.gene) {
+							return { ok: false, reason: '成就「' + a.id + '」是 mutation 类却没有 gene 字段' }
+						}
+						if (a.kind === 'wealth' && typeof a.at !== 'number') {
+							return { ok: false, reason: '成就「' + a.id + '」是 wealth 类却没有 at 字段' }
+						}
+						if (!['mutation', 'star', 'wealth'].includes(a.kind)) {
+							return { ok: false, reason: '成就「' + a.id + '」的 kind 认不出来：' + a.kind }
+						}
+					}
+
+					// 图标文件**真的加载得出来**吗。
+					//
+					// ⚠ 名字打错一个字母（或者漏拷一个文件）的表现是「横幅上
+					//   那一块是空的」—— 浏览器对 img 加载失败**不报错、不抛异常**，
+					//   连 console 里都没有一行。只能这样一个个真的去 load 一遍。
+					//   而这几张图是 SVG，路径和大小写都敏感（Windows 上文件系统
+					//   不敏感，但打包成 asar 之后就不一定了），所以大小写也要对
+					for (const a of pet.config.achievements) {
+						if (!a.icon) continue
+						const loaded = await new Promise((res) => {
+							const im = new Image()
+							im.onload = () => res(true)
+							im.onerror = () => res(false)
+							im.src = 'assets/achievements/' + a.icon
+						})
+						if (!loaded) {
+							return {
+								ok: false,
+								reason: '成就「' + a.id + '」的图标加载不出来：assets/achievements/' + a.icon +
+									' —— 文件没拷进来，或者名字对不上（大小写也算）',
+							}
+						}
+					}
+
+					// 从头来一遍
+					pet.ui.setAchievements([])
+					pet.ui._achievementQueue.length = 0
+
+					// 1) 四种突变：见到 → 拿成就；再见 → **不该重复**
+					//
+					// ⚠ 逐个来而不是只挑一种试：_checkGeneAchievement 是按
+					//   a.gene === geneId 认人的，配置里那个 id 打错一个字母
+					//   （goldn / chrismal）那条成就就**永远不会触发**，
+					//   而且不会有任何报错。只有拿真 id 挨个撞一遍才发现得了。
+					//
+					// ⚠ 撞之前要先把这一种从 _seenGenes 里摘掉 —— 上面「见过链路」
+					//   那一段已经让「石化」变成见过的了，留着的话 noteSeenGenes
+					//   会走 continue，成就根本不会被查
+					const geneIds = pet.config.mutation.types.map((t) => t.id)
+					for (const a of pet.config.achievements) {
+						if (a.kind !== 'mutation') continue
+						if (!geneIds.includes(a.gene)) {
+							return {
+								ok: false,
+								reason: '成就「' + a.id + '」挂在一个不存在的突变上（' + a.gene +
+									'）—— 真实 id 只有 ' + geneIds.join(' / ') + '，这条成就永远拿不到',
+							}
+						}
+						pet.ui.setAchievements([])
+						pet.ui._seenGenes = pet.ui._seenGenes.filter((x) => x !== a.gene)
+						pet.ui.noteSeenGenes([a.gene])
+						if (!pet.ui.hasAchievement(a.id)) {
+							return { ok: false, reason: '第一次见到「' + a.gene + '」却没有拿到成就「' + a.text + '」' }
+						}
+						// 同一种再见一次 —— 不该再拿一遍
+						pet.ui.noteSeenGenes([a.gene])
+						if (pet.ui._achievements.length !== 1) {
+							return {
+								ok: false,
+								reason: '同一种突变见过两次，成就拿了 ' + pet.ui._achievements.length +
+									' 遍（应当只有 1 遍）',
+							}
+						}
+					}
+
+					// 2) 彩蛋。
+					//
+					// ⚠ 关键在顺序：setStarUnlocked 的「值没变就早退」**拦不住**
+					//   启动恢复 —— 那一次 false → true 状态确实是变的。
+					//   只有 opt.silent 能把它和玩家真解锁区分开。所以这里两个方向
+					//   都要试：silent 不能给，非 silent 必须给
+					pet.ui.setAchievements([])
+					pet.ui.setStarUnlocked(false, { silent: true }) // 先按灭，保证下面那次是「真的变了」
+					pet.ui.setStarUnlocked(true, { silent: true }) // silent = 启动恢复，**不该**给成就
+					if (pet.ui.hasAchievement('starApple')) {
+						return {
+							ok: false,
+							reason: '按存档恢复彩蛋（silent）时也弹了成就 —— 每次开程序都会重放一遍「小时的梦想」',
+						}
+					}
+					pet.ui.setStarUnlocked(false, { silent: true })
+					pet.ui.setStarUnlocked(true) // 这次是真的解锁
+					if (!pet.ui.hasAchievement('starApple')) {
+						return { ok: false, reason: '彩蛋解锁了却没有拿到「小时的梦想」' }
+					}
+
+					// 3) 财富档位。⚠ wealthCases 有**五**条不是四条 ——
+					//   「金苹果」那条也是 wealth 类（它就是 $0.1 那一档），
+					//   所以这里顺带把「食物解锁」那个时刻也一起验了
+					pet.ui.setAchievements([])
+					const wealthCases = pet.config.achievements.filter((a) => a.kind === 'wealth').sort((a, b) => a.at - b.at)
+					for (const a of wealthCases) {
+						pet.ui._wealthWas = -1 // 逼 refreshStats 走「变了」那条路
+						pet.world.stats.earned = a.at
+						pet.ui.refreshStats()
+						if (!pet.ui.hasAchievement(a.id)) {
+							return { ok: false, reason: '总财富到 ' + a.at + ' 了却没有拿到成就「' + a.text + '」' }
+						}
+					}
+					// 一次跨过好几档时，中间的也要一起给（不能只给最后一档）
+					pet.ui.setAchievements([])
+					pet.ui._wealthWas = -1
+					pet.world.stats.earned = 20000
+					pet.ui.refreshStats()
+					if (pet.ui._achievements.length !== wealthCases.length) {
+						return {
+							ok: false,
+							reason: '总财富一次到 20000，只拿到了 ' + pet.ui._achievements.length +
+								' 个财富成就，应当是 ' + wealthCases.length + ' 个（跨档时中间那几档也要给）',
+						}
+					}
+
+					// 4) 横幅：同时达成好几个时**只能显示一条**，其余排队
+					//
+					// ⚠ 上面第 3 步已经在播了，这里必须先把播放状态**清干净**，
+					//   否则队列长度会多算一条正在播的，这条断言就变成随机红绿
+					clearTimeout(pet.ui._achievementTimer)
+					pet.ui._achievementTimer = null
+					pet.ui.setAchievements([])
+					pet.ui._achievementQueue.length = 0
+					pet.ui._wealthWas = -1
+					pet.world.stats.earned = 20000
+					pet.ui.refreshStats()
+					if (banner.classList.contains('hidden')) {
+						return { ok: false, reason: '一口气拿了一堆成就，横幅却一条都没露出来' }
+					}
+					// 正在播的那一条**不在队列里**（队列里只剩下等着的那几条），
+					// 所以这里应当是「成就数 − 1」
+					if (pet.ui._achievementQueue.length !== pet.ui._achievements.length - 1) {
+						return {
+							ok: false,
+							reason: '横幅没有排队：一口气拿到 ' + pet.ui._achievements.length + ' 个成就，屏幕上 1 条、' +
+								'队列里却排了 ' + pet.ui._achievementQueue.length + ' 条（应当是 ' +
+								(pet.ui._achievements.length - 1) + ' 条）—— 少排的那几条永远播不到',
+						}
+					}
+					// 而且屏幕上那条得**真的**是刚拿到的某一个（不是残留的上一条）
+					const shown = pet.config.achievements.find((a) => a.text === bannerText.textContent)
+					if (!shown || !pet.ui.hasAchievement(shown.id)) {
+						return {
+							ok: false,
+							reason: '横幅上写的是「' + bannerText.textContent + '」，和任何一个刚拿到的成就都对不上（像是残留的上一条）',
+						}
+					}
+					// 图标：有图的那条要挂上 src，没图的（后四档财富成就）得藏起来 ——
+					// 空 src 的 img 会显示成一个破图标
+					if (!shown.icon) {
+						if (!pet.ui.el.achievementIcon.classList.contains('hidden')) {
+							return { ok: false, reason: '成就「' + shown.id + '」没有图标，img 却没藏起来（会显示成破图标）' }
+						}
+					} else if (pet.ui.el.achievementIcon.getAttribute('src') !== 'assets/achievements/' + shown.icon) {
+						return {
+							ok: false,
+							reason: '成就「' + shown.id + '」的图标 src 是「' +
+								pet.ui.el.achievementIcon.getAttribute('src') + '」，应当是 assets/achievements/' + shown.icon,
+						}
+					}
+
+					// 5) 落盘 + 读回来。⚠ 这一条是**唯一**能发现「主进程白名单漏了新键」的断言 ——
+					//    漏了的话渲染侧照写不误、拿不到任何错误，只有这里会红
+					//
+					// ⚠ 读这一下是 await，中间主循环还会跑好几帧 —— 一有新的变异体出生
+					//   （noteSeenGenes → grantAchievement）就会**再写一次**这个文件，
+					//   读到的东西就不是刚写下去的了。所以先按暂停键把世界冻住
+					const wasPaused = pet.world.paused
+					pet.world.paused = true
+					pet.ui.setAchievements(['crystal', 'wealth10'])
+					pet.ui._persistUnlock()
+					const back = await window.pet.loadUnlock()
+					pet.world.paused = wasPaused
+					if (!Array.isArray(back?.data?.achievements)) {
+						return { ok: false, reason: 'achievements 写下去之后读不回来（主进程白名单里是不是漏了这个键？）' }
+					}
+					if (back.data.achievements.join() !== 'crystal,wealth10') {
+						return {
+							ok: false,
+							reason: '读回来的成就是 ' + JSON.stringify(back.data.achievements) +
+								'，应当是 ["crystal","wealth10"]',
+						}
+					}
+					// 而且**不能把另外两个键挤掉**（整份覆写 —— 只发一个键的话
+					// star 和 seen 会被一起抹掉，而且不报任何错）
+					if (back.data.star !== true || !Array.isArray(back.data.seen)) {
+						return {
+							ok: false,
+							reason: '写 achievements 之后 star / seen 没了 —— 三个键没有一起落盘（star=' +
+								JSON.stringify(back.data.star) + ', seen=' + JSON.stringify(back.data.seen) + '）',
+						}
+					}
+
+					// 还原。
+					//
+					// ⚠ 上面那几次 setAchievements / setStarUnlocked / noteSeenGenes
+					//   都会顺手 _persistUnlock() 写文件，所以最后这一下**必须**再写一遍
+					//   正确的状态 —— 否则 unlock.json 里留下的是自检中间态，
+					//   而这个文件是**跨局**的（下次开程序会读它）
+					pet.world.stats.earned = savedEarned
+					pet.world.paused = wasPaused
+					pet.ui._wealthWas = -1
+					pet.ui.setAchievements(savedAch)
+					pet.ui._seenGenes = savedSeen
+					pet.ui._achievementQueue.length = 0
+					clearTimeout(pet.ui._achievementTimer)
+					pet.ui._achievementTimer = null
+					banner.classList.add('hidden')
+					banner.classList.remove('on')
+					pet.ui.setStarUnlocked(savedStar, { silent: true })
+					pet.ui._persistUnlock()
+				} catch (e) {
+					return { ok: false, reason: '成就流程失败: ' + e.message }
+				}
+
+				// —— 总财富的口径 ——
+				//
+				// ⚠ 这条守的是「earned 到底在哪几处加」。全项目有四处 this.money +=，
+				//   其中三处是**退款**（没放下的钱还给你），只有 _creditSale 那一处
+				//   是真的赚到了。退款也算进去的话，玩家反复买一批放不下的东西
+				//   就能把总财富刷上去 —— 成就和食物门槛会跟着一起被刷开
+				try {
+					const wA = pet.world
+					const savedEarned = wA.stats.earned
+					const savedMoney = wA.money
+					const savedFoods = wA.foods.slice()
+					wA.stats.earned = 0
+					wA.money = 100
+					if (wA.lifetime !== 0) {
+						return { ok: false, reason: '刚把累计总收入清零，world.lifetime 却不是 0' }
+					}
+
+					// 卖一只 → 涨
+					const probeFly = wA.addFly(50, 50, 'M', 'normal', [])
+					if (!probeFly) return { ok: false, reason: '造不出用来验总财富的探针果蝇' }
+					const gain = wA.sellFly(probeFly)
+					if (!(wA.stats.earned > 0)) {
+						return { ok: false, reason: '卖了一只之后累计总收入还是 0（gain=' + gain + '）' }
+					}
+					if (Math.abs(wA.lifetime - wA.stats.earned) > 1e-9) {
+						return { ok: false, reason: 'world.lifetime 和 stats.earned 对不上' }
+					}
+
+					// 退款 → **不该**涨。
+					//
+					// ⚠ 走的是「投放区满了 → 一个都没放下 → 全额退回来」那条路。
+					//   这是三处退款里最容易触发的一处（把食物填到上限就行）。
+					//   装满之后钱一分没少，如果 earned 跟着涨了，那就是把退款
+					//   当成收入了 —— 玩家反复点「投 10 个」就能凭空刷总财富
+					const earnedBefore = wA.stats.earned
+					const F = pet.config.food
+					wA.dropFoods('apple', F.maxCount) // 填到上限（dropFoods 自己会在上限停住）
+					if (wA.foods.length < F.maxCount) {
+						return { ok: false, reason: '食物没填到上限（' + wA.foods.length + '/' + F.maxCount + '），退款那条路验不到' }
+					}
+					const moneyBefore = wA.money
+					const placed = wA.buyFood('apple', 1)
+					if (placed !== 0) {
+						return { ok: false, reason: '食物已经满了，buyFood 却还是放下了 ' + placed + ' 份' }
+					}
+					if (wA.money !== moneyBefore) {
+						return {
+							ok: false,
+							reason: '没放下食物却没把钱退回来（' + moneyBefore + ' → ' + wA.money + '）',
+						}
+					}
+					if (wA.stats.earned !== earnedBefore) {
+						return {
+							ok: false,
+							reason: '退款也算进了累计总收入（' + earnedBefore + ' → ' + wA.stats.earned +
+								'）—— 反复买放不下的东西就能刷总财富，食物门槛和财富成就会跟着被刷开',
+						}
+					}
+
+					// 还原：食物按原样放回去（上面那批是我自己填的）
+					wA.foods.length = 0
+					for (const f of savedFoods) wA.foods.push(f)
+					wA.stats.earned = savedEarned
+					wA.money = savedMoney
+					// 探针果蝇上面已经卖掉了，不会留在世界里
+				} catch (e) {
+					return { ok: false, reason: '总财富口径失败: ' + e.message }
 				}
 
 				// —— 结晶成虫的外观：**真的去数像素** ——
@@ -5132,6 +6187,12 @@ function runSelfTest() {
 					starTextureDiff,
 					eggTaps,
 					money: pet.world.counts.money.toFixed(3),
+					// ⚠ 门槛的数值从**配置**里读，不是从自检里写死 ——
+					//   改 config 之后清单上的数字会跟着变，不会变成一句谎话
+					foodLockNeed: pet.config.market.foodUnlock.gold,
+					achievementCount: pet.config.achievements.length,
+					flyIconRed,
+					updateVersion: updateInfo ? updateInfo.version : null,
 				}
 			})()`)
 
@@ -5151,6 +6212,17 @@ function runSelfTest() {
 					'  投放 / 商店：屏幕正中弹窗（不在 .window 里，不会被 overflow 剪掉）、点名分组渲染、' +
 						'三行六键买不起全置灰、玻璃罐免费且摆满置灰、食物投放区参考框按配置摆位且不吞鼠标\n' +
 					'  图鉴：格子式列出全部食物和基因，食物格真的画出来了（查非透明像素）、基因格的概率与配置一致\n' +
+					'  图鉴画像：基因格左边多了一张「这只突变果蝇长什么样」（复用场上那套 drawFly，查像素）；' +
+						'没见过的画成暗影、**五格长得一模一样**，见过的各不相同；' +
+						(report.flyIconRed
+							? `疯狂的红眼泛光比普通蝇红 ${(report.flyIconRed[1] / report.flyIconRed[0]).toFixed(2)} 倍` +
+								`（红能量 ${report.flyIconRed[0].toFixed(0)} → ${report.flyIconRed[1].toFixed(0)}）`
+							: '疯狂的红眼泛光：**没量到**') +
+						'\n' +
+					`  食物解锁：**苹果没有门槛**（口粮永远买得到）；金苹果要**累计总收入** ≥ $${report.foodLockNeed}` +
+						'（不是手里的钱）。没过线时投放面板那一行不出现、底下写一句点名道姓的提示，图鉴照画但那格置灰\n' +
+					`  成就：${report.achievementCount} 条（四种突变 / 星云苹果 / 金苹果 / 四档财富），` +
+						'达成时屏幕中上方弹入弹出、一口气拿好几个会排队、见过两次不会重复给、重置跟着清零\n' +
 					'  居中小卡：三张新卡的 ✕ 用 elementFromPoint 打出来是它自己、指针压上去 _overCard() 认、点下去真的关上；' +
 						'养蝇人的「配置」点开时商店自己让位（不再两张卡叠成一坨）\n' +
 					'  结晶成虫外观（查像素）：身体平均不透明度只有 45/255（全透明）、高饱和像素的色相铺开 350° 以上' +
@@ -5164,6 +6236,13 @@ function runSelfTest() {
 					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
 						'  越界等级：老存档里超出链长的等级被夹回来（表现为满级），商店照常重建、不抛异常\n' +
 					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +
+					`  检查更新：版本比较按数字段比（1.10.0 比 1.9.0 新，不会认成「已是最新」）、` +
+						`清单取不回来时分得清 404 / 不是 JSON / 超时 / 不是网址；` +
+						`主进程只放行 http(s)，file: / javascript: 一律拒绝。` +
+						`设置卡上版本号读到的是 ${report.updateVersion || '**没读到**'}，` +
+						'更新清单说有新版就提示并冒出「去下载」（优先用清单里的 url、没有才退回 downloadPage，' +
+						'两边都没有就明说而不是留一颗点了没反应的按钮），清单版本旧就改口「已经是最新的」' +
+						'并把上次那颗按钮收回去，没配地址时按钮置灰但**明说**没配\n' +
 					'  重置：**三道**确认（说明 → 标红再问 → 手打「重置」才能点确定），前三道里世界一动不动；' +
 						'走完三道才清世界 + 图鉴 + 彩蛋，开局那几只不带突变；' +
 						'输入框里打字不会触发工具快捷键\n' +
@@ -5173,7 +6252,9 @@ function runSelfTest() {
 					'  扫帚：按钮在、B 键开关、滚轮调半径且夹在 30~200、按住真的把幼虫推开（只推不删）\n' +
 					'  点火：打火机 / 喷火枪是**两颗独立按钮**（买到哪档点亮哪颗），碰到活蝇一次就点着、' +
 						'按住不重置倒计时、地上的尸体点不着、尸体只剩原价这一档、前 5 分钟不掉价\n' +
-					'  烤炉：$5 从投放里买（一次性、有上限），**放进去就开始烤**（不用等装满）、' +
+					'  烤炉：在**商店**里买断（钱不够 / 刚好够都置灰得对），买过之后投放面板里才长出那一行、' +
+						'摆一台**不花钱**、摆满置灰、一台炉子的存档读回来不会白得烤炉；' +
+						'**放进去就开始烤**（不用等装满）、' +
 						'每只各有一条自己的进度条（两头都画得出来）、' +
 						'**各自烤满各自到账**且地上不留尸体、每只各冒一个「+$x」飘字、面板上的钱跟着变\n' +
 					'  分类折叠：投放 / 商店的每一组都能折起来，而且**钱一变不会自己弹回去**\n' +
@@ -5349,10 +6430,135 @@ ipcMain.handle('pet:toggle-always-on-top', () => setAlwaysOnTop(!alwaysOnTop))
 
 ipcMain.handle('pet:toggle-click-through', () => setClickThrough(!clickThroughEnabled))
 
-/** 渲染进程要问「我现在到底该不该穿透」——比如刚启动时同步一次 */
-ipcMain.handle('pet:get-state', () => ({ alwaysOnTop, clickThrough: clickThroughEnabled }))
+/**
+ * 渲染进程要问「我现在到底该不该穿透」——比如刚启动时同步一次。
+ *
+ * ⚠ 版本号也搭这趟车回给设置卡。它**不是**窗口状态，放这儿只是因为
+ *   这条路本来就在启动时走一次、而且不需要联网 —— 没配更新地址时
+ *   `pet:check-update` 根本不会被调用，设置卡上就会永远挂着「版本 —」。
+ *   版本号是 `package.json` 的 version，由 electron-builder 打进 asar，
+ *   所以打包版读到的是真的、不是源码里那个
+ */
+ipcMain.handle('pet:get-state', () => ({
+	alwaysOnTop,
+	clickThrough: clickThroughEnabled,
+	version: app.getVersion(),
+}))
 
 ipcMain.on('pet:quit', () => app.quit())
+
+// ------------------------------------------------------- 检查更新 / 开外链
+
+/**
+ * 把 `a.b.c` 拆成三个数字。认不出来的段一律当 0。
+ *
+ * ⚠ **不能拿字符串直接比大小** —— 那样 "1.9.0" > "1.10.0"（'9' > '1'），
+ *   于是从 1.9 升到 1.10 的人永远收不到提示。这个坑很经典，也很安静
+ */
+function parseVersion(v) {
+	return String(v ?? '')
+		.split('.')
+		.map((n) => parseInt(n, 10))
+		.map((n) => (Number.isFinite(n) ? n : 0))
+}
+
+/** a 比 b 新返回正数，一样返回 0，旧返回负数 */
+function compareVersions(a, b) {
+	const A = parseVersion(a)
+	const B = parseVersion(b)
+	for (let i = 0; i < Math.max(A.length, B.length, 3); i++) {
+		const d = (A[i] ?? 0) - (B[i] ?? 0)
+		if (d !== 0) return d
+	}
+	return 0
+}
+
+/** 只认 http/https。`file:` / `javascript:` 之类的一律拒绝 */
+function isSafeUrl(u) {
+	try {
+		const p = new URL(String(u))
+		return p.protocol === 'http:' || p.protocol === 'https:'
+	} catch {
+		return false
+	}
+}
+
+/**
+ * 查一次版本清单。**请求是在主进程发的**，不是渲染进程 ——
+ * 渲染进程跑在 `file://` 上，从那儿 fetch 一个 https 地址算跨域，
+ * 得指望对方站点发 CORS 头；主进程是 Node，没有这回事。
+ *
+ * ⚠ 永远 resolve，不 reject：玩家没网、地址写错、对方站点挂了 ——
+ *   这些都是**正常情况**，返回 `{ ok: false, reason }` 让 UI 去决定
+ *   要不要说话。桌宠弹一个「检查更新失败」是最讨人厌的做法
+ *
+ * @param {string} url 清单地址
+ * @param {number} timeoutMs 超时。⚠ 必须有：没有的话断网时
+ *   fetch 会吊在那儿几十秒，而那期间设置卡上那颗按钮一直转
+ */
+async function fetchManifest(url, timeoutMs = 6000) {
+	if (!url) return { ok: false, reason: 'no-url' }
+	if (!isSafeUrl(url)) return { ok: false, reason: 'bad-url' }
+
+	const ac = new AbortController()
+	const timer = setTimeout(() => ac.abort(), timeoutMs)
+	try {
+		const res = await fetch(url, { signal: ac.signal, redirect: 'follow' })
+		if (!res.ok) return { ok: false, reason: 'http-' + res.status }
+		const text = await res.text()
+		// ⚠ 有些静态托管（比如 GitHub Pages 的 404 页）会用 200 返回一段 HTML。
+		//   不 try 的话这里会抛，而外面看到的就是一句没法解释的「检查更新失败」
+		let data
+		try {
+			data = JSON.parse(text)
+		} catch {
+			return { ok: false, reason: 'not-json' }
+		}
+		if (!data || typeof data.version !== 'string') return { ok: false, reason: 'no-version' }
+		return { ok: true, data }
+	} catch (e) {
+		// AbortError 就是我们自己掐的
+		return { ok: false, reason: e && e.name === 'AbortError' ? 'timeout' : 'network' }
+	} finally {
+		clearTimeout(timer)
+	}
+}
+
+ipcMain.handle('pet:check-update', async (_e, url, fallbackPage) => {
+	const current = app.getVersion()
+	const got = await fetchManifest(url)
+	if (!got.ok) return { ok: false, reason: got.reason, current }
+
+	const latest = got.data.version
+	const newer = compareVersions(latest, current) > 0
+	// ⚠ 地址优先用清单里的，没有才退回配置里那个兜底页
+	const page = isSafeUrl(got.data.url) ? got.data.url : isSafeUrl(fallbackPage) ? fallbackPage : ''
+	return {
+		ok: true,
+		current,
+		latest,
+		hasNew: newer,
+		url: newer ? page : '',
+		note: typeof got.data.note === 'string' ? got.data.note : '',
+	}
+})
+
+/**
+ * 在系统浏览器里打开一个链接。
+ *
+ * ⚠ **协议必须校验**。这是渲染进程递过来的字符串，而渲染进程是页面、
+ *   是会被 XSS 影响的那一层 —— 主进程不该无条件拿它去 `shell.openExternal`。
+ *   只认 http/https 之后，`file:` / `javascript:` 这类就进不来了
+ */
+ipcMain.handle('pet:open-external', async (_e, url) => {
+	if (!isSafeUrl(url)) return { ok: false, reason: 'bad-url' }
+	try {
+		await shell.openExternal(String(url))
+		return { ok: true }
+	} catch (e) {
+		return { ok: false, reason: e.message }
+	}
+})
 
 // ------------------------------------------------------------------ 存档
 
@@ -5377,10 +6583,11 @@ function backupFile() {
 }
 
 /**
- * 图鉴 + 彩蛋的进度，**单独一个文件**。装两样：
+ * 图鉴 + 彩蛋 + 成就的进度，**单独一个文件**。装三样：
  *
- *   `star`  —— 彩蛋（星空苹果 / 星云）解锁了没有
- *   `seen`  —— 图鉴里「见过」的突变 id（出生过就算，见 world.seenGenes）
+ *   `star`          —— 彩蛋（星空苹果 / 星云）解锁了没有
+ *   `seen`          —— 图鉴里「见过」的突变 id（出生过就算，见 world.seenGenes）
+ *   `achievements`  —— 已经拿到的成就 id（见 CONFIG.achievements）
  *
  * ⚠ **它现在不跨局了。** 这个文件曾经被刻意保护成「跨过『重新开始』」，
  *   注释里写的理由是「重开一局之后彩蛋又锁上，玩家会觉得坏了」。
@@ -5479,9 +6686,14 @@ ipcMain.handle('pet:save-unlock', (_e, data) => {
 	const safe = {
 		star: data && 'star' in data ? !!data.star : !!old.star,
 		seen: Array.isArray(data && data.seen)
-			? cleanSeenList(data.seen)
+			? cleanIdList(data.seen)
 			: Array.isArray(old.seen)
-				? cleanSeenList(old.seen)
+				? cleanIdList(old.seen)
+				: [],
+		achievements: Array.isArray(data && data.achievements)
+			? cleanIdList(data.achievements)
+			: Array.isArray(old.achievements)
+				? cleanIdList(old.achievements)
 				: [],
 	}
 	try {
@@ -5504,12 +6716,12 @@ function readUnlock() {
 }
 
 /**
- * 洗一遍「见过的突变」清单。
+ * 洗一遍「一串 id」—— `seen`（见过的突变）和 `achievements`（成就）共用。
  *
  * ⚠ 上限 64：这是渲染进程递过来的数组，不封顶的话它可以被拿来
  *   往这个文件里灌一个几百 MB 的字符串数组
  */
-function cleanSeenList(list) {
+function cleanIdList(list) {
 	return list.filter((id) => typeof id === 'string' && id && id.length <= 64).slice(0, 64)
 }
 

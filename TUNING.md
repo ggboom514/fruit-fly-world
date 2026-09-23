@@ -95,8 +95,50 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 金苹果快多少 | `config.js` | `food.growthBonus` | 苹果 1× / 金苹果 1.5× |
 | **投放区在哪** | `config.js` | `food.zone` 的 `x` / `y` / `w` / `h` | 左上角，屏幕的 21% × 39%（都是比例，不是像素） |
 | 想看见投放区边框 | `config.js` | `food.zone.show` 改 `true` | 关 |
+| 想加一档食物解锁 | `config.js` | `market.foodUnlock` 里补一行 | 只有 `gold: 0.1` |
 
 > `food.zone` 的四个数都是**屏幕比例**（0~1），换分辨率不会跑偏。调完想确认位置，把 `show` 打开会在屏幕上画出虚线框。
+
+> ⚠ `foodUnlock` 量的是 **`world.lifetime`（累计总收入）**，不是 `world.money`。
+> 用 `money` 的话，玩家买个工具就会把门槛「退回去」。见 `world.js` 的 `lifetime` getter。
+>
+> ⚠ **普通苹果不在表里**，而且不该被加进去 —— 口粮永远买得到，开局总财富是 0
+> 的时候把苹果锁上就等于开局没东西可买。自检里有一条专门盯着这个。
+>
+> ⚠ `CONFIG.achievements` 里 `goldApple` 那条的 `at: 0.1` 是**写死的**，
+> 改了金苹果的门槛记得一起改，否则「金苹果解锁」的成就和食物解锁会错开。
+>
+> ⚠ **星空苹果不在这张表里** —— 它走彩蛋（`ui.starUnlocked`），不受财富门槛管。
+
+## 成就
+
+| 想改什么 | 文件 | 现在 |
+| --- | --- | --- |
+| 全部成就 | `config.js` | `achievements` 数组（10 条） |
+| 财富四档的门槛 | 同上 | `{ kind: 'wealth', at: 10 / 100 / 1000 / 10000 }` |
+| 挂在哪种突变上 | 同上 | `{ kind: 'mutation', gene: '<突变 id>' }`，id 必须和 `mutation.types` 里的对得上 |
+| 横幅停多久 | `renderer/style.css` | `@keyframes achievement` 的 3.4 秒（⚠ JS 那边还有一个 4 秒的兜底定时器，改小的话记得也改它） |
+| 图标长什么样 | `renderer/assets/achievements/*.svg` | 自己画的 SVG，平涂 + 深色描边 |
+
+> 图标是**手写的 SVG**，不是位图。改的时候守住三条，不然横幅上会糊：
+> ① 只用**平涂**，不要渐变和阴影（26px 下渐变会糊成一团脏色）；
+> ② 每个形状都要**深色描边**，否则深棕色的横幅会把边缘吃进去；
+> ③ 别写 `width` / `height`，只留 `viewBox` —— 尺寸由 CSS 的 `.achievement-icon` 给。
+>
+> ⚠ 换文件名之后要确认**盘上真的有那个文件**：`<img>` 加载失败**不报错**，
+> 屏幕上只是空一块。自检里有一轮是把每个 `icon` 真的 load 一遍的。
+
+> ⚠ `kind` 只认 `'mutation'` / `'star'` / `'wealth'` 三种，拼错了那条成就
+> **永远不会触发**，而且不报任何错。自检里有一步是拿真 id 挨个撞一遍的。
+>
+> ⚠ `mutation` 类的 `gene` 打错一个字母，同样永远拿不到 —— 自检会拿
+> `config.mutation.types` 里的真 id 逐个验。
+>
+> ⚠ **财富那几条必须从低到高排**（`goldApple` 那条也算在这一组里）。
+> `_checkWealthAchievements` 是顺序遍历、够格就发，所以数组顺序就是播放顺序。
+>
+> ⚠ 加成就 id 时**不用**改白名单 —— 白名单认的是 `achievements` 这个**键**，
+> 不是里面的 id（见 `main.js` 的 `pet:save-unlock`）。
 
 ## 工具手感
 
@@ -182,7 +224,7 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 想改什么 | 文件 | 字段 | 现在 |
 | --- | --- | --- | --- |
 | 打火机烧多久 / 倍率 / 价格 | `config.js` | `market.roastChain[0].burnMs` / `.mul` / `.price` | 5 秒 / ×1.2 / $3 |
-| 喷火枪同上 | `config.js` | `market.roastChain[1]` 同名三个字段 | 3 秒 / ×1.5 / 再 $8 |
+| 喷火枪同上 | `config.js` | `market.roastChain[1]` 同名三个字段 | 3 秒 / ×1.5 / 再 $10 |
 | 判定「指针底下有活蝇」的半径 | `config.js` | `market.roastChain[].pickRadius` | 打火机 26 px / **喷火枪 60 px** |
 | 烧着的蝇有多慌 | `config.js` | `roast.burnPanicMul` | 2.4（乘在挥手受惊之上） |
 
@@ -204,13 +246,25 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 
 | 想改什么 | 文件 | 字段 | 现在 |
 | --- | --- | --- | --- |
-| 价格（在**投放 → 其他**里买） | `config.js` | `market.prices.oven` | $5 |
+| 价格（在**商店 → 工具类**里买断） | `config.js` | `market.shop` 里 `oven` 那条的 `price` | $15 |
 | 尺寸 / 装几只 / 最多几个 | `config.js` | `roast.oven.width` / `height` / `capacity` / `maxCount` | 150×108 / 5 只 / 3 个 |
 | **每只**烤多久 / 倍率 | `config.js` | `roast.oven.roastMs` / `mul` | 8 秒 / ×1.8 |
 | 进度条尺寸 / 画在虫上方多高 | `config.js` | `roast.oven.barWidth` / `barHeight` / `barOffsetY` | 20×3 px / 往上 7 px |
 | 进度条颜色 | `config.js` | `roast.oven.barColor` / `barTrackColor` | 橙 `#ffb454` / 半黑底槽 |
 | 同一帧出锅的多个数字错开多久 | `config.js` | `roast.oven.float.delayStep` | 110 ms（第 n 只延后 n× 这个） |
 
+> ⚠ **从 1.27.0 起烤炉是买断制**：在商店里花 $15 买一次，之后在**投放 → 其他**
+> 里免费「摆一个」（和玻璃罐同形态）。原来是「每摆一个收 $5」，最多 3 个 = $15，
+> 总代价没变，只是付款次数从三次变成一次。
+>
+> 想改回按次收费的话注意：那意味着 `world.buyOven()` 要回来、
+> `ui._feedRowFor` 里烤炉那条要从 `place: 'oven'` 改回 `unit` + `single`、
+> 投放面板的渲染过滤（`ui._feedRowHidden`）要去掉。**三处一起改**，
+> 漏一处的症状是「按钮在、点了没反应」或者「买断了却还要钱」。
+>
+> ⚠ 老存档的迁移在 `world.restore()` 里：**已经摆着炉子就算已拥有**。
+> 那一行在 ovens 重建循环**之后**，挪到前面就永远不会触发（而且是静默的）。
+>
 > ⚠ 从 1.21.0 起炉子是**每只各自计时、各自到账**：放进去就开始烤，
 > 谁先烤满谁先冒钱走人，**不用等装满**。
 > 所以 `roastMs` 是**单只**的时长，不是整炉的；`delayStep` 只在
@@ -260,7 +314,7 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 商店怎么分组 | `config.js` | `market.shopCats` | 分组 **和渲染顺序**的唯一来源 |
 | 投放弹窗怎么分组 | `config.js` | `market.feedCats` | 同上 |
 | 烤制链每级价格 | `config.js` | `market.roastChain[]` | — |
-| 养蝇人两级价格 | `config.js` | `market.keeperChain[]` | $2 → $5 |
+| 养蝇人两级价格 | `config.js` | `market.keeperChain[]` | $5 → 再 $17（合计 $22） |
 | 养蝇人配置项 | `config.js` | `market.keeperOptions` | 投什么 / 投几个 / 卖哪档 / 多久查一次 |
 | 投放单价 | `config.js` | `market.prices` | 苹果 $0.001 / 金苹果 $0.01 / 星空苹果 $1 / 投蝇 $0.005 |
 | 罐子要点几下才解锁星空苹果 | `config.js` | `easterEgg.tapsToUnlock` | 10 |
@@ -280,6 +334,7 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 想改什么 | 文件 | 字段 | 现在 |
 | --- | --- | --- | --- |
 | 各突变的概率和效果 | `config.js` | `mutation.types[]` | 疯狂 2.9% / 点石成金 3% / 石化 2% / 结晶 1.1% / 星云 **0** |
+| 「一颗卵是普通蝇」的概率 | 同上 | 四个 chance 的**乘积** | 约 **91.3%**（即 8.7% 的卵带突变） |
 | 幼虫吃星空苹果长出星云的概率 | `config.js` | `mutation.nebulaFromStar` | 0.1 |
 | 星云的价值 / 速度倍率 | `config.js` | `mutation.types[]` 里 nebula 那条 | `valueMul: 1.2` / `speedMul: 2` |
 
@@ -288,6 +343,15 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 >
 >     每颗卵形成时，对每一种突变各骰一次，概率就是它自己的 chance。
 >     父母带什么**完全不影响**子代。
+>
+> ⚠ **要调「变异体有多常见」，改的是一颗卵的普通率，不是任何单独一个 chance。**
+> 玩家感觉到的是 `P(普通) = ∏(1-chance)`，四个都得躲开才算普通。现在 ≈ 91.3%。
+> 只动一个数几乎没用 —— 结晶从 1.1% 砍到 0.55%，普通率只从 91.3% 挪到 91.7%。
+> 要整体变稀有/变常见，四个乘同一个系数，再按乘积验一遍。
+> sim 里会把这个数打印出来（**只报数，不卡** —— 它是手感值，不是正确性标准）。
+>
+> ⚠ 试过一次整体调到 95% 普通（四个等比缩到 ×0.566），**用户反馈太稀有，撤回了**。
+>   想再动先问一句。
 >
 > 两个后果，都是刻意的：稀有突变永远稀有（带结晶的父母，孩子照样只有 1.1%）；
 > 而**星云**（chance 为 0）**传不下去**，一只星云蝇的后代全是普通蝇。
@@ -386,6 +450,10 @@ bun run selftest   # 真的开一个窗口把 UI 跑一遍；读写的是 save.s
 | 图鉴里**没拿到**那两行占位符（？？？）、以及置灰的样式 | `renderer/src/ui.js` / `renderer/style.css` | 常量 `CODEX_HIDDEN`，样式 `.codex-cell.locked` |
 | 图鉴里食物有几格 | —— | **现算**，改 `config.js` 的 `market.feedCats` 里 `id: 'food'` 那组的 `items`（`ui._allFoodIds()`） |
 | 图鉴里基因的**点亮条件** | `renderer/src/ui.js` | `seenGene()` ← 突变是「出生过」，食物是 `starUnlocked` |
+| 图鉴里那格**画像**画多大 | `renderer/src/ui.js` | `_codexGeneCell()` 里的 `css * 0.58`（食物是 `0.72`） |
+| 突变**长什么样** | `renderer/src/render.js` | `drawFly()` —— 图鉴和场上**共用**它（图鉴走 `drawFlyIcon`） |
+| 图鉴里「没见过」画的那个暗影 | `renderer/src/render.js` | `drawFlyIcon()` 的 `silhouette` 分支（⚠ 颜色是**淡灰**不是纯黑，深色底上纯黑看不见） |
+| 疯狂那圈红眼泛光的浓淡 | `renderer/src/render.js` | `drawFly()` 里 `if (berserk)` 那段的三个 `addColorStop` |
 | 工具按钮的**显示名**和**悬停提示** | `renderer/index.html` | 每颗 `<button class="tool" data-tool="…" title="…">显示名</button>` |
 | 工具面板那行的快捷键总提示 | `renderer/index.html` | `fold-toggle id="btn-tools"` 的 `title` |
 | 烤制按钮的名字和提示 | —— | **现算**，改 `config.js` 的 `roastChain[].name` / `.desc`；「点一下摆一个 / 按住烤」那句后缀在 `ui.js` 的 `refreshToolButtons()` |
@@ -395,3 +463,14 @@ bun run selftest   # 真的开一个窗口把 UI 跑一遍；读写的是 save.s
 > 加一件新工具时，**三个地方都要动**：`index.html` 里加按钮、
 > 那行快捷键总提示补一个键、`ui.js` 的 `_onKey` 里加一个 `case`。
 > 漏掉哪个都不会报错，只是那个入口不存在。
+
+> ⚠ **图鉴那张画像是「时间冻结」的**：结晶的流光色相、金蝇的闪光、
+> 疯狂的眼部呼吸都吃 `performance.now()`，图鉴那边靠 `drawFlyIcon` 往假对象上
+> 塞一个 `f.frozenNow` 把它们定死 —— 不定的话每次打开图鉴长得都不一样，
+> 自检也没法断言。**这个字段只有图鉴图标会设，场上真的果蝇永远不带。**
+>
+> 想换一个相位，改 `drawFlyIcon` 里的 `FROZEN_NOW` 就行。放心换：
+> 金蝇那 5 颗闪光里有几颗亮是随相位变的，但**不可能全暗**——
+> 它们的相位两两差 2.3 弧度、总共铺开 9.2 弧度（超过一整个周期），
+> 扫过 0~6000ms 每一毫秒都找不到一个「全暗」的相位。
+> （自检里那条「金蝇格必须有闪光像素」抓的不是相位，是闪光整个没画。）

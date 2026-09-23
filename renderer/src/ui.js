@@ -26,14 +26,13 @@ import {
 	valueTierOf,
 	foodPrice,
 	flyPrice,
-	ovenPrice,
 	bulkPrice,
 	keeperOptions,
 	chainOf,
 	shopItem,
 } from './market.js'
 import { badgesOf } from './mutations.js'
-import { drawFoodIcon } from './render.js'
+import { drawFoodIcon, drawFlyIcon } from './render.js'
 
 /** 投放面板上每一行给的两档数量。想加「投 100 个」就往这里加一个数 */
 const FEED_QUANTITIES = [1, 10]
@@ -58,6 +57,31 @@ const FOOD_NAME = { apple: '苹果', gold: '金苹果', star: '星空苹果' }
  *   它得能引用**同一份**字符串，不然改一个字（？→ ?）断言就会假绿
  */
 const CODEX_HIDDEN = '？？？'
+
+/**
+ * 「检查更新」失败时给玩家看的话。
+ *
+ * ⚠ 主进程返回的 `reason` 是**给代码看的短标签**（'timeout' / 'network'），
+ *   不是给玩家看的句子 —— 直接显示 'timeout'，玩家只会以为游戏坏了
+ */
+const UPDATE_FAIL = {
+	'no-url': '还没配置更新地址',
+	'bad-url': '更新地址不是有效的网址',
+	'not-json': '拿回来的不是一份清单 —— 地址对不对？',
+	'no-version': '清单里没写版本号',
+	timeout: '超时了，多半是网络问题',
+	network: '连不上，检查一下网络',
+	ipc: '主进程没响应',
+}
+
+/** 把 `reason` 翻成人话。认不出来的原样返回，总比吞掉强 */
+function updateFailText(reason) {
+	if (!reason) return '未知原因'
+	if (UPDATE_FAIL[reason]) return UPDATE_FAIL[reason]
+	// 主进程对非 2xx 返回的是 'http-404' 这种
+	if (String(reason).startsWith('http-')) return '对方返回了 HTTP ' + String(reason).slice(5)
+	return String(reason)
+}
 
 /**
  * 重置第三道要玩家手打的那两个字。
@@ -126,6 +150,20 @@ export class UI {
 		 */
 		this._seenGenes = []
 		/**
+		 * 已经拿到的成就 id。和 `star` / `seen` 一样落 unlock.json，
+		 * 于是点「重置」会一起清掉。
+		 *
+		 * ⚠ 真值来源是这里，外面只准通过 `hasAchievement(id)` 读，
+		 *   拿成就一律走 `grantAchievement(id)`（它会判重 + 落盘 + 弹横幅）
+		 */
+		this._achievements = []
+		// 上一次见到的总财富。用来挡掉「没变化」的那些帧（见 refreshStats）
+		this._wealthWas = -1
+		// 成就横幅的队列和计时器。同时达成好几个时排队一条条放，
+		// 不然后一条会把前一条直接顶掉 —— 见 _showAchievement
+		this._achievementQueue = []
+		this._achievementTimer = null
+		/**
 		 * 这一轮连点了几下捐款罐子。**只在内存里** ——
 		 * 它问的是「刚才连点了几下」，跨会话记住没有意义
 		 * （也没人会关掉程序之后接着点）
@@ -190,6 +228,11 @@ export class UI {
 		this._handlePlaced = null // 上一次真正写进 style 的位置，没变就不碰 DOM
 		this._handleSkipClick = false // 刚拖完，下一次 click 不算「点一下叫回面板」
 
+		// 「检查更新」查出来的下载地址。⚠ 存在这里而不是读 DOM：
+		// 「去下载」按钮上的文字只是「有新版本，去下载」，地址没写在任何属性里，
+		// 需要时再问一次主进程的话，网络那一半就得跑两遍
+		this._pendingDownload = null
+
 		this._cacheDom()
 		this._bindEvents()
 		this._syncWindowState()
@@ -199,6 +242,7 @@ export class UI {
 		this.refreshFeed() // 投放面板同理
 		this.refreshFoodZone() // 投放区参考框（默认隐藏，只摆位置）
 		this.refreshStats()
+		this.initUpdate() // 版本号 + 开机静默查一次。见那个方法的注释
 	}
 
 	// ---------------------------------------------------------- 初始化
@@ -247,6 +291,13 @@ export class UI {
 			settingsPop: $('settings-pop'),
 			settingsClose: $('settings-close'),
 			modeList: $('mode-list'),
+			// 检查更新那三件（都在设置卡里）。
+			// ⚠ `updateVersion` 是**静态**的 —— 点检查之前显示 HTML 里写死的
+			//   「版本 —」，没配地址时它就一直是这个，正好说明这条没接上
+			updateVersion: $('update-version'),
+			updateCheck: $('update-check'),
+			updateMsg: $('update-msg'),
+			updateGet: $('update-get'),
 			btnDonate: $('btn-donate'),
 			keeperPop: $('keeper-pop'),
 			keeperClose: $('keeper-close'),
@@ -279,6 +330,12 @@ export class UI {
 			// ⚠ 这里**删掉过** swarm: $('swarm-badge') —— 那颗「幼虫集群中」
 			//   的浮标用户要求去掉了（见 index.html 那段注释）
 			pause: $('pause-badge'),
+			// 成就横幅。⚠ 它**不进** _updateInteractive 的 need ——
+			// `.badge` 是 pointer-events: none，纯粹是给人看的，
+			// 让它参与捕捉鼠标的话屏幕中上方会凭空多出一块吃掉桌面点击的区域
+			achievement: $('achievement'),
+			achievementIcon: $('achievement-icon'),
+			achievementText: $('achievement-text'),
 
 			// —— 经济 ——
 			money: $('s-money'),
@@ -414,15 +471,13 @@ export class UI {
 			const n = Number(btn.dataset.n)
 			const kind = btn.dataset.kind
 
-			// 烤炉：一次只买一个，钱和上限的闸门都在 world.buyOven 里。
+			// 烤炉：**免费摆一个**，和玻璃罐同一个形态（1.27.0 起在商店买断）。
 			// ⚠ 放在最前面并 return —— 它和下面「投 N 个」的语义完全不同
 			//   （那个按份数乘单价、还能部分成功退钱），混在 if/else 里会被误读。
-			//   ⚠ 按钮上的 disabled 只是**提示**，真正的闸门在 world.buyOven
+			//   ⚠ 上限的闸门在 world.addOven 里，按钮上的 disabled 只是提示
 			if (kind === 'oven') {
-				if (this.world.buyOven()) this._flashHint('摆了一个烤炉')
-				else if (this.world.ovens.length >= CONFIG.roast.oven.maxCount) {
-					this._flashHint(`烤炉最多摆 ${CONFIG.roast.oven.maxCount} 个`)
-				} else this._flashHint('钱不够')
+				const oven = this.world.dropOven()
+				this._flashHint(oven ? '摆了一个烤炉' : `烤炉最多摆 ${CONFIG.roast.oven.maxCount} 个`)
 				this.refreshStats()
 				return
 			}
@@ -521,6 +576,11 @@ export class UI {
 			if (!btn) return
 			this.setAnnoying(btn.dataset.mode === 'annoying')
 		})
+
+		// 检查更新那两颗。⚠ 按钮的重入由 checkUpdate 内部的 disabled 挡住 ——
+		// 不挡的话连点三下会同时飞三个请求出去，先回来的那个未必是最新的结论
+		this.el.updateCheck.addEventListener('click', () => this.checkUpdate(false))
+		this.el.updateGet.addEventListener('click', () => this.openDownload())
 
 		// —— 重置：**三道**确认 ——
 		//
@@ -1877,6 +1937,14 @@ export class UI {
 			if (this._seenGenes.includes(id)) continue
 			this._seenGenes.push(id)
 			added = true
+			// ⚠ **突变成就就挂在「刚刚新增」这一刻**（上面那行 continue 已经把
+			//   见过的挡掉了，所以走到这里的一定是首次）。
+			//
+			//   挂这里而不是挂 world 的四个 `_noteGenes` 调用点：这里是从世界到
+			//   UI 的**唯一汇聚点** —— 成虫 / 幼虫 / 卵 / 吃星空苹果现场长星云
+			//   那四条路最后都流到这里。挂世界那边要挂四处，还得再想办法知道
+			//   「这个 id 以前见过没有」
+			this._checkGeneAchievement(id)
 		}
 		if (!added) return
 		this._persistUnlock()
@@ -1891,15 +1959,138 @@ export class UI {
 	/**
 	 * 把解锁状态整个写下去。**这是唯一的落盘点。**
 	 *
-	 * ⚠ 必须一次把 `star` 和 `seen` **都**发过去：主进程那边是白名单整份覆写，
-	 *   只发一个键的话另一个会被静默抹掉（不报错、不崩，只是图鉴慢慢变空）。
+	 * ⚠ 必须一次把**三个键都**发过去：主进程那边是白名单整份覆写，
+	 *   只发一部分的话其余的会被静默抹掉（不报错、不崩，只是那些数据慢慢变空）。
 	 *   所以别再往 `window.pet.saveUnlock` 里塞别的东西 —— 一律走这里
 	 */
 	_persistUnlock() {
 		try {
-			window.pet?.saveUnlock?.({ star: !!this._starUnlocked, seen: this._seenGenes.slice() })
+			window.pet?.saveUnlock?.({
+				star: !!this._starUnlocked,
+				seen: this._seenGenes.slice(),
+				achievements: this._achievements.slice(),
+			})
 		} catch (e) {
 			console.error('[unlock] 写解锁状态失败:', e)
+		}
+	}
+
+	// ---------------------------------------------------------- 成就
+
+	/** 这个成就拿到了没有 */
+	hasAchievement(id) {
+		return this._achievements.includes(id)
+	}
+
+	/**
+	 * 发一个成就（已经拿过就什么都不做）。
+	 *
+	 * ⚠ **就算已经拿过也要正常返回**，调用方不需要先查 —— 那几个触发点
+	 *   都是「可能重复触发」的地方（`refreshStats` 一秒跑六七次、`noteSeenGenes`
+	 *   每帧都可能被调），让调用方自己判重迟早会漏一处
+	 */
+	grantAchievement(id) {
+		const a = CONFIG.achievements.find((x) => x.id === id)
+		if (!a) return false
+		if (this._achievements.includes(id)) return false
+		this._achievements.push(id)
+		this._persistUnlock()
+		this._showAchievement(a)
+		return true
+	}
+
+	/** 启动时按 unlock.json 恢复。**不落盘、也不弹横幅** */
+	setAchievements(ids) {
+		this._achievements = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : []
+	}
+
+	/**
+	 * 把一条成就排进播放队列。
+	 *
+	 * ⚠ **必须排队**，不能直接开始播：一个好时刻往往同时达成两个
+	 *   （财富刚过 $0.1 时「金苹果解锁」和苹果解锁是同一帧；一只带结晶的
+	 *   虫出生时也可能同时点亮图鉴两格）。直接播的话后一条会立刻把
+	 *   前一条换掉 —— 而两条都只显示了一瞬间，玩家一个都没看清
+	 */
+	_showAchievement(a) {
+		this._achievementQueue.push(a)
+		if (this._achievementTimer) return // 正在播，排队等着
+		this._pumpAchievementQueue()
+	}
+
+	/** 播队列里的下一条。播完（动画结束）再叫自己一次 */
+	_pumpAchievementQueue() {
+		const el = this.el.achievement
+		// ⚠ 先查元素**再**出队。反过来的话元素不存在时那一条会被 shift 掉、
+		//   然后白白丢掉 —— 而且不报错
+		if (!el) return
+		const a = this._achievementQueue.shift()
+		if (!a) {
+			this._achievementTimer = null
+			el.classList.add('hidden')
+			return
+		}
+
+		this.el.achievementText.textContent = a.text
+		// 没图标的（后四档财富成就）把 img 藏掉 —— 留着空 img 会显示一个破图标
+		if (a.icon) {
+			this.el.achievementIcon.src = 'assets/achievements/' + a.icon
+			this.el.achievementIcon.classList.remove('hidden')
+		} else {
+			this.el.achievementIcon.classList.add('hidden')
+		}
+
+		el.classList.remove('hidden', 'on')
+		// ⚠ 读一次布局把重排逼出来，否则连着播两条时第二条的 class 没变化、
+		//   动画不会重放 —— 表现是「第一条放完就没动静了」。
+		//   和 _playStarfield / _tapDonate 是同一个手法
+		void el.offsetWidth
+		el.classList.add('on')
+
+		// ⚠ 用 animationend 而不是 setTimeout：整段时长写在 style.css 的
+		//   关键帧里，这里再写一个数就是两处真相，改一处忘一处会变成
+		//   「横幅停在那儿不走」或者「还没停够就被抽掉」
+		//
+		// ⚠⚠ 两条路（animationend 和兜底定时器）**都要 clearTimeout**，
+		//   否则先到的那个不会取消另一个：animationend 先到时定时器照样在
+		//   3.4 秒后炸一下，又调一次 `_pumpAchievementQueue` ——
+		//   结果是**每播一条就偷偷跳过队列里的下一条**
+		let fired = false
+		const done = () => {
+			if (fired) return
+			fired = true
+			clearTimeout(this._achievementTimer)
+			el.removeEventListener('animationend', done)
+			this._achievementTimer = null
+			this._pumpAchievementQueue()
+		}
+		el.addEventListener('animationend', done)
+		// 兜底：万一 animationend 没来（窗口被最小化时浏览器会跳过动画），
+		// 队列不能就此卡死。时长比关键帧那 3.4 秒宽一点
+		this._achievementTimer = setTimeout(done, 4000)
+	}
+
+	/** 见到某种突变时查一下有没有对应的成就 */
+	_checkGeneAchievement(geneId) {
+		for (const a of CONFIG.achievements) {
+			if (a.kind === 'mutation' && a.gene === geneId) this.grantAchievement(a.id)
+		}
+	}
+
+	/**
+	 * 按当前总财富查财富档位的成就。**每次 `refreshStats` 都会调**。
+	 *
+	 * ⚠ 遍历整张表而不是「只查下一档」：表很小（四条），而「只查下一档」
+	 *   要求表是严格有序的、还得额外维护一个游标 —— 漏一档的表现是
+	 *   「那个成就永远拿不到」，没有任何报错
+	 *
+	 * ⚠ 总财富只增不减（见 world.lifetime），所以这里不需要防倒退。
+	 *   但如果哪天有人把它改成会掉的，**这里不能跟着改成「掉了就收回成就」**——
+	 *   成就拿过就是拿过
+	 */
+	_checkWealthAchievements(wealth) {
+		for (const a of CONFIG.achievements) {
+			if (a.kind === 'wealth' && wealth >= a.at) this.grantAchievement(a.id)
 		}
 	}
 
@@ -1917,6 +2108,9 @@ export class UI {
 	clearProgress() {
 		this._starUnlocked = false
 		this._seenGenes = []
+		// 成就也一起清。⚠ 和彩蛋同理：用户要的是「重置 = 真的从 0」，
+		//   成就是这一局挣来的，跟着走
+		this._achievements = []
 		// world.reset() 里也清了一次，这里再兜一道：启动那条路（「重新开始」）
 		// 走的是 save.begin()，调用方未必顺手 reset 过世界
 		if (Array.isArray(this.world?.seenGenes)) this.world.seenGenes.length = 0
@@ -1963,6 +2157,11 @@ export class UI {
 		if (opt.silent) return
 		this._playStarfield()
 		this._flashHint(v ? '罐子亮回了金色 —— 投放里多了一样东西' : '')
+		// ⚠ 成就要挂在 `opt.silent` 这一关的**后面**。
+		//   启动时按存档恢复走的也是这个方法（false → true，状态确实变了，
+		//   上面那个「值没变就早退」拦不住它），只有 `silent` 能把它区分出来 ——
+		//   挂在前面的话，每次开程序都会把「小时的梦想」重放一遍
+		if (v) this.grantAchievement('starApple')
 	}
 
 	/**
@@ -2359,6 +2558,102 @@ export class UI {
 		for (const btn of this.el.modeList.querySelectorAll('[data-mode]')) {
 			btn.classList.toggle('on', (btn.dataset.mode === 'annoying') === annoying)
 		}
+	}
+
+	// ---------------------------------------------------------- 检查更新
+
+	/**
+	 * 启动时那一次。构造函数末尾调，**不 await**。
+	 *
+	 * - 没配地址 → 走 checkUpdate 的同一条分支，把「未配置」摆到设置卡上。
+	 *   ⚠ 文案不在这里再抄一遍：两处各写一份的话，改了一处另一处会一直说旧话
+	 * - 配了地址但 `checkOnStart` 为假 → **什么都不做**，那颗按钮仍然点得动
+	 * - 配了地址又要开机查 → **quiet 模式**：查不到就一个字都不写。
+	 *   ⚠ 绝不 await 它：断网时主进程那边要吊满 6 秒超时，
+	 *     等它的话开局那 6 秒整个界面都是死的
+	 */
+	initUpdate() {
+		const U = CONFIG.update
+		if (!U || !U.manifestUrl) {
+			this.checkUpdate(false)
+			return
+		}
+		if (U.checkOnStart) this.checkUpdate(true)
+	}
+
+	/**
+	 * 查一次版本清单，把结论写进设置卡。
+	 *
+	 * ⚠ **网络那一半全在主进程**（`window.pet.checkUpdate`）——
+	 *   渲染进程跑在 file:// 上，从这儿 fetch 是跨域，换个托管就可能断。
+	 *   这个方法只管：什么时候查、查完显示什么
+	 *
+	 * @param {boolean} quiet 静默模式：不写「正在检查…」、失败也不吭声。
+	 *   启动时那一次用它 —— 桌宠一开机弹一句「检查更新失败」是最讨人厌的
+	 */
+	async checkUpdate(quiet = false) {
+		const U = CONFIG.update
+		if (!U || !U.manifestUrl) {
+			// 没配地址：把状态说出来，但什么都不做。
+			// ⚠ 不藏起来 —— 藏起来的话作者本人在开发时看不出这条没接上
+			this._setUpdateMsg('未配置更新地址（config.js 的 update.manifestUrl）')
+			this.el.updateCheck.disabled = true
+			return
+		}
+
+		this.el.updateCheck.disabled = true
+		// 上一次查出来的「去下载」先收起来：这次可能已经没有新版本了，
+		// 留着一颗指向旧版本的按钮比没有更糟
+		this._pendingDownload = null
+		this.el.updateGet.classList.add('hidden')
+		if (!quiet) this._setUpdateMsg('正在检查…')
+
+		let r
+		try {
+			r = await window.pet.checkUpdate(U.manifestUrl, U.downloadPage)
+		} catch (e) {
+			r = { ok: false, reason: 'ipc' }
+		}
+		this.el.updateCheck.disabled = false
+
+		if (!r || !r.ok) {
+			// ⚠ 静默那一次**一个字都不写**：没网是常态，不该被当成错误报出来。
+			//   手动点的那次要说清楚，不然玩家只看到按钮闪了一下
+			// ⚠ 括号不能省：`+` 比 `??` 结合得紧，写成 '检查失败：' + X ?? Y
+			//   会先算成 ('检查失败：' + X)，那串**永远是字符串**、`??` 永不触发，
+			//   reason 为 undefined 时会显示「检查失败：undefined」
+			if (!quiet) this._setUpdateMsg('检查失败：' + updateFailText(r?.reason))
+			return
+		}
+
+		this.el.updateVersion.textContent = `版本 ${r.current}`
+		if (!r.hasNew) {
+			if (!quiet) this._setUpdateMsg(`已经是最新的（${r.current}）`)
+			return
+		}
+
+		// 有新版本
+		this._setUpdateMsg(`有新版本 ${r.latest}${r.note ? '：' + r.note : ''}`, true)
+		if (r.url) {
+			this._pendingDownload = r.url
+			this.el.updateGet.classList.remove('hidden')
+		} else {
+			// 有新版本却没给下载地址 —— 这是**配置漏了**，说清楚而不是
+			// 放一颗点了没反应的按钮
+			this._setUpdateMsg(`有新版本 ${r.latest}，但清单里没给下载地址（url）`, true)
+		}
+	}
+
+	_setUpdateMsg(text, hasNew = false) {
+		this.el.updateMsg.textContent = text
+		this.el.updateMsg.classList.toggle('has-new', hasNew)
+	}
+
+	/** 打开下载页。地址是主进程校验过 http/https 的 */
+	async openDownload() {
+		if (!this._pendingDownload) return
+		const r = await window.pet.openExternal(this._pendingDownload)
+		if (!r || !r.ok) this._setUpdateMsg('打不开这个链接，手动复制它吧：' + this._pendingDownload, true)
 	}
 
 	/**
@@ -2767,6 +3062,9 @@ export class UI {
 	_applyWindowState(state) {
 		this.el.top.classList.toggle('on', !!state.alwaysOnTop)
 		this.el.through.classList.toggle('on', !!state.clickThrough)
+		// 启动时顺手把版本号填上。⚠ 只是「填上」，**不碰**成功/失败那句话 ——
+		// 这条路和检查更新是两回事，没网时它照样该显示得出来
+		if (state.version) this.el.updateVersion.textContent = '版本 ' + state.version
 		// 缓存一份给 setTool() 用 —— 它要在「选中工具」那一刻判断要不要闪提醒。
 		// 主进程才是真值来源，这边只是把推过来的状态记下来
 		this.view.clickThrough = !!state.clickThrough
@@ -3114,6 +3412,24 @@ export class UI {
 		// 食物那格顺便显示「有几只幼虫正趴在上面啃」，比单看食物数量有意思
 		this.el.food.textContent = c.eating > 0 ? `${c.foods}·${c.eating}啃` : c.foods
 
+		// —— 总财富：成就档位 + 食物解锁 ——
+		//
+		// ⚠ 用 `c.lifetime`（数字）判断，**不要**拿上面那个 moneyText 去比：
+		//   `formatMoney` 会舍入，$10.04 和 $10.04 之外的相邻值可能显示成同一串字符
+		//
+		// ⚠ 这里 6~7 Hz 跑，`grantAchievement` 自带判重，所以重复调用是安全的。
+		//   但 `_wealthWas` 这道缓存仍然值得留着 —— 它挡掉的是绝大部分帧，
+		//   让「没变化」这条快路径不进那两个循环
+		if (c.lifetime !== this._wealthWas) {
+			this._wealthWas = c.lifetime
+			this._checkWealthAchievements(c.lifetime)
+			// 总财富一变，食物可能刚跨过门槛 —— 投放面板要重铺一次
+			// （钱变了那条分支也会调，但卖东西之外还有别的进账路径，
+			//   而且那条分支走的是 money 不是 lifetime，两者不是一回事）
+			this.refreshFeed()
+			if (this.view.codexOpen) this.refreshCodex()
+		}
+
 		// 钱只在**变化时**写 DOM。这个方法是 6~7 Hz 跑的，而钱绝大部分时间是 0，
 		// 无条件写会让它在没变化时也一直触发重排（并且数字等宽也没用，浏览器照样标脏）
 		const moneyText = formatMoney(c.money)
@@ -3209,8 +3525,12 @@ export class UI {
 	 *
 	 * @param {string} group 这一块是谁（`'shop'` / `'feed'`）。只用来给折叠状态
 	 *   拼一个键 —— 两张表的 `cat.id` 目前不重叠，但那是巧合不是契约
+	 * @param {(id: string) => boolean} [hideItem] 这一项现在要不要**整个跳过**。
+	 *   只有投放面板用（烤炉没在商店买断之前不出现）。
+	 *   ⚠ 是逐项判，不是整组判 —— 和 `emptyHint` 那种「整组说话」的机制
+	 *   不是一回事，两者可以同时用在同一组上
 	 */
-	_renderCats(container, cats, rowFor, group) {
+	_renderCats(container, cats, rowFor, group, hideItem = null) {
 		container.innerHTML = ''
 		for (const cat of cats) {
 			const key = group + ':' + cat.id
@@ -3248,6 +3568,7 @@ export class UI {
 
 			let any = false
 			for (const id of cat.items) {
+				if (hideItem && hideItem(id)) continue // 还没到露面的时候（烤炉没买断）
 				const row = rowFor(id)
 				if (!row) continue // 认不出来的 id（配置写错了）—— 跳过，别让整块渲染炸掉
 				rows.append(row)
@@ -3255,7 +3576,25 @@ export class UI {
 			}
 			// 空分类不显示标题 —— 一个只有标题、下面什么都没有的分组
 			// 看起来像「加载失败了」
-			if (!any) continue
+			//
+			// ⚠ 例外：带 `emptyHint` 的那一种**要显示** —— 那句话说的正是
+			//   「这一组为什么是空的 / 还缺什么」（食物的财富门槛，见 _foodLockHint）。
+			//   没有它的话，门槛没过时整组会**凭空消失**：玩家找不到食物，
+			//   也没有任何字解释
+			//   ⚠ 自检里有一条断言要求每个分组都在 DOM 里（main.js 那条
+			//   「投放弹窗里没有「食物类」这个分组」），`continue` 掉就会红
+			if (!any && !cat.emptyHint) continue
+
+			// ⚠ 那句话**不挂在「组是空的」这个条件上** —— 食物那一组现在
+			//   永远有苹果，但金苹果还锁着。只在空组时才说的话，玩家要到
+			//   过线那一刻才发现「凭空多了一行」
+			if (cat.emptyHint) {
+				const hint = document.createElement('div')
+				hint.className = 'shop-cat-empty'
+				hint.dataset.empty = cat.id
+				hint.textContent = cat.emptyHint
+				rows.append(hint)
+			}
 
 			// 建的时候就带上折叠态 —— 状态在 UI 实例上，不在 DOM 上
 			this._applyCatFold(groupEl, key)
@@ -3433,14 +3772,38 @@ export class UI {
 	 * 这里的消耗品可以反复买，按钮永远不会变成「已拥有」。
 	 */
 	refreshFeed() {
-		// ⚠ 只改**食物那一组**的 items，其他组原样透传。
+		// ⚠ 只有**食物**那一组换 items（按财富门槛过滤），其余组原样透传。
 		//   `_renderCats` 靠 `group + ':' + cat.id` 拼折叠状态的键，
 		//   重建一个新对象没问题；但把 jar / oven 那几组也过一遍 filter，
 		//   迟早会漏掉一个 —— 而漏掉的表现是那一整组**静默消失**
+		//
+		// ⚠ 烤炉是**单项**过滤，不是整组：它和 jar / fly 同属「其他」那一组，
+		//   整组过滤会把另外两项一起干掉。所以走 hideItem 这一个钩子，
+		//   `_renderCats` 在渲染每一项之前问一次
 		const cats = CONFIG.market.feedCats.map((c) =>
-			c.id === 'food' ? { ...c, items: this.unlockedFoodIds() } : c,
+			c.id === 'food'
+				? { ...c, items: this.unlockedFoodIds(), emptyHint: this._foodLockHint() }
+				: c,
 		)
-		this._renderCats(this.el.feedList, cats, (id) => this._feedRowFor(id), 'feed')
+		this._renderCats(this.el.feedList, cats, (id) => this._feedRowFor(id), 'feed', (id) =>
+			this._feedRowHidden(id),
+		)
+	}
+
+	/**
+	 * 投放面板里这一项现在**该不该藏起来**。
+	 *
+	 * 目前只有一条：**烤炉要先在商店买断**（1.27.0 起）。
+	 * 没买之前那一行整个不出现 —— 摆一个按钮在那儿、点了却没反应，
+	 * 比不出现更让人困惑。
+	 *
+	 * ⚠ 判据用 `world.hasShopItem('oven')`（读的是 shop.oven），
+	 *   和商店那边「已拥有就置灰」是**同一个真值来源**。
+	 *   另起一套的话会出现「商店说已拥有、投放里却没有那一行」
+	 */
+	_feedRowHidden(id) {
+		if (id === 'oven') return !this.world.hasShopItem('oven')
+		return false
 	}
 
 	/**
@@ -3451,7 +3814,49 @@ export class UI {
 	 *   的断言会跟着一起漂 —— 而它们恰恰就是用来抓这种漂移的
 	 */
 	unlockedFoodIds() {
-		return this._allFoodIds().filter((id) => id !== 'star' || this.starUnlocked)
+		return this._allFoodIds().filter((id) => !this._foodLocked(id))
+	}
+
+	/**
+	 * 这种食物**现在是不是锁着**。投放面板和图鉴**共用这一条**。
+	 *
+	 * ⚠ 抽出来之前，判据散在两处（`unlockedFoodIds` 里一个三元、`_codexFoodCell`
+	 *   里一个 `id === 'star' &&`）。加苹果/金苹果的门槛时那两处**必须一起改**，
+	 *   漏一处的症状是「投放里有了、图鉴里还是灰的」—— 不报错，只是自相矛盾
+	 *
+	 * ⚠ 门槛读的是 `world.lifetime`（**累计赚到过多少钱**），不是 `money`。
+	 *   用 `money` 的话，玩家花 $0.01 买个苹果就可能把苹果自己锁回去
+	 */
+	_foodLocked(id) {
+		// 星空苹果走彩蛋那条路，和财富无关
+		if (id === 'star') return !this.starUnlocked
+		const need = CONFIG.market.foodUnlock[id]
+		return typeof need === 'number' && this.world.lifetime < need
+	}
+
+	/**
+	 * 「还有什么食物锁着、差多少钱」—— 给投放面板写一句人话。
+	 *
+	 * ⚠ 普通苹果开局就能买，所以这一组**永远不空**；这句话守的是另一件事：
+	 *   金苹果安安静静躺在配置里，玩家在过线之前完全不知道有它 ——
+	 *   然后到 $0.1 那一刻凭空多出一行。所以**不管组里有没有东西都要说**。
+	 *
+	 * ⚠ 点名是哪一样，不能只说「财富到 $0.100 解锁」—— 那样玩家不知道
+	 *   该期待什么，也不知道值不值得去赚这个钱。
+	 *
+	 * 返回 null = 没有锁着的东西（或者压根没配门槛），那句话就不出现
+	 */
+	_foodLockHint() {
+		const table = CONFIG.market.foodUnlock ?? {}
+		// ⚠ 只认表里有的那些 —— 星空苹果也「锁着」，但它走彩蛋，
+		//   在这句话里提它就等于剧透
+		const locked = this._allFoodIds().filter((id) => typeof table[id] === 'number' && this._foodLocked(id))
+		if (!locked.length) return null
+		// 说**最近的那一档** —— 玩家想知道的是「下一个还差多少」，
+		// 而不是最远的那个
+		const need = Math.min(...locked.map((id) => table[id]))
+		const names = locked.filter((id) => table[id] === need).map((id) => FOOD_NAME[id] ?? id)
+		return `${names.join(' / ')}：财富到 ${formatMoney(need)} 解锁`
 	}
 
 	/**
@@ -3515,11 +3920,17 @@ export class UI {
 				name: '玻璃罐',
 				short: '罐中寿命 ×2',
 				desc: `摆一个透明玻璃罐，最多同时摆 ${CONFIG.jar.maxCount} 个。用捕虫网把果蝇网进去，在罐子里它们活得比外面久一倍`,
-				free: true,
+				place: 'jar',
 			},
-			// 烤炉：**花钱，但一次只买一个** —— 这是第三种形态（见下面的 single 分支）。
-			// 它从 1.18.0 起从烤制链里独立出来，挪到了这里：炉子不是「点火器的一档」，
-			// 它是一条独立的赚钱路子（装 5 只 → 进度条 → 整炉卖钱）
+			// 烤炉：**和玻璃罐同一个形态** —— 先在商店里花 $15 买断，
+			// 之后这里就是免费的「摆一个」。
+			//
+			// ⚠ 1.27.0 之前它是「每摆一个收 $5」，是这个表里唯一花钱的一项，
+			//   走的是 single 分支。用户要求改成「获得后像玻璃罐一样放」——
+			//   同一件工具在商店里买断、在投放里却按次收费，两套语义并存的
+			//   确说不通
+			//
+			// ⚠ 没买之前这一行**不渲染**（见 refreshFeed 的过滤）
 			oven: {
 				name: '烤炉',
 				short: '整炉卖 ×' + CONFIG.roast.oven.mul,
@@ -3527,8 +3938,7 @@ export class UI {
 					`在屏幕上随便摆一个。戴手套抓最多 ${CONFIG.roast.oven.capacity} 只成虫放进去，` +
 					`进度条满了自动按 ×${CONFIG.roast.oven.mul} 卖成钱（不留尸体）。` +
 					`最多同时摆 ${CONFIG.roast.oven.maxCount} 个`,
-				unit: ovenPrice(),
-				single: true,
+				place: 'oven',
 			},
 		}
 
@@ -3537,35 +3947,26 @@ export class UI {
 
 		const buttons = []
 
-		if (r.free) {
+		if (r.place) {
+			// —— 免费摆一个（玻璃罐 / 烤炉）——
+			//
+			// ⚠ 上限是**看得到的**：满了就置灰，而不是点了没反应。
+			//   早先罐子那颗按钮在工具栏上，撞上限是静默的 —— 玩家只能猜
+			//
+			// ⚠ 两者的上限来自**两张不同的配置**（jar.maxCount / roast.oven.maxCount），
+			//   别图省事合并成一个字段：它们是独立调过的两个数
+			const cap = r.place === 'jar' ? CONFIG.jar.maxCount : CONFIG.roast.oven.maxCount
+			const now = r.place === 'jar' ? this.world.jars.length : this.world.ovens.length
+			const full = now >= cap
 			const b = document.createElement('button')
 			b.className = 'shop-buy'
-			b.dataset.jar = '1'
-			// ⚠ 上限是**看得到的**：满 4 个时置灰，而不是点了没反应。
-			//   早先这颗按钮在工具栏上，撞上限是静默的 —— 玩家只能猜
-			const full = this.world.jars.length >= CONFIG.jar.maxCount
+			// ⚠ 玻璃罐那条委托挂在 [data-jar] 上（它比烤炉早，另外两条 [data-kind]
+			//   的委托会把这个按钮当成「投 N 个」处理，data-n 是空的会算出 NaN）
+			if (r.place === 'jar') b.dataset.jar = '1'
+			else b.dataset.kind = id
 			b.textContent = full ? '摆满了' : '摆一个'
 			b.disabled = full
-			if (full) b.title = `最多同时摆 ${CONFIG.jar.maxCount} 个`
-			buttons.push(b)
-		} else if (r.single) {
-			// —— 第三种形态：花钱，但一次只买一个 ——
-			//
-			// ⚠ 复用下面那条 `[data-kind]` 委托，**不为它另开一条 [data-oven]**：
-			//   那条委托已经是「投放里的东西怎么买」的**唯一**入口，
-			//   再开一条的话「钱不够要置灰 / 撞上限要置灰」这两条规则会长出第二份
-			const cost = r.unit
-			const afford = this.world.money >= cost
-			const full = this.world.ovens.length >= CONFIG.roast.oven.maxCount
-			const b = document.createElement('button')
-			b.className = 'shop-buy'
-			b.dataset.kind = id // ⚠ 没有 data-n —— 它不是「投 N 个」
-			b.textContent = full ? '摆满了' : '摆一个 ' + formatMoney(cost)
-			b.disabled = full || !afford
-			// 「撞上限」和「钱不够」是两件事，提示要分开说 ——
-			// 早先罐子撞上限是静默的，玩家只能猜（见上面 free 分支那段注释）
-			if (full) b.title = `最多同时摆 ${CONFIG.roast.oven.maxCount} 个`
-			else if (!afford) b.title = '钱不够'
+			if (full) b.title = `最多同时摆 ${cap} 个`
 			buttons.push(b)
 		} else {
 			for (const n of FEED_QUANTITIES) {
@@ -3591,8 +3992,8 @@ export class UI {
 	 * ⚠ 内容**全部从 config 现算**，不在 UI 里另抄一份文案。
 	 *   抄一份的话，改了数值界面就成了假话 —— 而图鉴恰恰是玩家用来
 	 *   「查这个世界有什么」的地方，说假话比不说还糟。
-	 *   所以倍数（×1.3 / ×2）和概率（2.9%）都是现场从
-	 *   `CONFIG.mutation.types` 里读出来拼的。
+	 *   所以倍数（×1.3 / ×2）和概率都是现场从 `CONFIG.mutation.types`
+	 *   里读出来拼的 —— 那几行里**一个数字都不许写死**。
 	 *
 	 * ⚠ 食物格子是**真的画出来的**（每格一个小 canvas），不是色块。
 	 *   画法与场上那一份共用 `render.drawFoodIcon` —— 图鉴存在的意义就是
@@ -3655,9 +4056,9 @@ export class UI {
 		const V = CONFIG.visual
 		if (!V.food[id]) return null // 认不出来的食物类型
 
-		// 只有星空苹果有「拥有」这回事：其余的开局就能买。
-		// ⚠ 判据和投放面板共用 starUnlocked，不另起一套
-		const locked = id === 'star' && !this.starUnlocked
+		// ⚠ 判据和投放面板共用 `_foodLocked()`，不另起一套 ——
+		//   两处各写一份的话迟早变成「投放里有了、图鉴里还是灰的」
+		const locked = this._foodLocked(id)
 
 		const cell = document.createElement('div')
 		cell.className = 'codex-cell'
@@ -3705,11 +4106,17 @@ export class UI {
 	}
 
 	/**
-	 * 一格基因：胶囊 + 一句效果说明 + 出现概率。
+	 * 一格基因：**画像** + 胶囊 + 一句效果说明 + 出现概率。
 	 *
 	 * ⚠ 「见过」= 你的世界里**出生过**带这种突变的虫（卵和幼虫都算），
 	 *   见过一次就永久点亮。真值来源是 `seenGene(id)`（存在 unlock.json 里），
 	 *   不是「现在养着几只」
+	 *
+	 * ⚠ 排版和食物格**对齐**：左边一张 canvas、右边文字。为此把胶囊
+	 *   （`.gene-badge`）挪进了 `.codex-text` 里 —— 原来是并列的第三个
+	 *   flex 子元素，而每格内容只有 132px，胶囊最长 74px，
+	 *   再塞一个 34px 的 canvas 进去，文字列会只剩 27px、被挤成竖条。
+	 *   挪进去之后文字列反而从 51px 涨到 91px（见 style.css 那段注释）
 	 */
 	_codexGeneCell(id) {
 		const t = CONFIG.mutation.types.find((m) => m.id === id)
@@ -3724,6 +4131,28 @@ export class UI {
 			cell.classList.add('locked')
 			cell.dataset.locked = '1'
 		}
+
+		// —— 这只突变果蝇长什么样 ——
+		//
+		// ⚠ 没见过的格子画的是**一个暗影**，不是把真身调暗（见 drawFlyIcon
+		//   的 silhouette 分支）。图鉴的立场是「留得住有这么个东西，
+		//   留不住它是什么样」—— 名字和图标本来就露着，但长相是发现的一部分
+		//
+		// ⚠ 种子和尺寸从 crop 那套口径来（和食物格同一个 34px / 0.72 系数），
+		//   种子固定，免得每次打开形状都不一样
+		const css = 34
+		const dpr = window.devicePixelRatio || 1
+		const cv = document.createElement('canvas')
+		cv.className = 'codex-icon gene-preview'
+		cv.width = Math.floor(css * dpr)
+		cv.height = Math.floor(css * dpr)
+		const ctx = cv.getContext('2d')
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+		ctx.translate(css / 2, css / 2)
+		// ⚠ 系数比食物格那个 0.72 小。果蝇连着翅膀和眼部泛光的总跨度约 1.5×体长
+		//   （苹果是一颗圆的，没有这个问题），0.72 下泛光会顶到画布边被切掉 ——
+		//   自检里那条包围盒断言就是为这个写的
+		drawFlyIcon(ctx, [id], css * 0.58, 7, locked)
 
 		const badge = document.createElement('span')
 		badge.className = 'gene-badge'
@@ -3757,9 +4186,11 @@ export class UI {
 					? `${(t.chance * 100).toFixed(1)}% · ${how}`
 					: `${t.fromStar ? '吃星空苹果获得' : '无法自然获得'} · ${how}`
 		}
-		text.append(name, desc)
+		// ⚠ 胶囊在文字**上面**，和另外两行一样是 codex-text 的子节点 ——
+		//   这样它和 canvas 就不会抢同一行的宽度了
+		text.append(badge, name, desc)
 
-		cell.append(badge, text)
+		cell.append(cv, text)
 		return cell
 	}
 

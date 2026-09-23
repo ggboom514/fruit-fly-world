@@ -1058,6 +1058,24 @@ button.toggle.on {
 }
 
 /*
+ * 一整组都没解锁时顶替行的那句话（现在只有「食物类」会用）。
+ *
+ * ⚠ 它不是装饰：门槛没过时食物那一组本来是空的，而空组会被
+ *   _renderCats 整个跳过（「只有标题、下面什么都没有」看起来像加载失败）——
+ *   于是玩家发现食物凭空消失、还没有任何解释。这句话就是那个解释，
+ *   而且它必须**说出阈值**，不然玩家只知道「现在没有」，不知道要做什么
+ */
+.shop-cat-empty {
+	padding: 7px 8px;
+	border-radius: 7px;
+	background: rgba(255, 255, 255, 0.03);
+	border: 1px dashed rgba(255, 255, 255, 0.12);
+	font-size: 10px;
+	color: rgba(200, 190, 175, 0.5);
+	text-align: center;
+}
+
+/*
  * 分类标题现在是个**折叠按钮**。
  *
  * ⚠ 只挂 `.cat-toggle`，**不要去改 `.shop-cat-name`** —— 图鉴那两张小标题
@@ -1640,6 +1658,19 @@ body.over-grabbable {
 	width: 336px; /* 投放 / 商店 / 图鉴：装得下「名字 + 说明 + 两颗按钮」 */
 }
 
+/*
+ * 图鉴再宽一档。它跟另外两张 `.wide` 卡不一样：投放和商店的每一行是
+ * 「名字 + 说明 + 两颗按钮」，而图鉴的基因格是**画像 + 胶囊 + 效果 + 概率**
+ * 四样挤在半个格子里（两列布局），336px 下效果那行会折成三行、
+ * 而且最后一行的字会掉单（「…都显形」只剩一个「形」）。
+ *
+ * ⚠ 用 id 选择器是为了**只**影响图鉴 —— `.donate-pop.wide` 是投放和商店
+ *   共用的，改那个会把两张卡一起撑宽。id 的特异性天然盖过两个类
+ */
+#codex-pop {
+	width: 400px;
+}
+
 .donate-pop.mid {
 	width: 292px; /* 养蝇人：六行标签 + 一排按钮，比默认的 268 稍宽 */
 }
@@ -1862,6 +1893,87 @@ body.over-grabbable {
 	font-size: 10px;
 	color: rgba(200, 190, 175, 0.6);
 	line-height: 1.5;
+}
+
+/* ---------------------------------------------------------- 检查更新 */
+
+/*
+ * 设置卡最底下那一行：左边版本号、右边一颗按钮。
+ * 用 space-between 而不是让按钮撑满 —— 版本号是说明、按钮是动作，
+ * 两者挤在一起会让人以为整行都能点
+ */
+.update-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+	margin-top: 12px;
+	padding-top: 10px;
+	border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.update-version {
+	font-size: 10px;
+	color: rgba(200, 190, 175, 0.6);
+}
+
+.update-btn {
+	padding: 4px 10px;
+	font-size: 11px;
+	border-radius: 6px;
+	border: 1px solid var(--border);
+	background: rgba(255, 255, 255, 0.05);
+	color: var(--text);
+	cursor: pointer;
+}
+
+.update-btn:hover:not(:disabled) {
+	background: rgba(255, 255, 255, 0.1);
+}
+
+.update-btn:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+
+/*
+ * 结果那一行。⚠ 高度**先占住**（min-height），不然检查完文字一出来
+ * 整张卡会跳一下，而卡片是居中的 —— 跳的是它自己的位置
+ */
+.update-msg {
+	min-height: 13px;
+}
+
+/* 有新版本时那一行提示偏金色，和「已是最新」那种无关紧要的话区分开 */
+.update-msg.has-new {
+	color: var(--gold-hi);
+}
+
+.update-get {
+	width: 100%;
+	margin-top: 8px;
+	padding: 7px 10px;
+	font-size: 12px;
+	font-weight: 600;
+	border-radius: 8px;
+	border: 1px solid rgba(232, 184, 75, 0.6);
+	background: rgba(232, 184, 75, 0.14);
+	color: var(--gold-hi);
+	cursor: pointer;
+}
+
+.update-get:hover {
+	background: rgba(232, 184, 75, 0.22);
+}
+
+/*
+ * ⚠ 没有通用的 `.hidden { display:none }` —— 这个项目里每个 .hidden 都是
+ *   各自限定作用域的，光加 class 是不管用的（见 204 行那段注释）。
+ *   漏了这条的症状：**那颗「去下载」按钮从一开始就挂在那儿**，
+ *   而它点了没反应（`_pendingDownload` 还是 null）—— 看着像按钮坏了
+ */
+.update-get.hidden {
+	display: none;
 }
 
 /* 重置确认 */
@@ -2129,6 +2241,84 @@ body.booting .inspect {
 	}
 }
 
+/* ---------------------------------------------------------- 成就横幅 */
+
+/*
+ * 成就横幅。定位直接沿用 `.badge`（fixed / top:18px / 居中），
+ * 所以它就在**屏幕中上方** —— 不用再写一遍。
+ *
+ * ⚠ 入场和出场是**一整段**动画（`.on` 挂上之后跑一次就跑完），
+ *   不是「入场动画 + JS 计时器管出场」。用计时器的话它和动画时长是两处
+ *   写死的数，改一个忘一个的症状是「横幅停在那儿不走了」或者
+ *   「还没停够就被抽掉」，而且只在慢帧率下才看得出来。
+ *   动画跑完再靠 animationend 收尾 —— 见 ui._pumpAchievementQueue
+ */
+.achievement {
+	display: flex;
+	align-items: center;
+	gap: 9px;
+	padding: 7px 16px 7px 9px;
+	font-size: 13px;
+	font-weight: 600;
+	color: #ffe9b8;
+	border-color: rgba(224, 169, 79, 0.65);
+	background: rgba(28, 22, 14, 0.88);
+	box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+}
+
+.achievement.hidden {
+	display: none;
+}
+
+/*
+ * ⚠ 图标是**自己画的 SVG**（`renderer/assets/achievements/*.svg`），
+ *   带透明通道、平涂 + 深色描边。不是位图照片 —— 用照片的话
+ *   白底/黑底在深色横幅上就是一块方块，而且缩到 26px 会糊。
+ *
+ * ⚠ 所以这里**不要**加 border-radius / object-fit 那些「修照片」的东西：
+ *   SVG 自己就是最终形状，再裁一刀反而会把描边切掉
+ */
+.achievement-icon {
+	width: 26px;
+	height: 26px;
+	flex: none;
+}
+
+.achievement-icon.hidden {
+	display: none;
+}
+
+.achievement-text {
+	white-space: nowrap;
+}
+
+/*
+ * ⚠ 整段动画：滑入 → 停住 → 滑回去。`forwards` 是必要的 ——
+ *   没有它，动画播完元素会**弹回**初始状态（也就是 opacity 0 的位置）
+ */
+.achievement.on {
+	animation: achievement 3.4s ease forwards;
+}
+
+@keyframes achievement {
+	0% {
+		opacity: 0;
+		transform: translate(-50%, -14px) scale(0.96);
+	}
+	8% {
+		opacity: 1;
+		transform: translate(-50%, 0) scale(1);
+	}
+	86% {
+		opacity: 1;
+		transform: translate(-50%, 0) scale(1);
+	}
+	100% {
+		opacity: 0;
+		transform: translate(-50%, -14px) scale(0.98);
+	}
+}
+
 /* ---------------------------------------------------------- 悬停检视卡片 */
 
 /*
@@ -2341,9 +2531,26 @@ body.booting .inspect {
 	color: rgba(200, 190, 175, 0.55);
 }
 
-/* 突变格子里那枚胶囊（.gene-badge）自己带颜色，这里只保证它不被挤扁 */
-.codex-cell .gene-badge {
-	flex: none;
+/*
+ * 突变格子里那枚胶囊（.gene-badge）。
+ *
+ * ⚠ 它现在是 `.codex-text` 的**第一个子节点**（不是格子自己的子元素）——
+ *   见 ui._codexGeneCell 那段注释：格子内容只有 132px 宽，
+ *   胶囊（最长 74px）和 34px 的画像并列的话，文字列会被挤成竖条。
+ *   挪进文字列之后文字反而从 51px 涨到 91px。食物格没有胶囊，不受影响
+ *
+ * ⚠ `align-self: flex-start` 是**必须的**：`.codex-text` 是 column flex，
+ *   默认 `align-items: stretch` 会把这枚 span 拉满整行，
+ *   胶囊就不再是胶囊、变成一条横杠
+ *
+ * ⚠ `max-width` + `overflow` 防的是将来：胶囊是 `white-space: nowrap`
+ *   （见下面 .gene-badge 那条），再加一种名字更长的突变时它会**横向溢出到
+ *   隔壁格子**而不是换行。现在的「◆ 点石成金」74px 还够用，但那是碰巧
+ */
+.codex-text .gene-badge {
+	align-self: flex-start;
+	max-width: 100%;
+	overflow: hidden;
 }
 
 /*
@@ -2372,6 +2579,20 @@ body.booting .inspect {
 
 .codex-cell.locked .codex-icon {
 	filter: grayscale(1) opacity(0.35);
+}
+
+/*
+ * ⚠ 基因格里画的是**暗影**（见 render.drawFlyIcon 的 silhouette 分支），
+ *   本身就是「看不清」的样子了。再叠一层 grayscale + 0.35 会把它压到
+ *   几乎不可见 —— 那就和这一格不存在没区别了，而图鉴的立场恰恰是
+ *   「留得住有这么个东西，留不住它是什么样」。
+ *
+ * ⚠ 四个类的特异性稳盖上面那条三个类的。而且**必须带 `.gene-preview`** ——
+ *   写成 `.codex-cell.locked .codex-icon` 会把食物格的置灰一起干掉，
+ *   星空苹果那一格就会在没解锁时**亮着**
+ */
+.codex-cell.locked .codex-icon.gene-preview {
+	filter: none;
 }
 
 .codex-cell.locked .gene-badge {

@@ -1,0 +1,23 @@
+<!--
+	「点石成金」→ 金矿石。
+
+	⚠ 石头是**多边形**不是圆：圆角矩形在 26px 下就是一个灰方块，
+	   看得出「有块东西」但看不出「是石头」。八个折角才读得出矿物的意思。
+
+	⚠ 三粒金子的位置是**散开**的，不是排成一排 —— 排齐了像按钮上的图标，
+	   散着才像「嵌在石头里」。石头的描边比金子深一档，金子才不会陷进去。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+	<!-- 石头 -->
+	<path d="M11.6 2.6l6.9 3.4 2.3 7.3-4.6 6.5H8.2L3.4 13.3l2.3-7.3z"
+		fill="#8d9299" stroke="#494e55" stroke-width="1.3" stroke-linejoin="round" />
+	<!-- 石头上的暗面：给一点体积，不然是一块死平的灰 -->
+	<path d="M11.6 2.6l6.9 3.4 2.3 7.3-4.6 6.5H11.6z" fill="#6f757c" opacity=".55" />
+	<!-- 金粒 ×3 -->
+	<path d="M9.1 8.3l2.5-1.3 2.1 1.7-1.3 2.7-2.7.2z"
+		fill="#f2c14e" stroke="#8a5f12" stroke-width="1" stroke-linejoin="round" />
+	<path d="M13.8 12.9l2.3-.5 1.1 2.1-1.7 1.7-2.1-1.1z"
+		fill="#f2c14e" stroke="#8a5f12" stroke-width="1" stroke-linejoin="round" />
+	<path d="M6.6 12.6l1.9-.6.8 2.1-1.7 1.5-1.7-1.1z"
+		fill="#f2c14e" stroke="#8a5f12" stroke-width="1" stroke-linejoin="round" />
+</svg>

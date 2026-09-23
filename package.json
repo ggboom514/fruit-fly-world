@@ -1,6 +1,6 @@
 {
   "name": "fruit-fly-pet",
-  "version": "1.24.1",
+  "version": "1.28.0",
   "description": "果蝇世界 — 会繁殖、会长大、会腐烂的桌面生态",
   "main": "main.js",
   "scripts": {
@@ -10,6 +10,7 @@
     "sim": "bun tools/simulate.js",
     "probe": "bun tools/probe-fly.js",
     "probe:forage": "bun tools/probe-forage.js",
+    "manifest": "bun tools/make-manifest.js",
     "icon": "electron tools/make-icon.js",
     "dist": "electron-builder --win --x64"
   },

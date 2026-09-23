@@ -25,7 +25,7 @@ import {
 	snapshot,
 	revive,
 } from './entities.js'
-import { shopItem, foodPrice, flyPrice, bulkPrice, ovenPrice, formatMoney } from './market.js'
+import { shopItem, foodPrice, flyPrice, bulkPrice, formatMoney } from './market.js'
 
 /**
  * 读档时取一个数值：不是有限数就退回默认值。
@@ -221,7 +221,29 @@ export class World {
 			eggsLaid: 0, // 累计产卵数
 			emerged: 0, // 累计羽化数
 			sold: 0, // 累计卖掉的成虫数（经济那一条回路）
+			// 累计**赚到**过多少钱（金额，不是只数）。食物的解锁门槛和成就的
+			// 财富档位都读它 —— 见 `lifetime` getter。
+			//
+			// ⚠ 它和 `money` 是**两回事**：`money` 会因为你买东西而减少，
+			//   而这个只增不减。用 `money` 当门槛的话，玩家花 $0.01 买个苹果
+			//   就可能把刚拿到的成就「退回去」，下一次再涨回来又会重放一遍横幅
+			earned: 0,
 		}
+	}
+
+	/**
+	 * 「总财富」—— 从开局到现在一共赚到过多少钱。
+	 *
+	 * ⚠ **不是 `money`。** `money` 是「现在手里还有多少」，买工具会把它花掉；
+	 *   这个只认进账，所以成就和食物门槛不会因为花钱而倒退。
+	 *   用户明确选的就是这个口径（现金那个口径会因为买工具而缩水）。
+	 *
+	 * ⚠ 只统计 `_creditSale()` 那一处 —— 也就是**真的卖了东西**。
+	 *   `buyFood` / `buyFlies` / `buyOven` 里那三次 `this.money +=` 是
+	 *   「没放下的退钱」，不是收入，**不该**算进来
+	 */
+	get lifetime() {
+		return this.stats.earned ?? 0
 	}
 
 	// ================================================================
@@ -2433,26 +2455,10 @@ export class World {
 		return gain
 	}
 
-	/**
-	 * 花钱摆一个烤炉。返回摆成了没有。
-	 *
-	 * ⚠ 上限的**真正闸门在这里**，UI 那边把按钮置灰只是提示 ——
-	 *   和 buyFood 同一条规矩：失败的操作**不留下任何痕迹**（钱不够不扣款、
-	 *   到上限不扣款）。这里只有一个，所以没有「退钱」那一半；
-	 *   但 dropOven 万一将来多出一条拒绝条件，这里必须退钱，
-	 *   否则就是「扣了钱没东西」，而玩家只会觉得钱莫名其妙少了
-	 */
-	buyOven() {
-		if (this.ovens.length >= CONFIG.roast.oven.maxCount) return false
-		const cost = ovenPrice()
-		if (!this.spend(cost)) return false
-		const oven = this.dropOven()
-		if (!oven) {
-			this.money += cost
-			return false
-		}
-		return true
-	}
+	// ⚠ 这里删掉过 `buyOven()`（每摆一个收 $5）。烤炉从 1.27.0 起是商店里的
+	//   **一次性道具**：买断之后投放面板里出现一行免费的「摆一个」，
+	//   和玻璃罐走的是同一条路 —— 直接调 `dropOven()`。
+	//   上限的闸门因此只剩 `addOven()` 那一处，不再有「扣了钱没东西」要退钱的问题
 
 	/**
 	 * 记一笔卖出：钱进账 + 计数 +1。**只算钱、不碰任何实体**，
@@ -2468,6 +2474,12 @@ export class World {
 		if (!(gain > 0)) return 0
 		this.money += gain
 		this.stats.sold = (this.stats.sold ?? 0) + 1
+		// ⚠ 「累计总收入」**只在这里**累加。
+		//   全项目还有两处 `this.money +=`（buyFood / buyFlies 里的退款），
+		//   那两处是「没放下的钱还给你」，不是赚到的 —— 算进去的话
+		//   玩家反复买一批放不下的东西就能把总财富刷上去
+		//   （第三处 buyOven 的退款随烤炉改成买断道具一起没了，见上面那段）
+		this.stats.earned = (this.stats.earned ?? 0) + gain
 		return gain
 	}
 
@@ -3034,6 +3046,21 @@ export class World {
 			this.ovens.push(oven)
 		}
 
+		// —— 一次性存档迁移：烤炉从「按次收费」改成「商店买断」——
+		//
+		// 1.27.0 之前烤炉不在商店里，老存档的 this.shop 里**没有 oven 这个键**。
+		// 不迁的话，一个正摆着两三台炉子的玩家更新完打开投放面板会发现
+		// **那一行凭空消失**（要重新去商店花 $15 买一次），
+		// 而屏幕上明明还摆着他之前买的那几台。
+		//
+		// 判据用「已经摆着炉子」而不是版本号：那是**看得见的事实**，
+		// 顺手也兜住了「手改存档塞了炉子但没 shop 键」这种怪状态。
+		//
+		// ⚠ 位置**必须在上面这个 ovens 重建循环之后** ——
+		//   放到前面（挨着 _loadList 那几行）的话 this.ovens 还是构造函数里的
+		//   空数组，这条永远不触发，而且是静默的
+		if (this.ovens.length > 0 && !this.shop.oven) this.shop.oven = true
+
 		// 存档时的窗口尺寸不一定和现在一样（换显示器、改分辨率、或者存档来自
 		// 另一个屏幕）。坐标原样沿用的话，会有实体落在屏幕外回不来 ——
 		// 借 resize() 把它们夹回可见范围。
@@ -3170,6 +3197,9 @@ export class World {
 
 			// 经济。UI 只从这里读数字，和别的计数一个来源
 			money: this.money,
+			// 「总财富」= 累计赚到过多少钱（只增不减）。食物的解锁门槛和
+			// 成就的财富档位都读它 —— 和 `money` 的区别见 get lifetime()
+			lifetime: this.lifetime,
 			shop: this.shop,
 			// 养蝇人：等级（0 = 没买）和玩家调的配置。
 			// 按**引用**给出去，和 shop 一样 —— UI 只读不写，

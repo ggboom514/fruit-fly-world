@@ -10,7 +10,7 @@
 
 import { CONFIG, swatterHeadAt } from './config.js'
 import { World } from './world.js'
-import { Renderer } from './render.js'
+import { Renderer, drawFlyIcon } from './render.js'
 import { UI } from './ui.js'
 import { SaveManager } from './save.js'
 import { ensureNebula, nebulaInfo } from './nebula.js'
@@ -176,7 +176,21 @@ window.addEventListener('resize', () => {
 // ⚠ nebulaInfo 也给出去：自检要问「星云贴图到底加载出来了没有」。
 //   路径写错时 `new Image()` **不报错、不抛**，只是永远不 onload ——
 //   表现是「星空苹果是一块纯紫果肉」，看着像美术选择，其实是 404
-window.__pet = { world, view, renderer, ui, save, config: CONFIG, swatterHeadAt, nebulaInfo }
+// ⚠ drawFlyIcon 也给出去：自检要量「疯狂蝇比普通蝇红多少」。
+//   图鉴那 5 格里没有「普通蝇」这一格可比，只能自己拿同一个 size / seed
+//   把 [] 和 ['berserk'] 各画一张 —— 照抄图鉴的画法自己再算一遍的话，
+//   测的就成了断言自己的算术（和上面 swatterHeadAt 是同一条理由）
+window.__pet = {
+	world,
+	view,
+	renderer,
+	ui,
+	save,
+	config: CONFIG,
+	swatterHeadAt,
+	nebulaInfo,
+	drawFlyIcon,
+}
 
 // —— 启动 ——
 //
@@ -206,6 +220,10 @@ window.__pet = { world, view, renderer, ui, save, config: CONFIG, swatterHeadAt,
 		// 会走 _persistUnlock 把**两个键一起**写下去，反过来的话
 		// 这一拍会把刚读出来的 seen 用空数组覆盖掉
 		ui.setSeenGenes(res?.data?.seen)
+		// 成就同理。⚠ 它必须在 setStarUnlocked **之前**灌 ——
+		// 那个方法内部会走 _persistUnlock 把三个键**一起**写下去，
+		// 反过来的话这一拍会把刚读出来的成就用空数组覆盖掉
+		ui.setAchievements(res?.data?.achievements)
 		ui.setStarUnlocked(!!res?.data?.star, { silent: true })
 	} catch (e) {
 		console.error('[unlock] 读解锁状态失败，按未解锁处理:', e)

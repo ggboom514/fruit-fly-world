@@ -48,8 +48,13 @@ const files = [
 /**
  * 自检那一大块模板字符串里，混进来的反引号。
  *
- * 定位方式：从 `executeJavaScript(` 那一行开始，到它对应的 `})()` 结束，
+ * 定位方式：从模板字符串**开引号那一行**开始，到 `})()` 结束，
  * 中间除了最外层那一对，**不允许再有任何反引号**（也不允许 `${`）。
+ *
+ * ⚠ 起点认的是 `` `(async () => { ``，**不是** `executeJavaScript(` ——
+ *   后者在 main.js 里不止一处（自检开始前还有一次给渲染进程递变量的调用），
+ *   认它的话区间会从一个不相关的行开始，把模板开头那个合法的反引号
+ *   当成违规报出来
  *
  * ⚠ 为什么不用「数一数总共几个」那种土办法：main.js 里**别处也有合法的**
  *   反引号（`console.error` 那一句、结尾拼摘要那一串），数量对不上只会误报。
@@ -59,7 +64,7 @@ const files = [
  */
 function countStrayBackticks(src) {
 	const lines = src.split('\n')
-	const start = lines.findIndex((l) => l.includes('executeJavaScript('))
+	const start = lines.findIndex((l) => l.includes('`(async () => {'))
 	if (start < 0) return []
 	const end = lines.findIndex((l, i) => i > start && l.trim() === '})()`)')
 	if (end < 0) return []
