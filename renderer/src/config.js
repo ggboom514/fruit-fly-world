@@ -1728,18 +1728,36 @@ export const CONFIG = {
 	//
 	// ⚠ `version` 必须比玩家手上这个大，才会提示。相等或更小都算「已是最新」
 	update: {
-		// ⚠ **留空 = 整个功能关掉**：设置卡里那一行会显示「未配置」，不报错、不发请求。
-		//   填上一个 https 直链就活了 —— 以后换托管、换地址，改这一行就行
+		// 版本清单的地址。**可以写一个字符串，也可以写一串** ——
+		// 写一串时**按顺序试，第一个能用的说了算**（见 ui.checkUpdate）。
 		//
-		// 这个是仓库根目录那份 version.json 的 raw 链接，由
-		// `bun run manifest` 生成、跟着 git 一起推上去。
+		// ⚠ **留空（或空数组）= 整个功能关掉**：设置卡里那一行会显示
+		//   「未配置」，不报错、不发请求。
 		//
-		// ⚠ 仓库必须是**公开**的，raw 才认；私有仓库返回 404，
+		// 这两个地址指向的是**同一个文件**（仓库根目录那份 version.json，
+		// 由 `bun run manifest` 生成、跟着 git 一起推上去）。
+		// 两个都填是有原因的，实测过：
+		//
+		//   · raw.githubusercontent.com —— 内容**永远是新的**，但国内
+		//     经常连不上（实测：DNS 解析正常，TCP 连接 3/3 超时，
+		//     而 github.com 本身是通的）。放在第二位当兜底
+		//   · cdn.jsdelivr.net —— 国内基本能开，但它对 `@main` 这种
+		//     分支引用有 **12 小时**缓存（响应头写着 s-maxage=43200）。
+		//     发新版之后最坏要等半天玩家才收到提示。放在第一位，
+		//     因为它**能连上**才是最重要的
+		//
+		// ⚠ 推完新的 version.json 之后，可以去 jsDelivr 的刷新接口催一下，
+		//   省掉那 12 小时：
+		//   https://purge.jsdelivr.net/gh/ggboom514/fruit-fly-world@main/version.json
+		//
+		// ⚠ 仓库必须是**公开**的，这两个链接才认；私有仓库返回 404，
 		//   而症状只是「检查更新失败」，很容易以为是代码坏了
-		// ⚠ 国内访问 raw.githubusercontent.com 时好时坏。打不开就换成
-		//   jsDelivr 的镜像（同一个文件，不用改代码）：
-		//   https://cdn.jsdelivr.net/gh/ggboom514/fruit-fly-world@main/version.json
-		manifestUrl: 'https://raw.githubusercontent.com/ggboom514/fruit-fly-world/main/version.json',
+		//
+		// ⚠ 改这里**必须重新打包**才会生效（配置是打进 asar 的）
+		manifestUrl: [
+			'https://cdn.jsdelivr.net/gh/ggboom514/fruit-fly-world@main/version.json',
+			'https://raw.githubusercontent.com/ggboom514/fruit-fly-world/main/version.json',
+		],
 
 		// 兜底下载页：清单里没给 `url` 时用这个（比如你懒得每次同步写）
 		downloadPage: 'https://pan.quark.cn/s/0e1344d09eba?pwd=p43k',

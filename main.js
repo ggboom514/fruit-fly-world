@@ -1027,7 +1027,7 @@ function runSelfTest() {
 				try {
 					const ui = pet.ui
 					const U = pet.config.update
-					if (!U || typeof U.manifestUrl !== 'string') {
+					if (!U || U.manifestUrl === undefined) {
 						return { ok: false, reason: 'config 里没有 update 块 —— 设置卡上那一行整个是死的' }
 					}
 					const elBtn = document.getElementById('update-check')
@@ -1085,6 +1085,33 @@ function runSelfTest() {
 							return {
 								ok: false,
 								reason: '「去下载」记的地址是「' + ui._pendingDownload + '」，应当优先用清单里的 url',
+							}
+						}
+
+						// ②-b 配了**一串**地址时按顺序试：第一个是死链，
+						//      必须自动退到第二个，而不是就此认输。
+						//      ⚠ 这条守的是国内那个真实处境：raw 连不上、
+						//        jsDelivr 连得上，两个都配着才能用
+						U.manifestUrl = [base + '/nope.json', base + '/newer.json']
+						await ui.checkUpdate(false)
+						if (elMsg.textContent.indexOf('99.0.0') < 0) {
+							return {
+								ok: false,
+								reason: '第一个清单地址是死链时没有自动试第二个，那一行写的是「' + elMsg.textContent + '」',
+							}
+						}
+						if (ui._pendingDownload !== base + '/dl') {
+							return { ok: false, reason: '退到第二个地址之后，下载地址没有跟着用第二个清单里的' }
+						}
+
+						// ②-c 全是死链 → 要说清楚**试过几个**，
+						//      不然作者会以为只试了一个
+						U.manifestUrl = [base + '/nope.json', base + '/html']
+						await ui.checkUpdate(false)
+						if (elMsg.textContent.indexOf('2 个地址都试过了') < 0) {
+							return {
+								ok: false,
+								reason: '两个地址全挂了，那一行写的是「' + elMsg.textContent + '」—— 应当说明试过几个',
 							}
 						}
 
@@ -6242,7 +6269,8 @@ function runSelfTest() {
 						`设置卡上版本号读到的是 ${report.updateVersion || '**没读到**'}，` +
 						'更新清单说有新版就提示并冒出「去下载」（优先用清单里的 url、没有才退回 downloadPage，' +
 						'两边都没有就明说而不是留一颗点了没反应的按钮），清单版本旧就改口「已经是最新的」' +
-						'并把上次那颗按钮收回去，没配地址时按钮置灰但**明说**没配\n' +
+						'并把上次那颗按钮收回去，没配地址时按钮置灰但**明说**没配；' +
+						'清单地址配了**一串**时按顺序试（第一条是死链会自动退到第二条，全挂了会说清试过几个）\n' +
 					'  重置：**三道**确认（说明 → 标红再问 → 手打「重置」才能点确定），前三道里世界一动不动；' +
 						'走完三道才清世界 + 图鉴 + 彩蛋，开局那几只不带突变；' +
 						'输入框里打字不会触发工具快捷键\n' +

@@ -59,6 +59,14 @@ const FOOD_NAME = { apple: '苹果', gold: '金苹果', star: '星空苹果' }
 const CODEX_HIDDEN = '？？？'
 
 /**
+ * 自检模式（主进程带 `?selftest=1` 加载页面）。
+ *
+ * ⚠ 和 save.js 里那个同名常量是**同一个开关**，各写各的只是因为它是个
+ *   一行的事，为它开一个模块不划算。改判断方式时两处要一起改
+ */
+const SELFTEST = new URLSearchParams(location.search).has('selftest')
+
+/**
  * 「检查更新」失败时给玩家看的话。
  *
  * ⚠ 主进程返回的 `reason` 是**给代码看的短标签**（'timeout' / 'network'），
@@ -2574,11 +2582,38 @@ export class UI {
 	 */
 	initUpdate() {
 		const U = CONFIG.update
-		if (!U || !U.manifestUrl) {
+		if (!this._updateUrls().length) {
 			this.checkUpdate(false)
 			return
 		}
+		// ⚠ 自检模式下**不发**这一次请求（和 save.js 里那个 SELFTEST 同一个开关）。
+		//   两个理由，都是硬的：
+		//     ① 自检不该依赖网络 —— 配了真地址之后，这里会去连 jsDelivr /
+		//        raw.githubusercontent，断网或墙掉时最坏要吊满 6×N 秒，
+		//        而自检自己有个 15 秒的总超时
+		//     ② 它在后台跑，却和下面自检那段**共用一个 elMsg / _pendingDownload**。
+		//        它什么时候回来是不确定的，正好插在两条断言中间的话，
+		//        红的会是一条和本次改动毫无关系的断言，查起来极其难受
+		//   自检要验的是 checkUpdate() 本身，下面那段会拿着本地测试服务器
+		//   把它完整走一遍，覆盖不比这里少
+		if (SELFTEST) return
 		if (U.checkOnStart) this.checkUpdate(true)
+	}
+
+	/**
+	 * 把 config 里的 `manifestUrl` 归一成**地址数组**。
+	 *
+	 * 允许写一个字符串，也允许写一串 —— 见 config.js 那段注释：
+	 * 国内 raw.githubusercontent.com 连不上，而 jsDelivr 那个镜像
+	 * 对 `@main` 有 12 小时缓存。两个都不完美，所以两个都填、按顺序试。
+	 *
+	 * ⚠ 空串要滤掉：`['', 'https://…']` 里的第一项不该被当成「一个地址」，
+	 *   否则会先白等一次 `no-url`
+	 */
+	_updateUrls() {
+		const raw = CONFIG.update && CONFIG.update.manifestUrl
+		const list = Array.isArray(raw) ? raw : [raw]
+		return list.filter((u) => typeof u === 'string' && u.trim() !== '')
 	}
 
 	/**
@@ -2593,7 +2628,8 @@ export class UI {
 	 */
 	async checkUpdate(quiet = false) {
 		const U = CONFIG.update
-		if (!U || !U.manifestUrl) {
+		const urls = this._updateUrls()
+		if (!urls.length) {
 			// 没配地址：把状态说出来，但什么都不做。
 			// ⚠ 不藏起来 —— 藏起来的话作者本人在开发时看不出这条没接上
 			this._setUpdateMsg('未配置更新地址（config.js 的 update.manifestUrl）')
@@ -2608,11 +2644,19 @@ export class UI {
 		this.el.updateGet.classList.add('hidden')
 		if (!quiet) this._setUpdateMsg('正在检查…')
 
-		let r
-		try {
-			r = await window.pet.checkUpdate(U.manifestUrl, U.downloadPage)
-		} catch (e) {
-			r = { ok: false, reason: 'ipc' }
+		// 地址**按顺序试**，第一个成功的说了算。
+		//
+		// ⚠ 每个地址最多吊满主进程那个 6 秒超时，所以地址多的时候
+		//   最坏情况是 6×N 秒。这只有在**全都连不上**时才会发生，
+		//   而那种情况下多等几秒换来「另一个镜像也许通」是划算的
+		let r = { ok: false, reason: 'no-url' }
+		for (const url of urls) {
+			try {
+				r = await window.pet.checkUpdate(url, U.downloadPage)
+			} catch (e) {
+				r = { ok: false, reason: 'ipc' }
+			}
+			if (r && r.ok) break
 		}
 		this.el.updateCheck.disabled = false
 
@@ -2622,7 +2666,12 @@ export class UI {
 			// ⚠ 括号不能省：`+` 比 `??` 结合得紧，写成 '检查失败：' + X ?? Y
 			//   会先算成 ('检查失败：' + X)，那串**永远是字符串**、`??` 永不触发，
 			//   reason 为 undefined 时会显示「检查失败：undefined」
-			if (!quiet) this._setUpdateMsg('检查失败：' + updateFailText(r?.reason))
+			if (!quiet) {
+				// 配了多个地址却全挂了时，把「试过几个」也说出来 ——
+				// 只说最后一个的失败原因，作者会以为只试了一个
+				const tried = urls.length > 1 ? `（${urls.length} 个地址都试过了）` : ''
+				this._setUpdateMsg('检查失败：' + updateFailText(r?.reason) + tried)
+			}
 			return
 		}
 

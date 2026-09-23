@@ -354,9 +354,17 @@ bun run manifest -- "https://pan.quark.cn/s/……" "1.29.0 改了什么"
 git add version.json && git commit -m "版本清单" && git push
 ```
 
-推上去之后，raw 链接就有了（等一两分钟，那边有缓存）：
+推上去之后，**催一下 jsDelivr 的缓存** —— 它对分支引用有 12 小时缓存
+（响应头里写着 `s-maxage=43200`），不催的话玩家最坏要等半天才收到提示：
 
 ```
+https://purge.jsdelivr.net/gh/<用户名>/<仓库>@main/version.json
+```
+
+然后浏览器打开下面这个，看到白底黑字的 JSON 才算数：
+
+```
+https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/version.json
 https://raw.githubusercontent.com/<用户名>/<仓库>/main/version.json
 ```
 
@@ -367,19 +375,27 @@ https://raw.githubusercontent.com/<用户名>/<仓库>/main/version.json
 > ⚠ 版本号是按**数字段**比的，不是按字符串 —— 所以 1.10.0 比 1.9.0 新。
 > （按字符串比的话 `'9' > '1'`，从 1.9 升到 1.10 的人就永远收不到提示。）
 
-> ⚠ **仓库必须是公开的**，raw 链接才认。私有仓库返回 404，
+> ⚠ **仓库必须是公开的**，这两个链接才认。私有仓库返回 404，
 > 而症状只是「检查更新失败」，很容易以为是代码坏了。
->
-> ⚠ 国内访问 `raw.githubusercontent.com` 时好时坏。打不开的话，
-> 把地址换成 jsDelivr 的镜像（同一个文件，不用改代码）：
-> `https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/version.json`
-> —— 但它缓存久得多，发新版后可能要十几分钟才更新，别拿它调试。
+
+**为什么是两个地址**（在 `config.js` 里能填一串，按顺序试，第一个能用的说了算）：
+
+| 地址 | 实测 |
+| --- | --- |
+| `cdn.jsdelivr.net` | 国内基本能开，但内容最多旧 12 小时 |
+| `raw.githubusercontent.com` | 内容永远是最新的，但**国内经常整个连不上**（实测 DNS 解析正常、TCP 连接 3/3 超时，而 github.com 本身是通的） |
+
+所以 jsDelivr 放第一位（**连得上**最重要），raw 放第二位当兜底。
+两个都挂时，设置卡上会说「检查失败：……（2 个地址都试过了）」。
 
 然后把它填进 `renderer/src/config.js`：
 
 ```js
 update: {
-	manifestUrl: 'https://……/version.json',   // 清单的直链
+	manifestUrl: [                              // 一个字符串也行，一串就按顺序试
+		'https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/version.json',
+		'https://raw.githubusercontent.com/<用户名>/<仓库>/main/version.json',
+	],
 	downloadPage: 'https://……',                // 兜底下载页，清单里没写 url 时用它
 	checkOnStart: true,                        // 启动后静默查一次
 },
@@ -387,9 +403,10 @@ update: {
 
 改完 **`manifestUrl` 是打包进 asar 的**，所以要重新打包才会生效。
 
-> ⚠ 留空 = 整个功能关掉：设置卡上显示「未配置更新地址」，不发任何请求。
-> 自检里那条「检查更新」的断言走的是一条**本地小服务器**，和这里配什么无关，
-> 所以留空也不会让 `bun run selftest` 变红。
+> ⚠ 留空（或空数组）= 整个功能关掉：设置卡上显示「未配置更新地址」，
+> 不发任何请求。自检里那条「检查更新」的断言走的是一条**本地小服务器**，
+> 和这里配什么无关，所以留空也不会让 `bun run selftest` 变红。
+> 自检模式下启动那一次请求**不会发**（见 `ui.initUpdate` 那段注释）。
 
 ### 检查
 
