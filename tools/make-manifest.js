@@ -8,8 +8,12 @@
  *     `update.downloadPage`（那条兜底路）
  *   · 不写说明 → 就没有 `note`，设置卡上只显示「有新版本 1.28.0」
  *
- * 产物写在 `dist/version.json`（`dist/` 是打包输出目录，和安装包放一起，
- * 一起传上去就行）。
+ * 产物写在**仓库根目录**的 `version.json`，这个文件是要**提交进 git** 的：
+ * 游戏查的那份清单，走的就是 GitHub 的 raw 链接
+ * （`raw.githubusercontent.com/<用户名>/<仓库>/main/version.json`），
+ * 而 raw 只认得**提交进仓库**的文件。
+ *
+ * ⚠ 所以它**不能**放 `dist/` —— 那一整个目录都在 `.gitignore` 里。
  *
  * ## 为什么要有这个小工具
  *
@@ -37,11 +41,10 @@
  * 详见 README 的「发布新版本」一节。
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const ROOT = join(import.meta.dir, '..')
-const OUT_DIR = join(ROOT, 'dist')
 
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
 
@@ -53,17 +56,18 @@ const manifest = { version: pkg.version }
 if (url) manifest.url = url
 if (note) manifest.note = note
 
-if (!existsSync(OUT_DIR)) mkdirSync(OUT_DIR, { recursive: true })
-const out = join(OUT_DIR, 'version.json')
+const out = join(ROOT, 'version.json')
 writeFileSync(out, JSON.stringify(manifest, null, 2) + '\n', 'utf8')
 
 console.log('版本清单已写出：' + out)
 console.log(JSON.stringify(manifest, null, 2))
 console.log('')
 console.log('接下来：')
-console.log('  1. 把 dist/ 里的安装包 + 这个 version.json 传上去')
-console.log('  2. 确认 version.json 能**直接**用浏览器打开看到 JSON（不是下载、不是跳到网盘页面）')
-console.log('  3. 把那个直链填进 renderer/src/config.js 的 update.manifestUrl')
+console.log('  1. git add version.json && git commit && git push')
+console.log('  2. 等一两分钟（raw 那边有缓存），再用浏览器打开这个地址：')
+console.log('     https://raw.githubusercontent.com/<用户名>/<仓库>/main/version.json')
+console.log('     看到白底黑字的 JSON 才算数')
+console.log('  3. 把那个地址填进 renderer/src/config.js 的 update.manifestUrl，然后重新打包')
 if (!url) {
 	console.log('')
 	console.log('⚠ 这次没给下载地址 —— 游戏会退回 config 里的 update.downloadPage。')

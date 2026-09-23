@@ -1730,10 +1730,19 @@ export const CONFIG = {
 	update: {
 		// ⚠ **留空 = 整个功能关掉**：设置卡里那一行会显示「未配置」，不报错、不发请求。
 		//   填上一个 https 直链就活了 —— 以后换托管、换地址，改这一行就行
-		manifestUrl: '',
+		//
+		// 这个是仓库根目录那份 version.json 的 raw 链接，由
+		// `bun run manifest` 生成、跟着 git 一起推上去。
+		//
+		// ⚠ 仓库必须是**公开**的，raw 才认；私有仓库返回 404，
+		//   而症状只是「检查更新失败」，很容易以为是代码坏了
+		// ⚠ 国内访问 raw.githubusercontent.com 时好时坏。打不开就换成
+		//   jsDelivr 的镜像（同一个文件，不用改代码）：
+		//   https://cdn.jsdelivr.net/gh/ggboom514/fruit-fly-world@main/version.json
+		manifestUrl: 'https://raw.githubusercontent.com/ggboom514/fruit-fly-world/main/version.json',
 
 		// 兜底下载页：清单里没给 `url` 时用这个（比如你懒得每次同步写）
-		downloadPage: '',
+		downloadPage: 'https://pan.quark.cn/s/0e1344d09eba?pwd=p43k',
 
 		// 启动后**静默**查一次。查不到就算了，不弹任何东西 ——
 		// 桌宠启动时弹一个「检查更新失败」是最讨人厌的做法

@@ -328,24 +328,37 @@ bun run dist
 | `FruitFlyWorld-Setup-x.y.z.exe` | ✅ | 安装版，大多数人下这个 |
 | `FruitFlyWorld-Setup-x.y.z.exe.blockmap` | ✅ | 增量更新的差分文件。现在没用上，但少传了以后想加会**只能重传全部历史版本** |
 | `FruitFlyWorld-x.y.z.exe` | ✅ | 免安装版，给不想装的人 |
-| `version.json` | ✅ | **更新检查靠它**，见下 |
 | `说明.txt` | ✅ | 仓库根目录那份，给下载的人看的 |
 | `win-unpacked/`、`builder-*.yml` | ❌ | 中间产物，传上去只是让人多下几百 MB |
 
+> ⚠ **`version.json` 不传网盘。** 它是给**程序**抓的，而网盘不给程序抓 ——
+> 它要待在 git 仓库里，走 raw 链接。见下一节。
+
 #### ② 更新检查怎么工作
 
-游戏查的是一个**你自己托管的 JSON**，格式就三行：
+游戏查的是一个**你自己仓库里的 JSON**，格式就三行：
 
 ```json
 {
   "version": "1.28.0",
-  "url": "https://你的下载页",
+  "url": "https://pan.quark.cn/s/……",
   "note": "这一版改了什么（可选，一句话）"
 }
 ```
 
 `bun run manifest -- "https://你的下载页" "改了啥"` 会照着 `package.json`
-里的版本号生成它，写在 `dist/version.json`。
+里的版本号生成它，写在**仓库根目录**的 `version.json`。
+
+```bash
+bun run manifest -- "https://pan.quark.cn/s/……" "1.29.0 改了什么"
+git add version.json && git commit -m "版本清单" && git push
+```
+
+推上去之后，raw 链接就有了（等一两分钟，那边有缓存）：
+
+```
+https://raw.githubusercontent.com/<用户名>/<仓库>/main/version.json
+```
 
 > ⚠ **别手写 `version`** —— 「package.json 升到 1.29.0、清单忘了改」这种错
 > 特别隐蔽：游戏老老实实说「已经是最新的」，你会以为更新检查坏了。
@@ -354,10 +367,13 @@ bun run dist
 > ⚠ 版本号是按**数字段**比的，不是按字符串 —— 所以 1.10.0 比 1.9.0 新。
 > （按字符串比的话 `'9' > '1'`，从 1.9 升到 1.10 的人就永远收不到提示。）
 
-> ⚠ `version.json` 得放在一个**能直接用 GET 拿到 JSON** 的地方。
-> 夸克网盘的分享页不行 —— 那是给人看的网页，要过验证码。分享页适合放在
-> 清单的 `url` 那一栏（那颗按钮是用**浏览器**打开的，程序不抓它）。
-> 清单本身可以放 GitHub Pages、Gitee Pages、或者任何静态托管。
+> ⚠ **仓库必须是公开的**，raw 链接才认。私有仓库返回 404，
+> 而症状只是「检查更新失败」，很容易以为是代码坏了。
+>
+> ⚠ 国内访问 `raw.githubusercontent.com` 时好时坏。打不开的话，
+> 把地址换成 jsDelivr 的镜像（同一个文件，不用改代码）：
+> `https://cdn.jsdelivr.net/gh/<用户名>/<仓库>@main/version.json`
+> —— 但它缓存久得多，发新版后可能要十几分钟才更新，别拿它调试。
 
 然后把它填进 `renderer/src/config.js`：
 
@@ -453,7 +469,10 @@ tools/
   make-manifest.js   生成更新检查要的 version.json（`bun run manifest`）
 ```
 
-仓库根目录还有一份 `说明.txt`，是给网盘下载的人看的，传安装包时一起传。
+仓库根目录还有两份要**提交进 git** 的小文件：
+
+- `version.json` —— 更新检查要的清单，走 raw 链接被程序抓（`bun run manifest` 生成）
+- `说明.txt` —— 给网盘下载的人看的，传安装包时一起传
 
 **想改数值，先看 `renderer/src/config.js`** —— 按生态分节，注释里写清楚了每个数字是干什么的。
 
