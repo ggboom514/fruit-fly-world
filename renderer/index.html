@@ -134,7 +134,7 @@
 						不然收起来之后完全看不出状态（快捷键仍然直接生效）。
 					-->
 					<div class="fold collapsed" id="tools-box">
-						<button class="fold-toggle" id="btn-tools" title="展开 / 收起工具。快捷键不用展开也能直接用：G 手套 · F 拍 · N 网 · B 扫帚 · C 擦 · W 冲 · R 点火 · V 查看 · Esc 观察">
+						<button class="fold-toggle" id="btn-tools" title="展开 / 收起工具。快捷键不用展开也能直接用：G 手套 · F 拍 · N 网 · B 扫帚 · C 擦 · W 冲 · R 点火 · V 查看 · H 金锤 · Esc 观察">
 							<span>工具</span>
 							<b id="tools-current">观察</b>
 							<span class="caret">▾</span>
@@ -185,6 +185,13 @@
 							-->
 							<button class="tool locked" id="btn-lighter" data-tool="lighter" title="">打火机</button>
 							<button class="tool locked" id="btn-flamer" data-tool="flamer" title="">喷火枪</button>
+							<!--
+								gold Banhammer。$999，全场最贵的一件。
+								⚠ 名字由 ui.refreshToolButtons() 从 CONFIG 现算，这里只是初始值
+								⚠ 排最后是刻意的：位置跟着「买没买」跳来跳去的按钮很难用，
+								   而它本来就是最后才买得起的那一件
+							-->
+							<button class="tool locked" id="btn-banhammer" data-tool="banhammer" title="">gold Banhammer</button>
 						</div>
 					</div>
 

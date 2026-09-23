@@ -311,7 +311,54 @@ export class Fly {
 	 * 五处都读这个 getter，将来再加「不能飞」的变异也只用改这里
 	 */
 	get canFly() {
-		return !this.hasMutation('stone')
+		return !this.hasMutation('stone') && this.canMove
+	}
+
+	/**
+	 * 还能不能移动。
+	 *
+	 * 封禁（金锤敲出来的）是**完全不能动**：不爬、不飞、扫帚推不动、
+	 * 手套也拖不走 —— 字面意义上的雕塑。
+	 *
+	 * ⚠ `canFly` 里**并进了** `canMove`：动不了的东西当然也飞不起来。
+	 *   这样「失去飞行」那五个入口一处都不用改就全对。
+	 *
+	 * ⚠⚠ **所有推进坐标的地方都必须走 `_shift()`，不许直接写 `this.x +=`。**
+	 *   石化只锁了「飞」，`_walk` 照样位移 —— 所以「不能动」不是加一个
+	 *   getter 就完事的，它得把**每一个**位移积分点都堵上。目前有六处：
+	 *     · `_walk`（爬行）
+	 *     · `_fly`（飞行）
+	 *     · `_lay`（产卵母体的阻尼滑停）← **最容易漏的一个**，
+	 *       它绕过 mode 直接改坐标，而且 update() 在 laying 时提前 return，
+	 *       连 `_updateMode` 都跑不到。只堵前两处的话症状是
+	 *       「大部分时候不动、偶尔往前滑一段」，极难归因
+	 *     · `updateJarred`（罐里游动）
+	 *     · `_updateMode` 里把已经在飞的按回地面
+	 *     · 幼虫那边是 `Larva._advance`（爬行 + 扫帚推力，一次算完）
+	 *
+	 * ⚠ **不要用 `speedMul: 0` 代替这套**。`_fly` 是指数趋近目标速度的，
+	 *   `vx/vy` 只会渐近 0、**永远不精确等于 0**，所以它会一直飘；
+	 *   而幼虫的扫帚推力根本不吃 `speedMul`（那边明写「推力另算」）。
+	 *   看着能用，其实两头都漏
+	 */
+	get canMove() {
+		return !this.hasMutation('ban')
+	}
+
+	/**
+	 * 把这一帧的位移落到坐标上。**不能移动的个体一律吞掉**。
+	 *
+	 * 做成漏斗而不是在每个积分点各写一句 `if (this.canMove)`：
+	 * 前者将来加位移点时会漏（而且漏了不报错），后者只要照抄就行。
+	 *
+	 * @returns {boolean} 真的挪了没有 —— 步态相位靠它推进，
+	 *   「走不到距离就不该倒腿」（见 _walk 里那段注释）
+	 */
+	_shift(dx, dy) {
+		if (!this.canMove) return false
+		this.x += dx
+		this.y += dy
+		return true
 	}
 
 	// ---------------------------------------------------------- 生命值
@@ -589,8 +636,11 @@ export class Fly {
 		const drag = Math.exp(-L.settleDrag * dt)
 		this.vx *= drag
 		this.vy *= drag
-		this.x += this.vx * dt
-		this.y += this.vy * dt
+		// ⚠ 这一处位移**最容易漏**：它绕过 _walk / _fly 直接改坐标，
+		//   而且 update() 在 laying 时提前 return，连 _updateMode 都跑不到。
+		//   不堵这里的话，被敲中时正好在产卵的蝇会继续滑停一段 ——
+		//   症状是「大部分时候不动、偶尔往前滑一下」，极难归因
+		this._shift(this.vx * dt, this.vy * dt)
 
 		this.wingPhase += dt * 12 // 产卵时翅膀只是慢慢扇
 		this.angle += Math.sin(this.age / 700) * dt * 0.9 // 像在找合适的位置
@@ -743,6 +793,23 @@ export class Fly {
 	_updateMode(dtMs) {
 		const B = CONFIG.behavior
 
+		// —— 被金锤敲中时如果正在飞：按回地面 ——
+		//
+		// ⚠ 「失去飞行」那五个入口全都**假定 `canFly` 一辈子不变**——
+		//   石化是出生就带着的，改不了。封禁是**第一个能在活体上敲上去**的突变，
+		//   那个假定当场就破了。
+		//
+		//   不补这一条的话：半空中被敲中的蝇会一直悬在那儿扇翅膀（因为
+		//   `_fly` 被 `_shift` 吞掉了位移、却没被降级成 walk），
+		//   而且 `mode` 是**自有字段、会进存档** —— 读档回来它还是 'fly'。
+		//
+		//   `_land()` 正好把 mode / modeTimer / pausing / boutTimer /
+		//   vx / vy / wingPhase 一起收干净
+		if (this.mode === 'fly' && !this.canFly) {
+			this._land()
+			return
+		}
+
 		// —— 刚飞到果子跟前：立刻掷一次落地判定 ——
 		//
 		// 这一条不能并到下面那个计时器里。飞行速度 1700px/s，穿过
@@ -864,11 +931,11 @@ export class Fly {
 			// 再乘上体重倍率（爬行这一路也要，否则变异蝇一落地就和普通一样快）
 			const speed =
 			W.speed * (this.feeding ? F.feedSpeedScale : 1) * this.speedScale * this.panicMul
-			this.x += Math.cos(this.aim) * speed * dt
-			this.y += Math.sin(this.aim) * speed * dt
-			// 步态相位跟着**实际走过的距离**推进 ——
-			// 走得快腿就倒得快，停下来腿也停，比按固定频率好看得多
-			this.gaitPhase += speed * dt * 0.26
+			// ⚠ 用 _shift 而不是直接 `this.x +=`：封禁蝇要一动不动。
+			//   返回值是「真的挪了没有」—— 步态相位跟着**实际走过的距离**推进，
+			//   走不到距离就不该倒腿（原来那句注释就是这个意思）
+			const moved = this._shift(Math.cos(this.aim) * speed * dt, Math.sin(this.aim) * speed * dt)
+			if (moved) this.gaitPhase += speed * dt * 0.26
 		}
 
 		// 爬行时不保留飞行速度，否则下一次起飞会带着旧惯性窜出去
@@ -1025,8 +1092,9 @@ export class Fly {
 		this.vx += (Math.cos(this.aim) * wantSpeed - this.vx) * k
 		this.vy += (Math.sin(this.aim) * wantSpeed - this.vy) * k
 
-		this.x += this.vx * dt
-		this.y += this.vy * dt
+		// ⚠ 上面那个指数趋近**永远到不了 0**（只是渐近），所以「不能动」
+		//   绝不能靠 speedMul: 0 之类的速度侧写法来糊弄，必须在这儿吞掉
+		this._shift(this.vx * dt, this.vy * dt)
 
 		// 身体朝向跟随实际速度；速度太低（悬停）就跟着意图方向
 		const spd = Math.hypot(this.vx, this.vy)
@@ -1111,8 +1179,9 @@ export class Fly {
 		this.vx += (Math.cos(this.aim) * want - this.vx) * k
 		this.vy += (Math.sin(this.aim) * want - this.vy) * k
 
-		this.x += this.vx * dt
-		this.y += this.vy * dt
+		// ⚠ 罐里也要挡 —— 石化在罐里是**照样飞**的（`canFly` 只管外面那几处），
+		//   而封禁是「拖都拖不走」，罐里当然也不该游
+		this._shift(this.vx * dt, this.vy * dt)
 
 		// 身体朝向跟随实际速度；速度太低（悬停）就跟着意图方向
 		const spd = Math.hypot(this.vx, this.vy)
@@ -1394,6 +1463,25 @@ export class Larva {
 	/** 身上带没带某种突变。和 Fly 上那个同名同义，UI 和 world 可以一视同仁地调 */
 	hasMutation(id) {
 		return hasMutation(this.mutations, id)
+	}
+
+	/**
+	 * 还能不能移动。和 `Fly.canMove` 同义 —— 封禁的幼虫同样是雕塑。
+	 *
+	 * ⚠ 幼虫没有 `canFly`（它本来就不会飞），所以只加这一个。
+	 * ⚠ 位移在 `_advance` 里**一次算完**（爬行 + 扫帚推力），
+	 *   所以那边只需要一个 `_shift` 就把两条路都堵住了
+	 */
+	get canMove() {
+		return !this.hasMutation('ban')
+	}
+
+	/** 和 `Fly._shift` 同义：不能移动的个体一律吞掉这一帧的位移 */
+	_shift(dx, dy) {
+		if (!this.canMove) return false
+		this.x += dx
+		this.y += dy
+		return true
 	}
 
 	/**
@@ -1681,8 +1769,12 @@ export class Larva {
 		const speed = CONFIG.larva.crawlSpeed * this.speedScale * speedMulOf(this.mutations) * scale
 		// 扫帚的推力**另算**，不乘 speedScale —— 那是「这只虫自己爬多快」的个体差异，
 		// 而扫帚是同一把，推谁都是同样的力
-		this.x += (Math.cos(this.angle) * speed + this.pushVx) * dt
-		this.y += (Math.sin(this.angle) * speed + this.pushVy) * dt
+		//
+		// ⚠ 爬行和推力在这一句里**一起**落地，所以一个 `_shift` 就把两条路都堵住了 ——
+		//   封禁的幼虫被扫帚推也是不动的（用户指定「推不动」）。
+		//   注意推力根本不走 `speedMul`，所以「给 ban 配个 speedMul: 0」这种写法
+		//   对幼虫是完全无效的
+		this._shift((Math.cos(this.angle) * speed + this.pushVx) * dt, (Math.sin(this.angle) * speed + this.pushVy) * dt)
 	}
 
 	/**

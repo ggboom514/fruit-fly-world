@@ -25,7 +25,7 @@ import {
 	snapshot,
 	revive,
 } from './entities.js'
-import { shopItem, foodPrice, flyPrice, bulkPrice, formatMoney } from './market.js'
+import { shopItem, foodPrice, flyPrice, bulkPrice, formatMoney, bannedLarvaPrice } from './market.js'
 
 /**
  * 读档时取一个数值：不是有限数就退回默认值。
@@ -949,6 +949,10 @@ export class World {
 		for (let i = this.flies.length - 1; i >= 0; i--) {
 			const f = this.flies[i]
 			if (f.dead) continue
+			// ⚠ 封禁的果蝇网不走 —— 「拖都拖不走」是对**玩家**说的，
+			//   网是玩家的另一种搬法。不挡的话有一条绕过雕塑的后门：
+			//   封禁 → 网进罐子 → 罐子一扔，它就换了个地方
+			if (!f.canMove) continue
 			if (dist2(x, y, f.x, f.y) > R2) continue
 			if (!jar.admit(f)) break // 装满了
 
@@ -2455,6 +2459,33 @@ export class World {
 		return gain
 	}
 
+	/**
+	 * 卖掉一只**幼虫**（金锤敲第二下的时候用）。
+	 *
+	 * ⚠ **为什么不复用 `sellFly`**：那只认 `this.flies` → `jarOf` → `this.remains`，
+	 *   传一只幼虫进去会走到 `const jar = this.jarOf(fly)` 拿到 null，
+	 *   然后**静默返回 0** —— 钱不到账、虫也不消失，界面上什么都没发生。
+	 *   那个 `return 0` 是给「罐 / 炉里已经没了的东西」兜底的**正常契约**，
+	 *   别去改它，这里另开一条。
+	 *
+	 * ⚠ **必须把幼虫从 `this.larvae` 里摘掉**，不能只置 `dead`。
+	 *   `_resolveLifecycles` 下一帧会遍历 `this.larvae`，见到 `dead` 的就
+	 *   走 `else stats.swatted++` —— 卖掉会被记账成「被拍死」还炸一把灰；
+	 *   而如果死因写成 `'starved'` / `'killed'`，还会凭空留一具蛆尸体。
+	 *   先 `splice` 出去之后它根本不在那个数组里，什么都不会发生
+	 *
+	 * @returns {number} 卖了多少钱（三位小数）
+	 */
+	sellLarva(l) {
+		if (!l || l.dead) return 0
+		const i = this.larvae.indexOf(l)
+		if (i < 0) return 0
+		this.larvae.splice(i, 1)
+		l.dead = true
+		l.causeOfDeath = 'sold'
+		return this._creditSale(bannedLarvaPrice())
+	}
+
 	// ⚠ 这里删掉过 `buyOven()`（每摆一个收 $5）。烤炉从 1.27.0 起是商店里的
 	//   **一次性道具**：买断之后投放面板里出现一行免费的「摆一个」，
 	//   和玻璃罐走的是同一条路 —— 直接调 `dropOven()`。
@@ -2681,6 +2712,82 @@ export class World {
 	}
 
 	/**
+	 * gold Banhammer：以 (x, y) 为圆心、`CONFIG.tools.ban.radius` 为半径锤一下。
+	 *
+	 * ## 语义是**无状态**的
+	 *
+	 * 「点一下封、再点一下卖掉」不靠一个看不见的档位实现 ——：
+	 *
+	 *   圈里**还有没封的** → 这一下是「封」
+	 *   圈里**全是封着的** → 这一下是「卖」
+	 *
+	 * ⚠ 为什么不做一个 `banMode` 开关位：那种状态**在界面上表达不出来**，
+	 *   玩家只会读成「有时候封有时候卖」。判据挂在「圈里有没有没封的」上面，
+	 *   玩家看一眼金色流动就知道下一锤会发生什么。
+	 *   同一块空地连敲两下，自然就是用户描述的「点一下封、再点一下卖」。
+	 *
+	 * ## 够不着罐子和烤炉
+	 *
+	 * 只扫 `this.flies` / `this.larvae`（和苍蝇拍一致）。罐中 / 炉中的果蝇
+	 * 是相对坐标，屏幕半径对它们没有意义 —— 拍子打不进罐子也是同一条规矩。
+	 *
+	 * @returns {{marked:number, sold:number, gain:number}}
+	 *   marked = 这一下新封了几只，sold = 卖掉了几只，gain = 卖到的钱。
+	 *   ⚠ **两者不会同时非零**（见上），但都返回出来让自检能钉住这条不变式
+	 */
+	banStrike(x, y) {
+		const R2 = CONFIG.tools.ban.radius * CONFIG.tools.ban.radius
+
+		// ⚠ 两份名单**先算完再动手**：不然「刚封上的」会在同一次调用里
+		//   被下面那一步当成熟货卖掉 —— 连敲一下都看不到金色流动
+		const inRange = []
+		for (const list of [this.flies, this.larvae]) {
+			for (const e of list) {
+				if (e.dead) continue
+				if (dist2(x, y, e.x, e.y) > R2) continue
+				inRange.push(e)
+			}
+		}
+		const already = inRange.filter((e) => e.hasMutation('ban'))
+		const fresh = inRange.filter((e) => !e.hasMutation('ban'))
+
+		let sold = 0
+		let gain = 0
+		if (already.length) {
+			for (const e of already) {
+				const got = e.kind === 'larva' ? this.sellLarva(e) : this.sellFly(e)
+				if (got > 0) {
+					sold++
+					gain += got
+					this.addFloatText(e.x, e.y, '+' + formatMoney(got))
+				}
+			}
+			this.burstRing(x, y, CONFIG.tools.ban.radius, 14, 'rgba(255, 226, 140, 0.95)')
+			this.burstDust(x, y, 8)
+			return { marked: 0, sold, gain }
+		}
+
+		let marked = 0
+		for (const e of fresh) {
+			e.mutations = cleanGenes([...e.mutations, 'ban'])
+			marked++
+			this.burstRing(e.x, e.y, 16, 5, 'rgba(255, 214, 110, 0.9)')
+		}
+		// ⚠ 图鉴收件箱。**漏了这一步的症状是「图鉴那一格永远是灰的、
+		//   成就永远不弹」** —— 不报错，而且别的地方全绿。
+		//   卵 / 成虫 / 幼虫的四个出生入口都会调它，锤子是第五条路，得自己来
+		this._noteGenes(fresh.flatMap((e) => e.mutations))
+		this.burstRing(
+			x,
+			y,
+			CONFIG.tools.ban.radius,
+			14,
+			marked > 0 ? 'rgba(255, 226, 140, 0.95)' : 'rgba(205, 205, 205, 0.8)',
+		)
+		return { marked, sold: 0, gain: 0 }
+	}
+
+	/**
 	 * 扫帚：把 (x, y) 半径 r 内的**幼虫**朝外推。
 	 *
 	 * 形状和 swat / wipe / squirt 一样：立即执行、返回一个计数，所以无头模拟器
@@ -2708,6 +2815,10 @@ export class World {
 
 		for (const L of this.larvae) {
 			if (L.dead || L.pupa) continue
+			// ⚠ 封禁的幼虫推不动 —— 它是雕塑。
+			//   这里**跳过**而不是「推了但坐标不动」：后者会让 `pushed` 计数
+			//   把它算进去，看起来像推到了，而屏幕上什么都没发生
+			if (!L.canMove) continue
 			const d2 = dist2(x, y, L.x, L.y)
 			if (d2 > r2) continue
 

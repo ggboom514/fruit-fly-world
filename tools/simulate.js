@@ -5965,6 +5965,231 @@ if (world.livingCount === 0 && marks.adult != null) problems.push('最终种群�
 if (!(travel1 > 0) || !(travel2 > 0)) problems.push('擦拭路程异常')
 if (travel2 <= travel1) problems.push('腐烂后并不比新鲜时更难擦 —— 检查 remains.wipeScrubFresh/Rotten')
 
+// ====================================================================
+//  gold Banhammer + 「封禁」突变
+// ====================================================================
+//
+// 这个工具同时踩了三件容易静默失效的事，所以断言比别的工具密：
+//   ① 位移有**六个**积分点，只堵一半会变成「大部分时候不动、偶尔滑一段」
+//   ② 卖幼虫走的是 `sellLarva`（`sellFly` 传幼虫进去会**静默返回 0**），
+//      而且必须 splice —— 只置 dead 会被 `_resolveLifecycles` 记成拍死
+//   ③ 授予突变必须调 `_noteGenes`，漏了图鉴那一格永远灰、成就永远不弹
+
+const banProblems = []
+{
+	const B = CONFIG.tools.ban
+	const R = B.radius
+	const w = new World(1920, 1080)
+	const clear = () => {
+		w.flies.length = 0
+		w.larvae.length = 0
+		w.eggs.length = 0
+		w.foods.length = 0
+		w.remains.length = 0
+		w.floatTexts.length = 0
+		w.particles.length = 0
+		w.seenGenes.length = 0
+	}
+
+	// —— 半径边界 ——
+	// ⚠ 圈外那两只才是这条断言的重点。只查「圈内的中了」的话，
+	//   半径写成 1000 照样绿
+	clear()
+	const inside = w.addFly(500, 500, {})
+	const edgeIn = w.addFly(500 + R - 2, 500, {})
+	const edgeOut = w.addFly(500 + R + 2, 500, {})
+	const larvaIn = w.addLarva(500, 500 + 50, {})
+	const r1 = w.banStrike(500, 500)
+	if (r1.marked !== 3) banProblems.push(`半径内应当封 3 只，实得 ${r1.marked}`)
+	if (!inside.hasMutation('ban') || !edgeIn.hasMutation('ban')) banProblems.push('圈内的成虫没被封上')
+	if (edgeOut.hasMutation('ban')) banProblems.push(`半径 ${R} 之外（${R + 2}px）的成虫也被封了 —— 判定没按半径来`)
+	if (!larvaIn.hasMutation('ban')) banProblems.push('幼虫没被封上 —— 它和成虫应当一视同仁')
+	if (!w.seenGenes.includes('ban')) {
+		banProblems.push('封禁没有进 seenGenes —— 图鉴那一格会永远是灰的，成就也永远不弹')
+	}
+
+	// —— 完全不能移动：六条路各一条 ——
+	//
+	// ⚠ 每条都要先给一个「本来会动」的前提，否则断言是空的：
+	//   不给食物、不给速度的话，它本来就不动
+	const bx = inside.x
+	const by = inside.y
+	for (let i = 0; i < 120; i++) w.update(1 / 60)
+	if (inside.x !== bx || inside.y !== by) {
+		banProblems.push(`封禁的成虫 120 帧挪了 (${bx},${by}) → (${inside.x},${inside.y}) —— 它该纹丝不动`)
+	}
+	if (inside.mode !== 'walk') {
+		banProblems.push(`封禁的成虫 mode 是 ${inside.mode} —— 被敲中时如果在飞，应当被按回地面`)
+	}
+
+	// 产卵中的阻尼滑停（六个位移里最容易漏的那个）
+	clear()
+	const mom = w.addFly(700, 700, {})
+	mom.mutations = ['ban']
+	mom.laying = true
+	mom.vx = 300
+	const mx = mom.x
+	for (let i = 0; i < 60; i++) w.update(1 / 60)
+	if (mom.x !== mx) banProblems.push(`产卵中的封禁蝇往前滑了 ${(mom.x - mx).toFixed(1)}px —— _lay 那处位移没堵`)
+
+	// 罐里也不游
+	clear()
+	const jf = w.addFly(900, 900, {})
+	jf.mutations = ['ban']
+	const jar0 = w.dropJar(900, 900)
+	if (jar0) {
+		jar0.admit(jf)
+		w.flies.splice(w.flies.indexOf(jf), 1)
+		const jx = jf.x
+		for (let i = 0; i < 60; i++) w.update(1 / 60)
+		if (jf.x !== jx) banProblems.push('罐里的封禁蝇还在游 —— updateJarred 那处位移没堵')
+	}
+
+	// 扫帚推不动
+	clear()
+	const bl = w.addLarva(400, 400, {})
+	bl.mutations = ['ban']
+	const blx = bl.x
+	const pushed = w.broom(400, 400, 120)
+	for (let i = 0; i < 60; i++) w.update(1 / 60)
+	if (pushed !== 0) banProblems.push(`扫帚推到了 ${pushed} 只封禁幼虫 —— 它该推不动`)
+	if (bl.x !== blx || bl.pushVx !== 0) banProblems.push('被扫的封禁幼虫动了')
+
+	// —— 售价 ×1.5 ——
+	//
+	// ⚠ 同时钉住 weightMul 是 1：走成石化那条路（借体重顺带涨价）的话，
+	//   图鉴写着 ×1.5，实际涨得更多，而单价断言只比 value 是看不出来的
+	clear()
+	const f1 = w.addFly(600, 600, {})
+	f1.age = f1.lifespan * 0.8
+	const v0 = f1.value
+	f1.mutations = ['ban']
+	const v1 = f1.value
+	if (Math.abs(v1 / v0 - 1.5) > 1e-9) banProblems.push(`封禁的售价倍率是 ${(v1 / v0).toFixed(6)}，应当是 1.5`)
+	if (weightMulOf(['ban']) !== 1) banProblems.push('封禁动了 weightMul —— 它该只乘 valueMul，不然售价会涨两次')
+
+	// —— 不参与抽奖 ——
+	//
+	// ⚠ 只断言 `chance === 0` 是空的：把它改成 0.0001 照样绿。
+	//   真骰两万次才算数
+	const banType = MUTATION_TYPES.find((t) => t.id === 'ban')
+	if (!banType) banProblems.push('CONFIG.mutation.types 里没有 ban')
+	else {
+		if (banType.chance !== 0) banProblems.push(`封禁的 chance 是 ${banType.chance}，应当恒为 0（它只能由金锤给）`)
+		if (banType.adultOnly) banProblems.push('封禁写了 adultOnly —— 幼虫也该吃得到')
+		let rolled = 0
+		for (let i = 0; i < 20000; i++) if (rollDeNovo().includes('ban')) rolled++
+		if (rolled > 0) banProblems.push(`两万次新发抽奖里出现了 ${rolled} 次封禁 —— 它不该在抽奖池里`)
+	}
+
+	// —— 两锤：先封后卖，无状态 ——
+	clear()
+	w.money = 0
+	const s1 = w.addFly(800, 800, {})
+	const s2 = w.addFly(830, 800, {})
+	const s3 = w.addLarva(800, 830, {})
+	const first = w.banStrike(800, 800)
+	if (first.marked !== 3 || first.sold !== 0) {
+		banProblems.push(`第一锤应当是「封 3 卖 0」，实得「封 ${first.marked} 卖 ${first.sold}」`)
+	}
+	const moneyBefore = w.money
+	const soldBefore = w.stats.sold
+	const second = w.banStrike(800, 800)
+	if (second.marked !== 0 || second.sold !== 3) {
+		banProblems.push(`第二锤应当是「封 0 卖 3」，实得「封 ${second.marked} 卖 ${second.sold}」`)
+	}
+	if (Math.abs(second.gain - (w.money - moneyBefore)) > 1e-9) {
+		banProblems.push(`卖掉之后钱加了 ${(w.money - moneyBefore).toFixed(3)}，返回值却说 ${second.gain.toFixed(3)}`)
+	}
+	if (w.stats.sold !== soldBefore + 3) banProblems.push('stats.sold 没有 +3')
+	if (w.flies.length !== 0 || w.larvae.length !== 0) banProblems.push('卖掉之后虫子还留在数组里')
+	// 第三锤：什么都没了，两个数都该是 0
+	const third = w.banStrike(800, 800)
+	if (third.marked !== 0 || third.sold !== 0) banProblems.push('空锤还打出了东西')
+
+	// —— 卖掉不留尸体、不被记成死亡 ——
+	//
+	// ⚠ **必须再跑一帧再数**：尸体是 `_resolveLifecycles` **下一帧**才落的。
+	//   卖完立刻数 remains 的话，虫子还没被收尸，这条断言是空的
+	const remainsBefore = w.remains.length
+	const deathsBefore = w.stats.deaths
+	const swattedBefore = w.stats.swatted
+	const killedBefore = w.stats.killed
+	w.update(1 / 60)
+	if (w.remains.length !== remainsBefore) {
+		banProblems.push(`卖掉之后多出了 ${w.remains.length - remainsBefore} 块残留 —— 卖不该留尸体`)
+	}
+	if (w.stats.deaths !== deathsBefore) banProblems.push('卖掉被记成了死亡')
+	if (w.stats.swatted !== swattedBefore || w.stats.killed !== killedBefore) {
+		banProblems.push('卖掉被记成了拍死 / 咬死 —— sellLarva 没有把幼虫从 larvae 里摘掉')
+	}
+
+	// —— 幼虫售价：落在区间内，而且不是常数 ——
+	clear()
+	const prices = []
+	for (let i = 0; i < 200; i++) {
+		// ⚠ 这个 null 检查是**断言**，不是防御性代码：
+		//   `sellLarva` 忘了把幼虫从 `this.larvae` 里摘掉的话，卖掉的会越积越多，
+		//   很快撞上 `maxLarvae`，然后 addLarva 返回 null —— 再往下就是
+		//   「TypeError: null is not an object」，整段断言**一个字都打不出来**
+		const l = w.addLarva(300, 300, {})
+		if (!l) {
+			banProblems.push('幼虫池早早满了 —— 卖掉的幼虫没从 larvae 里摘掉，一直在攒')
+			break
+		}
+		l.mutations = ['ban']
+		const g = w.sellLarva(l)
+		if (g > 0) prices.push(g)
+	}
+	if (prices.length !== 200) banProblems.push(`200 只封禁幼虫只卖掉了 ${prices.length} 只`)
+	if (prices.length) {
+		const lo = Math.min(...prices)
+		const hi = Math.max(...prices)
+		if (lo < B.larvaValueMin - 1e-9 || hi > B.larvaValueMax + 1e-9) {
+			banProblems.push(`幼虫售价 ${lo} ~ ${hi} 超出配置区间 ${B.larvaValueMin} ~ ${B.larvaValueMax}`)
+		}
+		// ⚠ 只查上界的话，`return 0.001` 这种常数实现照样绿
+		if (!(lo < hi)) banProblems.push(`200 只幼虫卖出的价钱全一样（${lo}）—— 说好的随机区间呢`)
+	}
+
+	// —— 罐子和烤炉打不进去（和苍蝇拍同一条规矩）——
+	clear()
+	const inJar = w.addFly(1000, 1000, {})
+	const jar1 = w.dropJar(1000, 1000)
+	if (jar1) {
+		jar1.admit(inJar)
+		w.flies.splice(w.flies.indexOf(inJar), 1)
+		const r = w.banStrike(1000, 1000)
+		if (r.marked !== 0 || inJar.hasMutation('ban')) banProblems.push('金锤打进了罐子 —— 它只该作用在场上')
+	}
+
+	// —— 商店归类 ——
+	//
+	// ⚠ 漏了 shopCats 的商品会从商店里**静默消失**，什么错都不报
+	const inCats = CONFIG.market.shopCats.some((c) => c.items.includes('banhammer'))
+	if (!inCats) banProblems.push('banhammer 不在任何 shopCats 分组里 —— 它不会出现在商店')
+	const shopEntry = CONFIG.market.shop.find((it) => it.id === 'banhammer')
+	if (!shopEntry) banProblems.push('CONFIG.market.shop 里没有 banhammer')
+	else if (shopEntry.price !== 999) banProblems.push(`金锤的价格是 ${shopEntry.price}，用户指定的是 999`)
+
+	// —— 成就 ——
+	const ach = CONFIG.achievements.find((a) => a.id === 'ban')
+	if (!ach) banProblems.push('成就表里没有 ban 那一条')
+	else if (ach.gene !== 'ban') banProblems.push(`ban 成就挂的基因是 ${ach.gene}`)
+
+	console.log(
+		`\n—— 封禁 / gold Banhammer ——\n` +
+			`  半径 ${R}px：圈内 ${r1.marked} 只全中，圈外 1 只没被误伤；成虫和幼虫一视同仁\n` +
+			`  完全不能移动：爬 / 飞 / 产卵滑停 / 罐中 / 扫帚推力 五条路各跑 60~120 帧，坐标一个像素没变\n` +
+			`  售价 ×${(v1 / v0).toFixed(2)}（${v0.toFixed(4)} → ${v1.toFixed(4)}），weightMul 恒为 1（不是石化那条路）\n` +
+			`  两锤：第一锤封 3 卖 0 → 第二锤封 0 卖 3（+${second.gain.toFixed(3)}）→ 第三锤打出 0\n` +
+			`  卖掉不留尸体、不计死亡、不算拍死（跑满一帧再数的）\n` +
+			`  幼虫售价 ${prices.length} 次抽样全落在 $${B.larvaValueMin}~$${B.larvaValueMax} 之间且有大有小\n` +
+			`  两万次新发抽奖里封禁出现 0 次（它只能靠金锤）；罐子打不进去；商店 $${shopEntry ? shopEntry.price : '?'}`,
+	)
+}
+problems.push(...banProblems)
+
 if (problems.length === 0) {
 	console.log('\n  没有发现问题：生命周期跑通，工具行为符合预期。')
 } else {

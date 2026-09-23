@@ -72,6 +72,21 @@ export function priceOf(weightMg) {
 }
 
 /**
+ * 卖一只**被封禁的幼虫**值多少钱。
+ *
+ * 幼虫没有体重、稀有度、成长（`Larva` 类里压根没这几个字段），
+ * 所以它不是算出来的，是在 `CONFIG.tools.ban` 那个区间里随机抽的 ——
+ * 「一条蛆不值钱」。用户指定 $0.001 ~ $0.01。
+ *
+ * ⚠ round 到三位，和 `formatMoney` / `bulkPrice` 同一个理由：
+ *   浮点尾巴会渗进 `world.money`，攒多了就会看到 `$0.3009999999999999`
+ */
+export function bannedLarvaPrice() {
+	const B = CONFIG.tools.ban
+	return Math.round((B.larvaValueMin + Math.random() * (B.larvaValueMax - B.larvaValueMin)) * 1000) / 1000
+}
+
+/**
  * 价值落在哪一档。返回 valueTiers 里的那一条配置。
  *
  * 用「第一个上界 ≥ 价值」来判，所以档位配置**必须按上界升序排**。

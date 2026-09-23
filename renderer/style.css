@@ -493,6 +493,71 @@ button.toggle.on {
 }
 
 /*
+ * ---------------------------------------------------------- 工具图标（像素画）
+ *
+ * 图上没有颜色 —— 颜色全在这一层。形状由 JS 现算的 `mask-image` 裁
+ * （`renderer/src/toolicons.js` 把 12×12 的字符串矩阵画成 data URL），
+ * 所以 `.locked` / `:hover` / `.active` 想换色只要改 background，
+ * 不用重画图、也不用多带一份资源。
+ *
+ * ⚠ 和 `.jar-icon::after` 是同一套「渐变铺底 + mask 裁形状」的做法，
+ *   只有金锤那一颗会真的动起来（见下面的 .flow）
+ *
+ * ⚠ 图标是**空 span**，不放任何文字：`setTool` 拿 `btn.textContent`
+ *   当「当前工具名」显示到收起状态的标题行，塞字进去会把它污染成
+ *   「图标名中文名」—— 而且不报错
+ */
+.tools button {
+	/* 图标和文字排一行。原来只有文字时是靠默认的 inline 排版 */
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 3px;
+}
+
+.tool-icon {
+	width: 12px;
+	height: 12px;
+	/* ⚠ flex: none —— 不给的话按钮变窄时图标会被压扁，
+	   而像素图被非等比压扁之后就是一团糊，认不出是什么 */
+	flex: none;
+	/* 平时是哑光的米色，和按钮文字同一族 —— 11 颗都是彩色的话工具栏会吵 */
+	background: rgba(226, 214, 190, 0.72);
+	-webkit-mask-repeat: no-repeat;
+	mask-repeat: no-repeat;
+	-webkit-mask-position: center;
+	mask-position: center;
+	-webkit-mask-size: 12px 12px;
+	mask-size: 12px 12px;
+}
+
+/* 选中之后跟着文字一起变金 —— 和 button.active 的配色是一套 */
+.tools button.active .tool-icon {
+	background: #ffd89a;
+}
+
+/*
+ * 金色流动 —— **只有 gold Banhammer 那一颗**。
+ *
+ * 渐变横向铺 300% 宽，靠 `@keyframes border-flow` 推 background-position，
+ * 亮带就会从左到右反复扫过。形状被 mask 裁住，看起来就是金子在图标里流。
+ *
+ * ⚠ 复用现成的 border-flow（它本来是给「去下载」那颗按钮的流光写的）。
+ *   不另写一套：conic-gradient 那条路要 @property，旧 Chromium 直接不动，
+ *   理由写在 .gold::before 上面那一段
+ */
+.tool-icon.flow {
+	background: linear-gradient(90deg, #8a5f10, #e8b84b, #fff3c4, #e8b84b, #8a5f10);
+	background-size: 300% 100%;
+	animation: border-flow 2.6s linear infinite;
+}
+
+/* 没买下来的时候跟着按钮一起暗下去（.locked 给的是 opacity，这里不用重复） */
+.tools button.locked .tool-icon {
+	background: rgba(226, 214, 190, 0.5);
+}
+
+/*
  * 「烤制」那颗按钮在没买之前整个藏起来（等级 0 时它代表不了任何东西），
  * 买下打火机之后才出现，文字随档位变成 打火机 / 喷火枪 / 烤炉。
  *

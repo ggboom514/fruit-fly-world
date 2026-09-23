@@ -33,6 +33,7 @@ import {
 } from './market.js'
 import { badgesOf } from './mutations.js'
 import { drawFoodIcon, drawFlyIcon } from './render.js'
+import { toolIconMaskUrl } from './toolicons.js'
 
 /** 投放面板上每一行给的两档数量。想加「投 100 个」就往这里加一个数 */
 const FEED_QUANTITIES = [1, 10]
@@ -111,6 +112,10 @@ export class UI {
 		this.mouseDown = false
 		this.lastSwat = 0
 		this.lastNet = 0
+		// 金锤上一次落锤的时刻（performance.now 的毫秒）。
+		// ⚠ 和拍子 / 网同一个理由：`_useTool` 是**按住每帧都调**的，
+		//   没有冷却的话按住一秒就是 60 锤
+		this.lastBan = 0
 
 		// —— 抹布：累计「滑过的路程」——
 		//
@@ -286,6 +291,7 @@ export class UI {
 			btnNet: $('btn-net'),
 			btnLighter: $('btn-lighter'),
 			btnFlamer: $('btn-flamer'),
+			btnBanhammer: $('btn-banhammer'),
 			jarWindow: $('jar-window'),
 			jarHead: $('jar-head'),
 			jarList: $('jar-list'),
@@ -390,6 +396,46 @@ export class UI {
 		this.speedButtons = Array.from(this.el.speeds.querySelectorAll('[data-speed]'))
 	}
 
+	/**
+	 * 给每颗工具按钮塞一个像素画图标。
+	 *
+	 * 图标走「空 span + CSS mask」这条路（见 toolicons.js 文件头那段），
+	 * 这里只负责把 mask 装上、把 span 塞进去。
+	 *
+	 * ⚠ **必须是空 span。** `setTool` 用 `btn.textContent` 当「当前工具名」
+	 *   显示到收起状态的标题行（`#tools-current`）。塞任何文字节点进来
+	 *   （哪怕只是兜底用的一个字符）都会把它污染成「图标名中文名」，
+	 *   而且不报错。
+	 *
+	 * ⚠ **幂等**：`refreshToolButtons` 会 `textContent = ...` 把子节点整个换掉
+	 *   （打火机那两颗的名字是从 CONFIG 现算的），所以它末尾会再调一次这里。
+	 *   没有这道 `querySelector` 检查的话，那些没被 `textContent` 碰过的按钮
+	 *   会长出第二个图标
+	 */
+	_installToolIcons() {
+		const dpr = window.devicePixelRatio || 1
+		for (const btn of this.toolButtons) {
+			if (btn.querySelector('.tool-icon')) continue
+			const id = btn.dataset.tool
+			const url = toolIconMaskUrl(id, dpr)
+			// 认不出的 id：不塞图标，但也别塞一个空 url ——
+			// 空 url 会让 `mask-image` 失效，那个 span 就变成一块实心色块
+			if (!url) continue
+
+			const span = document.createElement('span')
+			span.className = 'tool-icon'
+			// ⚠ 金色流动只有金锤那一颗。加上这个类之后 CSS 会推 background-position，
+			//   形状由 mask 裁住，看起来就是金子在图标里流
+			if (id === 'banhammer') span.classList.add('flow')
+			// ⚠ 用 setProperty 写带前缀的那个名字。
+			//   `span.style.webkitMaskImage = ...` 在部分 Chromium 上不生效，
+			//   而失效的样子是「图标整块消失」—— 不报错
+			span.style.setProperty('-webkit-mask-image', 'url(' + url + ')')
+			span.style.setProperty('mask-image', 'url(' + url + ')')
+			btn.prepend(span)
+		}
+	}
+
 	_bindEvents() {
 		for (const btn of this.toolButtons) {
 			// ⚠ 这里原来有一段特判：`data-tool === 'roast'` 且等级 ≥3 时，
@@ -398,6 +444,7 @@ export class UI {
 			//   玩家点「打火机」会凭空摆出一个炉子
 			btn.addEventListener('click', () => this.setTool(btn.dataset.tool))
 		}
+		this._installToolIcons()
 		for (const btn of this.speedButtons) {
 			btn.addEventListener('click', () => this.setSpeed(btn.dataset.speed))
 		}
@@ -1133,7 +1180,19 @@ export class UI {
 		//
 		// ⚠ 这个 return 必须在下面 `mouseDown = true` **之前**：
 		// 否则观察模式下手套空抓会让 update() 每帧空跑一次 _useTool()
-		if (this.view.tool === 'glove') return
+		if (this.view.tool === 'glove') {
+			// 空抓本来什么都不做。但「按在封禁蝇上没反应」是个例外 ——
+			// 那不是抓空了，是**它拖不动**（_grabbableAt 里挡掉了）。
+			// 不说一句的话玩家会以为手套坏了：这是这个项目最怕的静默失效
+			const blocked = this._flyAt(
+				this.view.mouse.x,
+				this.view.mouse.y,
+				CONFIG.tools.grabFlyRadius,
+				(f) => !f.canMove,
+			)
+			if (blocked) this._flashHint('封禁的果蝇拖不动 —— 拿金锤再敲一下卖掉它')
+			return
+		}
 
 		// —— 查看工具：点一下虫，弹出它的数据面板 ——
 		//
@@ -1296,7 +1355,13 @@ export class UI {
 		const corpse = this._corpseAt(m.x, m.y)
 		if (corpse) return { item: corpse, kind: 'corpse' }
 
-		const fly = this._flyAt(m.x, m.y, CONFIG.tools.grabFlyRadius)
+		// ⚠ 封禁蝇**手套也拖不走** —— 字面意义的雕塑。
+		//
+		//   闸门必须在这里，**不能**放 `_dragTo` 里做「拖了但钉住」：
+		//   `_endDrag` 判出售区用的是 `_pointInSell(this.view.mouse)` ——
+		//   **指针**的位置，不是虫的位置。于是「拖不动」的虫照样能
+		//   被拖进出售区卖掉，一个看不见的后门
+		const fly = this._flyAt(m.x, m.y, CONFIG.tools.grabFlyRadius, (f) => f.canMove)
 		if (fly) return { item: fly, kind: 'fly' }
 
 		return null
@@ -1360,11 +1425,19 @@ export class UI {
 	 *
 	 * @param {number} radius 判定半径。悬停检视用小值、戴手套抓用大值
 	 */
-	_flyAt(x, y, radius) {
+	/**
+	 * 指针底下最近的成虫，超出 radius 就不算。
+	 *
+	 * @param {((f: object) => boolean) | null} filter 可选的过滤谓词。
+	 *   ⚠ 要在**循环里面**过滤，不是拿到结果之后再判 —— 后者的话，
+	 *     指针正下方那只是封禁蝇时，稍远一点那只正常蝇也一起抓不到了
+	 */
+	_flyAt(x, y, radius, filter = null) {
 		let best = null
 		let bestD = radius * radius
 		for (const f of this.world.flies) {
 			if (f.dead) continue
+			if (filter && !filter(f)) continue
 			const d = dist2(x, y, f.x, f.y)
 			if (d <= bestD) {
 				bestD = d
@@ -1663,6 +1736,39 @@ export class UI {
 		//   重开一局回到 radiusStart 才对
 		if (this.view.tool === 'broom') {
 			this.world.broom(m.x, m.y, this.view.broom.r)
+			return
+		}
+
+		// gold Banhammer：**点一下**封、**再点一下**卖。
+		//
+		// 语义是**无状态**的（判据在 world.banStrike 里）：圈里还有没封的
+		// 就是「封」，全是封着的就是「卖」。这里只负责冷却 ——
+		//
+		// ⚠ 冷却**必须有**：`_useTool` 是按住每帧都调的（见 update()）。
+		//   没有它的话按住一秒就是 60 锤 —— 第一锤刚封上，同一秒里就被
+		//   后面某一锤卖掉了，玩家永远看不到金色流动
+		//
+		// ⚠ 圆心是**指针**，不是苍蝇拍那种「拍面在指针左上方」。
+		//   金锤是个范围技，圆心跟着指针走才符合直觉，别照抄 swatterHeadAt
+		if (this.view.tool === 'banhammer') {
+			// 拿着锤子时点「重置」：清空会连 shop 一起清掉，但**不会**动 view.tool ——
+			// 不拦的话手里就攥着一把已经不该存在的锤子（和捕虫网同一处坑）
+			if (!this.world.hasShopItem('banhammer')) {
+				this.setTool('none')
+				this._flashHint('gold Banhammer 被重置掉了，要重新买')
+				return
+			}
+			const now = performance.now()
+			if (now - this.lastBan < CONFIG.tools.ban.cooldown * 1000) return
+			this.lastBan = now
+
+			const r = this.world.banStrike(m.x, m.y)
+			if (r.marked > 0) {
+				this._flashHint(`封禁 ${r.marked} 只（售价 ×1.5，但动不了了）—— 再锤一下原地卖掉`)
+			} else if (r.sold > 0) {
+				this._flashHint(`卖掉了 ${r.sold} 只，+${formatMoney(r.gain)}`)
+			}
+			if (r.marked > 0 || r.sold > 0) this.refreshStats()
 			return
 		}
 
@@ -2957,6 +3063,9 @@ export class UI {
 				this.setTool(held ? 'none' : lv >= 2 ? 'flamer' : 'lighter')
 				break
 			}
+			case 'KeyH':
+				this.setTool(this.view.tool === 'banhammer' ? 'none' : 'banhammer')
+				break
 			case 'Space':
 				e.preventDefault()
 				this.togglePause()
@@ -2969,14 +3078,23 @@ export class UI {
 	setTool(tool) {
 		// 捕虫网要先买。不拦的话它会切过去、标题行显示「捕虫网」，
 		// 但按下去什么都不发生 —— 得让玩家知道是没买，不是坏了
+		//
+		// ⚠ 价格一律从配置里读，别在提示语里写死 —— 写死的话改了 shop 里的
+		//   price，这句话就成了假话。（捕虫网那句原来写死成 $1.2，
+		//   而价格表早就改成 $1 了）
 		if (tool === 'net' && !this.world.hasShopItem('net')) {
-			this._flashHint('先去商店买捕虫网（$1.2）')
+			this._flashHint(`先去商店买捕虫网（${formatMoney(shopItem('net')?.price ?? 0)}）`)
 			return
 		}
-		// 喷水枪同理。价格从配置里读，别在提示语里写死 ——
-		// 写死的话改了 shop 里的 price，这句话就成了假话
+		// 喷水枪同理
 		if (tool === 'squirt' && !this.world.hasShopItem('squirt')) {
 			this._flashHint(`先去商店买喷水枪（${formatMoney(shopItem('squirt')?.price ?? 0)}）`)
+			return
+		}
+		// 金锤同理。它是全场最贵的一件，提示里必须带上价钱 ——
+		// 不然玩家只看到一颗灰按钮，会以为是坏了
+		if (tool === 'banhammer' && !this.world.hasShopItem('banhammer')) {
+			this._flashHint(`gold Banhammer 在商店里，${formatMoney(shopItem('banhammer')?.price ?? 0)} 买断`)
 			return
 		}
 
@@ -3291,8 +3409,13 @@ export class UI {
 			fx.on = this.mouseDown && fx.scrub > 0
 			fx.rate = F.clothRate
 		} else {
-			// 拍子 / 网 / 查看 / 手套 / 观察 —— 没有持续特效，
-			// 它们的反馈是**动作那一下**的一次性粒子（见 world.swat / catchFlies）
+			// 拍子 / 网 / 金锤 / 查看 / 手套 / 观察 —— 没有持续特效，
+			// 它们的反馈是**动作那一下**的一次性粒子
+			// （见 world.swat / catchFlies / banStrike 里那个 burstRing）
+			//
+			// ⚠ 金锤落在**这一支**是刻意的：它没有滚轮参数，
+			//   所以不需要 idle 速率。给它加一个的话，举着锤子就会
+			//   有一圈常驻粒子转，和拍子 / 网的手感不一致
 			fx.on = false
 			fx.rate = idle[tool] ?? 0
 		}
@@ -3810,6 +3933,25 @@ export class UI {
 					? `要先在商店买下${tier.name}（${formatMoney(tier.price)}）才能用`
 					: `要先买下${burnChain[0].name}，再花 ${formatMoney(tier.price)} 升级到${tier.name}`
 		}
+
+		// —— gold Banhammer ——
+		//
+		// 和上面两颗同一套：一直显示、没买时 `.locked`（**不是 disabled**），
+		// 点了由 setTool 拦下来并说明原因。
+		// 名字和价格一律从 CONFIG 取，不在这里另抄一份
+		const bh = shopItem('banhammer')
+		if (this.el.btnBanhammer && bh) {
+			const owned = this.world.hasShopItem('banhammer')
+			this.el.btnBanhammer.classList.toggle('locked', !owned)
+			this.el.btnBanhammer.textContent = bh.name
+			this.el.btnBanhammer.title = owned
+				? `${bh.desc}（H）`
+				: `要先在商店买下${bh.name}（${formatMoney(bh.price)}）才能用`
+		}
+
+		// ⚠ 上面有 `textContent = ...`，那是**把子节点整个换掉** ——
+		//   像素图标那个 span 会跟着一起没。所以这里必须再装一次
+		this._installToolIcons()
 	}
 
 	/**
@@ -4230,10 +4372,14 @@ export class UI {
 			desc.textContent = CODEX_HIDDEN
 		} else {
 			name.textContent = this._mutationEffect(t)
-			desc.textContent =
-				t.chance > 0
-					? `${(t.chance * 100).toFixed(1)}% · ${how}`
-					: `${t.fromStar ? '吃星空苹果获得' : '无法自然获得'} · ${how}`
+			// 来历那行：抽奖出来的写概率，抽不出来的写「怎么才拿得到」。
+			//
+			// ⚠ 三个分支缺一不可。少了 `fromTool` 那支，「封禁」会显示成
+			//   「无法自然获得」—— 对玩家来说等于「这格永远拿不到」，
+			//   而它其实买把 $999 的锤子就能敲出来。
+			//   ⚠ main.js 自检里**照抄了一份同样的三元表达式**，改这里要一起改
+			const origin = t.fromStar ? '吃星空苹果获得' : t.fromTool ? '金锤敲出来' : '无法自然获得'
+			desc.textContent = t.chance > 0 ? `${(t.chance * 100).toFixed(1)}% · ${how}` : `${origin} · ${how}`
 		}
 		// ⚠ 胶囊在文字**上面**，和另外两行一样是 codex-text 的子节点 ——
 		//   这样它和 canvas 就不会抢同一行的宽度了
@@ -4268,6 +4414,11 @@ export class UI {
 		if (t.id === 'crystal') bits.push('全身透明只剩描边')
 		if (t.id === 'golden') bits.push('通体金色、带闪光')
 		if (t.id === 'nebula') bits.push('身体是星云上的一扇窗（星空钉在屏幕上不动）')
+		// ⚠ 封禁那两条是**非数值**的，自动拼不出来，必须在这儿手写。
+		//   「价值 ×1.5」那一档上面会自动拼上（走 t.valueMul）；
+		//   「完全不能动」没有对应的字段，漏了这一句图鉴上就只剩钱的事
+		if (t.id === 'ban') bits.push('完全不能移动（拖都拖不走）')
+		if (t.id === 'ban') bits.push('身体流过一道金光')
 		return bits.length ? bits.join(' · ') : t.name
 	}
 

@@ -373,6 +373,60 @@ function crystalRim(ctx, f, s) {
 	ctx.stroke()
 }
 
+/** 把值夹进 0~1。`addColorStop` 收到越界的 offset 会抛 IndexSizeError */
+function clamp01(v) {
+	return v < 0 ? 0 : v > 1 ? 1 : v
+}
+
+/**
+ * 封禁的金色流光：一条亮带沿着身体长轴扫过去。
+ *
+ * ⚠ 和「点石成金」刻意做得**不一样**，两者同屏时要一眼分得开：
+ *   · 点石成金 = `GOLD_PALETTE` **整只换一套金色** + 5 颗闪光点
+ *   · 封禁     = **体色不动**，只有一条金带流过身体
+ *   体色不动是刻意的：任何「整体偏金」的调色板都会往点石成金上靠，
+ *   而且会让「流光到底画上没有」的像素断言变成空的（体色本身就能让它过）
+ *
+ * ⚠ 用 **clip + fillRect**，不用 stroke。文件末尾「关于描边」那条规矩是
+ *   「给填充形状勾边一律不要」，结晶那圈描边是**唯一**的例外，别当先例
+ *
+ * ⚠ 时间从 `f.frozenNow` 取（图鉴图标会把它定死成 0），没有才退回实时 ——
+ *   和 crystalRim / drawGoldSparkle / 疯狂眼部呼吸同一条规矩
+ *
+ * ⚠ 三个 offset 一律过 `clamp01`。越界时 canvas 抛 IndexSizeError，
+ *   而 `app.js` 那一帧的 `renderer.draw` 是被 try/catch 包住的 ——
+ *   表现是**这一帧后面所有东西都不画**（罐子 / 粒子 / 飘字全没了，
+ *   只有虫还在），看起来像随机丢物件，极难归因
+ *
+ * @param {object} obj 带 `frozenNow` / `seed` 的东西（Fly 或 Larva）
+ * @param {number} s 尺寸
+ * @param {() => void} buildPath 把自己身体的路径 trace 进 ctx（不 fill、不 stroke）
+ */
+function banSheen(ctx, obj, s, buildPath) {
+	const t = (obj.frozenNow ?? performance.now()) / 1000
+	// 相位从 -0.3 走到 1.3：进和出都在身体外面，两头都完整
+	const u = -0.3 + ((t * 0.55 + obj.seed * 0.137) % 1.6)
+	const a = clamp01(u - 0.2)
+	const b = clamp01(u)
+	const c = clamp01(u + 0.2)
+
+	ctx.save()
+	// ⚠ 必须自己兜住 globalAlpha：结晶把整个身体的 alpha 设成 0.14 一直留着，
+	//   金蝇的闪光结尾又是**硬写** 1（不是还原）。不显式设的话，
+	//   「结晶 + 封禁」的虫流光会淡到看不见
+	ctx.globalAlpha = 1
+	buildPath()
+	ctx.clip()
+	const g = ctx.createLinearGradient(-s * 0.55, 0, s * 0.45, 0)
+	g.addColorStop(a, 'rgba(255, 214, 110, 0)')
+	// 中间那档比任何静态体色都亮 —— 像素断言就靠它区分「有流光 / 没流光」
+	g.addColorStop(b, 'rgba(255, 240, 190, 0.9)')
+	g.addColorStop(c, 'rgba(255, 214, 110, 0)')
+	ctx.fillStyle = g
+	ctx.fillRect(-s, -s * 0.8, s * 2, s * 1.6) // 铺满整个裁剪区
+	ctx.restore()
+}
+
 /**
  * 点石成金蝇身上的闪光。
  *
@@ -435,6 +489,8 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 	// 星云的**身体贴图**。和 crystal 一样每帧直接读基因数组 ——
 	// 它们都是「这只虫现在长什么样」的判据，没有第二处状态
 	const nebula = f.mutations && f.mutations.includes('nebula')
+	// 封禁的**金色流光**。同样是叠加效果、同样直接读基因数组
+	const ban = f.mutations && f.mutations.includes('ban')
 
 	ctx.save()
 	ctx.translate(f.x + ox, f.y + oy)
@@ -716,6 +772,12 @@ function drawFly(ctx, f, ox = 0, oy = 0) {
 	// 闪光画在最上层，否则会被后画的身体盖住
 	if (V._gold) drawGoldSparkle(ctx, f, s)
 
+	// 封禁的金色流光。⚠ 放在**石化暗边之后** —— 暗边是描边界，
+	// 而流光按定义在身体内部，压在暗边上的话会把描边内侧盖掉。
+	// 但要在结晶那圈炫彩边**之前**：结晶是整个文件里唯一允许描边的例外，
+	// 让它保持在最上面（两种效果同时有的时候，玩家先认得出的应该是结晶）
+	if (ban) banSheen(ctx, f, s, () => flyBodyPath(ctx, s, f.sex))
+
 	// ⚠ 炫彩轮廓最后画，而且要**先把不透明度还原** ——
 	//   结晶蝇的身体是 0.14 的 alpha，描边要是也吃这个值，
 	//   那圈彩虹会淡到看不见，整个结晶就等于只有一团鬼影
@@ -876,6 +938,15 @@ function drawLarva(ctx, l) {
 		// 壳面的颗粒质感（和成虫同一套）
 		speckle(ctx, l.seed, P.speckles, 0, 0, pl * 0.85, pw * 0.8, V.pupaSpeckle)
 
+		// 封禁的流光在蛹期**也要接着画**：一只被封禁的幼虫化蛹之后
+		// 效果突然消失，玩家会读成「封禁没了」（而它其实还在，还是卖 ×1.5）
+		if (l.mutations && l.mutations.includes('ban')) {
+			banSheen(ctx, l, s, () => {
+				ctx.beginPath()
+				ctx.ellipse(0, 0, pl, pw, 0, 0, TAU)
+			})
+		}
+
 		ctx.restore()
 		return
 	}
@@ -909,6 +980,20 @@ function drawLarva(ctx, l) {
 	const crystal = l.mutations && l.mutations.includes('crystal')
 	const nebula = l.mutations && l.mutations.includes('nebula')
 
+	// 封禁的金色流光。抽成一个小闭包是因为幼虫有**三个出口**
+	// （星云 / 结晶各自提前 return，剩下的走到底），每个出口都要画一次 ——
+	// 一只「结晶 + 封禁」的幼虫两条效果都该看得见。
+	//
+	// ⚠ 成虫那边只需要在末尾调一次（它没有提前 return 的分支），
+	//   幼虫这边结构不同，别照抄那边的写法
+	const banned = l.mutations && l.mutations.includes('ban')
+	const drawBanSheen = () => {
+		if (!banned) return
+		// 复用**同一条** `bodyOutline()`（结晶描边和星云贴图用的也是它），
+		// 所以流光贴得严丝合缝
+		banSheen(ctx, l, l.size, () => traceSmooth(ctx, outline))
+	}
+
 	// —— 星云（幼虫）——
 	//
 	// 幼虫这边比成虫省事得多：`bodyOutline()` 已经是一条现成的闭合路径
@@ -932,6 +1017,7 @@ function drawLarva(ctx, l) {
 	//   就是最后画的那只星云幼虫，它一动，整屏跟着动
 	if (nebula && !crystal) {
 		fillWorldTexture(ctx, nebulaPattern(ctx))
+		drawBanSheen()
 		ctx.restore()
 		return
 	}
@@ -960,6 +1046,7 @@ function drawLarva(ctx, l) {
 		ctx.lineJoin = 'round'
 		ctx.stroke()
 
+		drawBanSheen()
 		ctx.restore()
 		return
 	}
@@ -1000,6 +1087,7 @@ function drawLarva(ctx, l) {
 		ctx.restore()
 	}
 
+	drawBanSheen()
 	ctx.restore()
 }
 

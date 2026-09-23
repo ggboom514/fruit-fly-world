@@ -409,6 +409,11 @@ function runSelfTest() {
 				// 路径拼错、文件没权限、原子写的 rename 失败，这些全都照样绿。
 				// 自检期间读写的是 save.selftest.json，碰不到玩家的真存档。
 				let saveKB = 0
+				// ⚠ 这两个必须声明在**最外层**。写在各自那一段的 try 里面的话，
+				//   作用域出不了那个 try —— 而 report 是在最外层拼的，
+				//   表现是最后报一句「banTag is not defined」，整段自检一个字都打不出来
+				let banTag = null
+				let iconTag = null
 				try {
 					const json = JSON.stringify({
 						version: 1,
@@ -2787,6 +2792,217 @@ function runSelfTest() {
 					else delete pet.world.shop.oven
 					pet.ui.refreshFeed()
 
+					// —— gold Banhammer：工具接线 ——
+					//
+					// 机制那一半在 tools/simulate.js 里（半径 / 不能动 / 两次敲 / 售价），
+					// 这里只管**界面这一层**：按钮在不在、锁没锁、点了真的打到指针那儿
+					try {
+						const ui = pet.ui
+						const savedShopBan = pet.world.shop.banhammer
+						const wh = pet.world
+
+						// ① 商店里得有它，而且归了类
+						//    ⚠ 漏了 shopCats 的话商品会**静默消失**
+						const shopRows = document.getElementById('shop-list')
+						document.getElementById('btn-shop').click()
+						ui.refreshShop()
+						if (!shopRows.querySelector('[data-buy="banhammer"]')) {
+							ui._onKey({ code: 'Escape' })
+							return { ok: false, reason: '商店里没有 gold Banhammer —— shopCats 里漏归类了' }
+						}
+						ui._onKey({ code: 'Escape' })
+
+						// ② 没买之前：带 .locked，而且**不是 disabled** ——
+						//    disabled 的话玩家点下去什么都不会发生，会以为是坏了
+						const btn = document.getElementById('btn-banhammer')
+						if (!btn) return { ok: false, reason: '#btn-banhammer 不存在' }
+						delete wh.shop.banhammer
+						ui.refreshToolButtons()
+						if (!btn.classList.contains('locked')) {
+							return { ok: false, reason: '没买金锤，那颗按钮却没有 .locked' }
+						}
+						if (btn.disabled) {
+							return { ok: false, reason: '金锤按钮被 disabled 了 —— 点了没反应的按钮最难查' }
+						}
+						// ③ 没买就切不过去
+						const toolBefore = pet.view.tool
+						ui.setTool('banhammer')
+						if (pet.view.tool !== toolBefore) {
+							return { ok: false, reason: '没买金锤却切过去了' }
+						}
+						// ④ 买了就能切
+						wh.shop.banhammer = true
+						ui.refreshToolButtons()
+						if (btn.classList.contains('locked')) {
+							return { ok: false, reason: '买了金锤之后按钮还是 .locked' }
+						}
+						ui.setTool('banhammer')
+						if (pet.view.tool !== 'banhammer') return { ok: false, reason: 'setTool 切不到金锤' }
+						if (!btn.classList.contains('active')) return { ok: false, reason: '切到金锤后按钮没有选中态' }
+
+						// ⑤ 按 H 能开能关（和 B / V 那些同一套写法）
+						ui._onKey({ code: 'KeyH' })
+						if (pet.view.tool !== 'none') return { ok: false, reason: '按一下 H 没切回观察' }
+						ui._onKey({ code: 'KeyH' })
+						if (pet.view.tool !== 'banhammer') return { ok: false, reason: '再按一下 H 没切回金锤' }
+
+						// ⑥ **真的打到指针那一点** ——
+						//    这条抓的是「圆心抄成了拍面 / 屏幕中心」之类的错，
+						//    光断言 world.banStrike 能封东西是抓不到的
+						const m = pet.view.mouse
+						const sx = m.x
+						const sy = m.y
+						wh.flies.length = 0
+						wh.larvae.length = 0
+						const under = wh.addFly(sx, sy, {})
+						const outside = wh.addFly(sx + pet.config.tools.ban.radius + 40, sy, {})
+						ui.lastBan = 0
+						ui._useTool()
+						if (!under.hasMutation('ban')) {
+							return { ok: false, reason: '按在指针底下的那只没被封 —— 圆心没跟着指针走' }
+						}
+						if (outside.hasMutation('ban')) {
+							return { ok: false, reason: '半径外的也被封了' }
+						}
+						// ⑦ 冷却：紧接着再来一下。
+						//    ⚠ 没有冷却的话第二下会真的落锤 —— 而那时 under
+						//      已经被封上了，于是当场被卖掉。所以「它还活着」
+						//      就是「冷却生效了」的判据
+						ui._useTool()
+						if (under.dead) {
+							return { ok: false, reason: '同一瞬间连锤两下就把它卖了 —— 冷却没生效' }
+						}
+						banTag = { marked: 1 }
+
+						// 收拾：把工具切回去、把这两只清掉、商店状态还原
+						ui.setTool('none')
+						wh.flies.length = 0
+						wh.larvae.length = 0
+						if (savedShopBan) wh.shop.banhammer = savedShopBan
+						else delete wh.shop.banhammer
+						ui.refreshToolButtons()
+					} catch (e) {
+						return { ok: false, reason: '金锤接线流程失败: ' + e.message }
+					}
+
+					// —— 工具按钮上的像素图标 ——
+					try {
+						const mod = await import('./src/toolicons.js')
+						const ICONS = mod.TOOL_ICONS
+
+						// ① 键集合必须和按钮**一一对应**。
+						//    ⚠ 只查「有 .tool-icon」是不够的：漏画一个 id 的话，
+						//      那颗按钮就是一面空白，而别的按钮照样有图标
+						const ids = pet.ui.toolButtons.map((b) => b.dataset.tool).sort()
+						const keys = Object.keys(ICONS).sort()
+						if (ids.join(',') !== keys.join(',')) {
+							return {
+								ok: false,
+								reason:
+									'工具按钮和 TOOL_ICONS 对不上：按钮有 [' + ids.join(',') +
+									']，图有 [' + keys.join(',') + ']',
+							}
+						}
+
+						// ② 每张图必须是 12×12、而且着色格数够多。
+						//    ⚠ 「有这个键」是空的：一张全透明的图照样过，
+						//      而屏幕上就是一颗空按钮
+						const sigs = []
+						for (const id of keys) {
+							const px = ICONS[id]
+							if (px.length !== mod.ICON_SIZE) {
+								return {
+									ok: false,
+									reason: '图标「' + id + '」有 ' + px.length + ' 行，应当是 ' + mod.ICON_SIZE + ' 行',
+								}
+							}
+							for (let i = 0; i < px.length; i++) {
+								if (px[i].length !== mod.ICON_SIZE) {
+									return {
+										ok: false,
+										reason:
+											'图标「' + id + '」第 ' + (i + 1) + ' 行有 ' + px[i].length +
+											' 个字符，应当是 ' + mod.ICON_SIZE,
+									}
+								}
+								if (/[^#.]/.test(px[i])) {
+									return {
+										ok: false,
+										reason: '图标「' + id + '」第 ' + (i + 1) + ' 行里有既不是 # 也不是 . 的字符',
+									}
+								}
+							}
+							const n = mod.iconFillCount(id)
+							if (n < 12) {
+								return {
+									ok: false,
+									reason: '图标「' + id + '」只有 ' + n + ' 格是实的 —— 画得太空，屏幕上认不出来',
+								}
+							}
+							sigs.push([id, px.join('|')])
+						}
+						// ③ 11 张图**两两不同** —— 上面那条在「全都画同一个东西」时也是绿的
+						for (let i = 0; i < sigs.length; i++) {
+							for (let j = i + 1; j < sigs.length; j++) {
+								if (sigs[i][1] === sigs[j][1]) {
+									return {
+										ok: false,
+										reason: '图标「' + sigs[i][0] + '」和「' + sigs[j][0] + '」长得一模一样',
+									}
+								}
+							}
+						}
+
+						// ④ 每颗按钮里真的装上了，而且**有尺寸**
+						//
+						// ⚠ 必须先展开工具组：它默认收着（.collapsed），
+						//   而 CSS 里那条「收起时隐藏 fold-body」的规则是 display:none ——
+						//   收着的时候每颗按钮的 getBoundingClientRect() 都是 0，
+						//   这条断言会把「全都正常」误报成「尺寸是 0」
+						const toolsBox2 = document.getElementById('tools-box')
+						if (toolsBox2.classList.contains('collapsed')) document.getElementById('btn-tools').click()
+						for (const b of pet.ui.toolButtons) {
+							const sp = b.querySelector('.tool-icon')
+							if (!sp) return { ok: false, reason: '按钮「' + b.dataset.tool + '」里没有 .tool-icon' }
+							const r = sp.getBoundingClientRect()
+							if (!(r.width > 0) || !(r.height > 0)) {
+								return { ok: false, reason: '按钮「' + b.dataset.tool + '」的图标尺寸是 0' }
+							}
+						}
+
+						// ⑤ 图标**不能污染按钮文字**：setTool 拿 btn.textContent
+						//    当「当前工具名」显示到收起状态的标题行
+						const bhBtn = document.getElementById('btn-banhammer')
+						if (bhBtn.textContent.trim() !== 'gold Banhammer') {
+							return {
+								ok: false,
+								reason: '金锤按钮的 textContent 是「' + bhBtn.textContent.trim() + '」—— 图标把它污染了',
+							}
+						}
+
+						// ⑥ 金色流动：只有金锤那一颗挂了 .flow，而且真的在跑动画。
+						//    ⚠ 查类名是不够的 —— 类名对了但 CSS 没写，照样是死的
+						const flowEl = document.getElementById('btn-banhammer').querySelector('.tool-icon')
+						if (!flowEl.classList.contains('flow')) {
+							return { ok: false, reason: '金锤图标没有 .flow —— 金色不会流动' }
+						}
+						const anim = getComputedStyle(flowEl).animationName
+						if (anim === 'none' || !anim) {
+							return { ok: false, reason: '金锤图标的 animation-name 是 ' + anim + ' —— 流光没跑起来' }
+						}
+						for (const b of pet.ui.toolButtons) {
+							const sp = b.querySelector('.tool-icon')
+							if (b.dataset.tool !== 'banhammer' && sp.classList.contains('flow')) {
+								return { ok: false, reason: '「' + b.dataset.tool + '」也挂了 .flow —— 只有金锤该流动' }
+							}
+						}
+						// 收回去，把工具组还原成进来时的样子
+						if (!toolsBox2.classList.contains('collapsed')) document.getElementById('btn-tools').click()
+						iconTag = { count: keys.length, anim }
+					} catch (e) {
+						return { ok: false, reason: '图标断言失败: ' + e.message }
+					}
+
 					// —— 分类折叠：折起来之后，**钱一变也不能弹回去** ——
 					//
 					// ⚠ 这是折叠功能唯一会真坏的地方。_renderCats 每次都是
@@ -4487,7 +4703,17 @@ function runSelfTest() {
 								}
 							}
 							const pct = (t.chance * 100).toFixed(1) + '%'
-							const want = t.chance > 0 ? pct : t.fromStar ? '吃星空苹果获得' : '无法自然获得'
+							// ⚠ 这三元和 ui._codexGeneCell 里那份**逐字对应**。
+							//   只改一边的话，这条断言会在措辞换掉时红，
+							//   而且报的是「没出现『无法自然获得』」—— 指错方向
+							const want =
+								t.chance > 0
+									? pct
+									: t.fromStar
+										? '吃星空苹果获得'
+										: t.fromTool
+											? '金锤敲出来'
+											: '无法自然获得'
 							if (!cell.textContent.includes(want)) {
 								return {
 									ok: false,
@@ -6220,6 +6446,8 @@ function runSelfTest() {
 					achievementCount: pet.config.achievements.length,
 					flyIconRed,
 					updateVersion: updateInfo ? updateInfo.version : null,
+					banTool: banTag,
+					toolIcons: iconTag,
 				}
 			})()`)
 
@@ -6261,6 +6489,14 @@ function runSelfTest() {
 					'  罐中列表防闪：连刷两次行节点不变、顺序被打乱能排回去\n' +
 					'  玻璃罐：观察模式就能拖（指针在罐上才接管，食物不算），移开后鼠标归还\n' +
 					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
+						'  gold Banhammer：商店里归了类、没买是 .locked（**不是 disabled**）、买前切不过去买后能切、' +
+						'H 键开合、**锤下去真的打在指针那一点**（圈内中圈外不中）、连着两下会被冷却挡住；' +
+						'机制那一半在 `bun run sim` 里（半径 / 五条路都动不了 / 两锤先封后卖 / 售价 ×1.5 / 幼虫价区间）\n' +
+						`  工具图标：${report.toolIcons ? report.toolIcons.count : '?'} 张 12×12 像素图，` +
+							'和按钮一一对应、每张都是 12×12、着色格数够多、**两两不同**、真的装进了按钮且有尺寸、' +
+							'没有污染按钮文字（收起时标题行的工具名还读得对）；' +
+							'金色流动只有金锤那一颗挂了，而且 `animation-name` 真的是 ' +
+							(report.toolIcons ? report.toolIcons.anim : '?') + '\n' +
 						'  越界等级：老存档里超出链长的等级被夹回来（表现为满级），商店照常重建、不抛异常\n' +
 					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +
 					`  检查更新：版本比较按数字段比（1.10.0 比 1.9.0 新，不会认成「已是最新」）、` +
