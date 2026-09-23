@@ -1143,9 +1143,9 @@ button.toggle.on {
 /*
  * 分类标题现在是个**折叠按钮**。
  *
- * ⚠ 只挂 `.cat-toggle`，**不要去改 `.shop-cat-name`** —— 图鉴那两张小标题
- *   （ui._codexSection）用的是同一个类名，改了的话图鉴的标题也会跟着
- *   多出一个悬停底色和手指指针，而它压根不是按钮
+ * ⚠ 只挂 `.cat-toggle`，**不要去改 `.shop-cat-name`** —— 那个类名同时被
+ *   投放 / 商店 / 图鉴三处拿来定字色字号，改这里会三处一起变。
+ *   想改折叠按钮自己的盒模型，就写在这个类里
  *
  * ⚠ 也**不要**复用面板里的 `.fold-toggle` —— 那个有背景色、圆角和 11px 字号，
  *   是给工具栏那种成块的折叠写的；分类标题要轻得多（见上面 `.shop-cat-name`）。
@@ -2594,6 +2594,34 @@ body.booting .inspect {
 	font-size: 9px;
 	line-height: 1.35;
 	color: rgba(200, 190, 175, 0.55);
+}
+
+/*
+ * 工具格子里的快捷键那一行。
+ *
+ * ⚠ 单独一行、用等宽字体：`Esc` / `Shift` 这些词和中文混排时，
+ *   用正文那套字体会宽窄不一，一列格子看下来歪歪扭扭
+ */
+.codex-key {
+	font-size: 9px;
+	line-height: 1.35;
+	color: rgba(232, 184, 75, 0.75);
+	font-family: Consolas, 'Courier New', monospace;
+}
+
+/*
+ * 图鉴每段标题右边那个「N 项」。
+ *
+ * ⚠ 折起来之后标题是玩家唯一看得到的东西，得有个数告诉他里面有多少 ——
+ *   不然「工具」折了还是展着，光看标题分不出来
+ */
+.codex-count {
+	margin-left: auto;
+	font-size: 9px;
+	color: rgba(200, 190, 175, 0.4);
+	/* ⚠ 跟着 caret 一起被 margin-left:auto 推到右边，顺序是
+	   「名字 — N 项 — ▾」；不加这条的话它会贴着名字 */
+	padding-right: 2px;
 }
 
 /*

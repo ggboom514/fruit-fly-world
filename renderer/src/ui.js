@@ -33,7 +33,7 @@ import {
 } from './market.js'
 import { badgesOf } from './mutations.js'
 import { drawFoodIcon, drawFlyIcon } from './render.js'
-import { toolIconMaskUrl } from './toolicons.js'
+import { toolIconMaskUrl, drawPixelIcon } from './toolicons.js'
 
 /** 投放面板上每一行给的两档数量。想加「投 100 个」就往这里加一个数 */
 const FEED_QUANTITIES = [1, 10]
@@ -4207,6 +4207,15 @@ export class UI {
 		const body = this.el.codexBody
 		body.innerHTML = ''
 
+		// ⚠ 顺序 = 图鉴里的顺序。工具排最前，因为它是玩家最先接触的东西
+		//   （一进游戏就在面板上）；食物和基因都是后来才慢慢懂的
+		body.append(
+			this._codexSection(
+				'工具',
+				CONFIG.tools.toolCodex.map((t) => t.id),
+				(id) => this._codexToolCell(id),
+			),
+		)
 		body.append(this._codexSection('食物', this._allFoodIds(), (id) => this._codexFoodCell(id)))
 		body.append(
 			this._codexSection(
@@ -4217,15 +4226,114 @@ export class UI {
 		)
 	}
 
-	/** 图鉴里的一段：小标题 + 格子网格 */
+	/**
+	 * 一格工具：左边画出来（和工具栏按钮上**同一个像素矩阵**，
+	 * 只是画大了），右边名字 + 快捷键 + 说明 + 怎么拿到。
+	 *
+	 * ⚠ 名字和价格**一律从配置现算**，不在这里抄第二遍：
+	 *   要买的走 `market.shop`、要升级的走 `market.roastChain`。
+	 *   抄一份的话，改了价格表图鉴里还印着旧价 —— 而那种「文件里写着假话」
+	 *   没有任何东西会报错
+	 *
+	 * ⚠ 这里**不做「未解锁置灰」**：食物那边置灰是因为星空苹果是个彩蛋，
+	 *   提前剧透就没意思了；而工具是明码标价摆在商店里的，
+	 *   藏起来反而变成「图鉴里怎么少了一格」
+	 */
+	_codexToolCell(id) {
+		const info = CONFIG.tools.toolCodex.find((t) => t.id === id)
+		if (!info) return null
+
+		// 名字 + 价格 + 「怎么拿到」那句话，从登记表的 from 现算
+		let name = info.name ?? id
+		let how = '免费'
+		if (info.from && info.from.shop) {
+			const it = shopItem(info.from.shop)
+			if (it) {
+				name = it.name
+				how = `商店 ${formatMoney(it.price)}`
+			}
+		} else if (info.from && info.from.chain) {
+			const tiers = chainOf(info.from.chain) ?? []
+			const tier = tiers[info.from.level - 1]
+			if (tier) {
+				name = tier.name
+				// 链条是**逐级累加**的，所以「怎么拿到」要把前面的档也说清楚
+				how =
+					info.from.level > 1
+						? `先买${tiers[0].name}（${formatMoney(tiers[0].price)}），再付 ${formatMoney(tier.price)}`
+						: `商店 ${formatMoney(tier.price)}`
+			}
+		}
+
+		const cell = document.createElement('div')
+		cell.className = 'codex-cell'
+		cell.dataset.tool = id
+
+		const css = 34
+		const dpr = window.devicePixelRatio || 1
+		const cv = document.createElement('canvas')
+		cv.className = 'codex-icon tool-preview'
+		cv.width = Math.floor(css * dpr)
+		cv.height = Math.floor(css * dpr)
+		const ctx = cv.getContext('2d')
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+		// 12 格 × 2px = 24px。⚠ 边长必须是**整数**，用小数的图会糊
+		drawPixelIcon(ctx, id, 2, css / 2, css / 2, '#e8b84b')
+
+		const text = document.createElement('div')
+		text.className = 'codex-text'
+		const nameEl = document.createElement('div')
+		nameEl.className = 'codex-name'
+		nameEl.textContent = name
+		const keyEl = document.createElement('div')
+		keyEl.className = 'codex-key'
+		keyEl.textContent = '快捷键 ' + info.key
+		const desc = document.createElement('div')
+		desc.className = 'codex-desc'
+		desc.textContent = info.desc + ' · ' + how
+		text.append(nameEl, keyEl, desc)
+		cell.append(cv, text)
+		return cell
+	}
+
+	/**
+	 * 图鉴里的一段：可折叠的小标题 + 格子网格。
+	 *
+	 * ⚠ 结构**故意和 `_renderCats` 造的一模一样**（`.shop-cat` +
+	 *   `button.cat-toggle` + `.shop-cat-rows`）：这样折叠状态能直接用
+	 *   现成的 `_applyCatFold` 和那份 CSS，不用为图鉴再写一套。
+	 *   自己另发明一套的话，「折起来」这个行为迟早两边不一样
+	 *
+	 * ⚠ 折叠状态的键带 `codex:` 前缀。不加的话「工具」这个分类名和
+	 *   商店里的分组撞上，折了图鉴会顺手把商店那组也折起来 ——
+	 *   而那种 bug 只在同时打开过两张卡的时候出现
+	 */
 	_codexSection(title, ids, cellFor) {
-		const wrap = document.createElement('div')
+		const groupEl = document.createElement('div')
+		groupEl.className = 'shop-cat'
 
-		const head = document.createElement('div')
-		head.className = 'shop-cat-name'
-		head.textContent = title
-		wrap.append(head)
+		const head = document.createElement('button')
+		head.type = 'button'
+		head.className = 'shop-cat-name cat-toggle'
+		const label = document.createElement('span')
+		label.textContent = title
+		const count = document.createElement('span')
+		count.className = 'codex-count'
+		count.textContent = ids.length + ' 项'
+		const caret = document.createElement('span')
+		caret.className = 'caret'
+		caret.textContent = '▾'
+		head.append(label, count, caret)
 
+		const key = 'codex:' + title
+		head.addEventListener('click', () => {
+			if (this.collapsedCats.has(key)) this.collapsedCats.delete(key)
+			else this.collapsedCats.add(key)
+			this._applyCatFold(groupEl, key)
+		})
+
+		const rows = document.createElement('div')
+		rows.className = 'shop-cat-rows'
 		const grid = document.createElement('div')
 		grid.className = 'codex-grid'
 		grid.dataset.codex = title
@@ -4233,8 +4341,11 @@ export class UI {
 			const cell = cellFor(id)
 			if (cell) grid.append(cell)
 		}
-		wrap.append(grid)
-		return wrap
+		rows.append(grid)
+
+		this._applyCatFold(groupEl, key)
+		groupEl.append(head, rows)
+		return groupEl
 	}
 
 	/**

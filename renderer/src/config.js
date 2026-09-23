@@ -1150,6 +1150,35 @@ export const CONFIG = {
 			larvaValueMin: 0.001,
 			larvaValueMax: 0.01,
 		},
+
+		/**
+		 * 图鉴里「工具」那一段的登记表。**顺序就是图鉴里的顺序**，
+		 * 也是工具栏里按钮的顺序。
+		 *
+		 * ⚠ `id` 必须和 `index.html` 里那颗按钮的 `data-tool`、
+		 *   以及 `toolicons.js` 里的图标键**完全一致** ——
+		 *   自检有一条断言钉着这三者（漏一个，那一格就是空白按钮）。
+		 *
+		 * ⚠ **名字不在这里抄第二遍**：带 `from` 的那几件（要买 / 要升级的）
+		 *   名字和价格一律从 `market.shop` / `market.roastChain` 现算，
+		 *   免得改了价格表、图鉴里还写着旧价。只有免费工具才在 `name` 里写死 ——
+		 *   而它们的名字在 HTML 按钮上有一份，所以自检也钉着那两边一致
+		 *
+		 * `key` 是快捷键，`Esc` 那种特殊的照写
+		 */
+		toolCodex: [
+			{ id: 'none', name: '观察', key: 'Esc', desc: '纯看不打扰。鼠标基本穿透，但悬停在玻璃罐上时还能直接拖它' },
+			{ id: 'inspect', name: '查看', key: 'V', desc: '点一下虫弹出数据面板：基因、体重、售价、剩余寿命。罐子里的也能点' },
+			{ id: 'glove', name: '手套', key: 'G', desc: '拖动食物、蛹壳、成虫、尸体；把抓起来的成虫丢进玻璃罐或烤炉' },
+			{ id: 'swatter', name: '苍蝇拍', key: 'F', desc: '拍面在指针的左上方，28px 半径内的虫全拍死，落点还会留一块汁渍' },
+			{ id: 'net', key: 'N', desc: '把附近 62px 内的成虫网进最近的玻璃罐', from: { shop: 'net' } },
+			{ id: 'cloth', name: '抹布', key: 'C', desc: '按住来回滑动，擦掉尸体、污渍和蛹壳。按住不动是擦不掉的' },
+			{ id: 'broom', name: '扫帚', key: 'B', desc: '按住把圈里的幼虫朝外扫开，滚轮调半径 30~200px。只推不杀' },
+			{ id: 'squirt', key: 'W', desc: '按住喷水，冲掉尸体、污渍、蛹壳。滚轮改长度，Shift+滚轮转方向', from: { shop: 'squirt' } },
+			{ id: 'lighter', key: 'R', desc: '按住扫过成虫就把它点着，烧 5 秒后按 ×1.2 自动卖掉', from: { chain: 'roast', level: 1 } },
+			{ id: 'flamer', key: 'R', desc: '同上，但只烧 3 秒、按 ×1.5 卖，而且判定半径大一圈（26 → 60px）', from: { chain: 'roast', level: 2 } },
+			{ id: 'banhammer', key: 'H', desc: '点一下：100px 内的成虫和幼虫全被打上「封禁」。再点一下：圈里已封禁的原地卖掉', from: { shop: 'banhammer' } },
+		],
 	},
 
 	// ================================================================

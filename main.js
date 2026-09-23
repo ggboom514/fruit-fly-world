@@ -2893,7 +2893,12 @@ function runSelfTest() {
 						// ① 键集合必须和按钮**一一对应**。
 						//    ⚠ 只查「有 .tool-icon」是不够的：漏画一个 id 的话，
 						//      那颗按钮就是一面空白，而别的按钮照样有图标
-						const ids = pet.ui.toolButtons.map((b) => b.dataset.tool).sort()
+						// ⚠ idsRaw 是**按钮在 DOM 里的顺序**（工具栏从左到右），
+						//   keys 是排序过的 —— 两者比的是不同的问题：
+						//     · 排过序的比**覆盖**（少了谁 / 多了谁）
+						//     · 不排的比**顺序**（图鉴和工具栏的排列一致）
+						const idsRaw = pet.ui.toolButtons.map((b) => b.dataset.tool)
+						const ids = idsRaw.slice().sort()
 						const keys = Object.keys(ICONS).sort()
 						if (ids.join(',') !== keys.join(',')) {
 							return {
@@ -2998,7 +3003,134 @@ function runSelfTest() {
 						}
 						// 收回去，把工具组还原成进来时的样子
 						if (!toolsBox2.classList.contains('collapsed')) document.getElementById('btn-tools').click()
-						iconTag = { count: keys.length, anim }
+
+						// ⑦ 图鉴里的「工具」那一段
+						//
+						// ⚠ 三份 id 必须**完全一致**：按钮的 data-tool、图标矩阵的键、
+						//   图鉴登记表。任意一处漏了或写错，那一格就是**空白**
+						//   （或者干脆整格消失），而且不报错
+						const codexIds = pet.config.tools.toolCodex.map((t) => t.id)
+						if (codexIds.slice().sort().join(',') !== keys.join(',')) {
+							return {
+								ok: false,
+								reason:
+									'图鉴登记表和图标键对不上：登记表 [' + codexIds.join(',') +
+									']，图标 [' + keys.join(',') + ']',
+							}
+						}
+						// 图鉴里的排列顺序要和工具栏一致 —— 玩家在面板上从左到右
+						// 认熟的顺序，翻图鉴不该变成另一套
+						if (codexIds.join(',') !== idsRaw.join(',')) {
+							return {
+								ok: false,
+								reason:
+									'图鉴登记表的顺序和工具栏按钮不一致：登记表 [' + codexIds.join(',') +
+									']，按钮 [' + idsRaw.join(',') + ']',
+							}
+						}
+
+						// 打开图鉴，看那一段真的渲染出来了
+						document.getElementById('btn-codex').click()
+						pet.ui.refreshCodex()
+						const sec = pet.ui.el.codexBody.querySelector('[data-codex="工具"]')
+						if (!sec) return { ok: false, reason: '图鉴里没有「工具」这一段' }
+						const toolCells = sec.querySelectorAll('.codex-cell')
+						if (toolCells.length !== codexIds.length) {
+							return {
+								ok: false,
+								reason: '工具那一段有 ' + toolCells.length + ' 格，应当是 ' + codexIds.length + ' 格',
+							}
+						}
+						for (const c of toolCells) {
+							const id2 = c.dataset.tool
+							if (!c.querySelector('canvas')) {
+								return { ok: false, reason: '工具格「' + id2 + '」里没有画布' }
+							}
+							if (!c.textContent.includes('快捷键')) {
+								return { ok: false, reason: '工具格「' + id2 + '」没有显示快捷键' }
+							}
+						}
+
+						// ⑧ 免费工具的名字，图鉴里和按钮上必须是**同一个**
+						//
+						// ⚠ 带 from 的那几件不用比：它们的名字是从商店配置现算的
+						//   （见 config.toolCodex 那段注释），不可能漂。
+						//   免费工具的名字在 HTML 按钮上有一份、登记表里又有一份，
+						//   这份重复就是靠这条断言钉住的
+						for (const t of pet.config.tools.toolCodex) {
+							if (t.from || !t.name) continue
+							const btn2 = pet.ui.toolButtons.find((b) => b.dataset.tool === t.id)
+							if (!btn2) continue
+							if (btn2.textContent.trim() !== t.name) {
+								return {
+									ok: false,
+									reason:
+										'工具「' + t.id + '」在图鉴里叫「' + t.name +
+										'」，按钮上却是「' + btn2.textContent.trim() + '」',
+								}
+							}
+						}
+						// ⑨ 三段都能折起来，而且**折了不影响别的**
+						//
+						// ⚠ 最后那一半才是重点：折叠状态的键如果不加
+						//   一个 codex 前缀，「工具」这个分类名会和商店里的分组撞上，
+						//   折了图鉴会顺手把商店那组也折起来
+						// ⚠ 从 codexBody 找，不是从 sec 的父节点 ——
+						//   sec 本身就是一格 [data-codex]，往上只一层的话
+						//   只会找到它自己（实得 1 而不是 3）
+						const heads = pet.ui.el.codexBody.querySelectorAll('[data-codex]')
+						if (heads.length !== 3) {
+							return { ok: false, reason: '图鉴应当有三段（工具 / 食物 / 基因），实得 ' + heads.length }
+						}
+						for (const grid of heads) {
+							const groupEl = grid.closest('.shop-cat')
+							const hd = groupEl.querySelector('.cat-toggle')
+							if (!hd) return { ok: false, reason: '图鉴「' + grid.dataset.codex + '」那一段没有折叠按钮' }
+							if (groupEl.classList.contains('collapsed')) {
+								return { ok: false, reason: '图鉴那几段默认就该是**展开**的' }
+							}
+							const shown = () => getComputedStyle(groupEl.querySelector('.shop-cat-rows')).display !== 'none'
+							if (!shown()) {
+								return { ok: false, reason: '图鉴「' + grid.dataset.codex + '」展开着却看不见' }
+							}
+							hd.click()
+							if (!groupEl.classList.contains('collapsed') || shown()) {
+								return { ok: false, reason: '点了「' + grid.dataset.codex + '」的标题却没折起来' }
+							}
+							// 折起来的时候**别的段不能被带着一起折**
+							for (const other of heads) {
+								if (other === grid) continue
+								if (other.closest('.shop-cat').classList.contains('collapsed')) {
+									return {
+										ok: false,
+										reason:
+											'折了「' + grid.dataset.codex + '」，把「' + other.dataset.codex +
+											'」也一起折了 —— 折叠状态的键撞上了',
+									}
+								}
+							}
+							hd.click()
+							if (groupEl.classList.contains('collapsed') || !shown()) {
+								return { ok: false, reason: '再点一下「' + grid.dataset.codex + '」没有展开' }
+							}
+						}
+						pet.ui._onKey({ code: 'Escape' })
+
+						// ⚠ 画布上得有东西。只查「有 canvas」的话，一张全透明的
+						//   空图照样过 —— 而屏幕上就是一块空白
+						const probe = pet.ui.el.codexBody.querySelector('[data-codex="工具"] .codex-cell canvas')
+						if (probe) {
+							const pctx = probe.getContext('2d')
+							const img = pctx.getImageData(0, 0, probe.width, probe.height).data
+							let solid = 0
+							for (let i = 3; i < img.length; i += 4) if (img[i] > 0) solid++
+							if (solid === 0) {
+								return { ok: false, reason: '工具图鉴的画布上一个不透明像素都没有 —— 图标没画上去' }
+							}
+							iconTag = { count: keys.length, anim, codexPixels: solid }
+						} else {
+							iconTag = { count: keys.length, anim, codexPixels: 0 }
+						}
 					} catch (e) {
 						return { ok: false, reason: '图标断言失败: ' + e.message }
 					}
