@@ -135,13 +135,74 @@ body.dragging * {
 	color: #ffd6d0;
 }
 
-/* 最小化：整块主体收起，只剩标题栏一条 */
-.window.minimized .body {
+/*
+ * 面板收起：面板和罐子小窗**整块**收掉，屏幕上只留飞的虫 + 右下角那个把手。
+ *
+ * ⚠ 类挂在 #hud 上，不是分别挂到那两个元素上。两个理由：
+ *   1. 一次 toggle 是原子的 —— 不会出现「面板收了、罐子窗忘了收」这种半截状态
+ *   2. `refreshJarList()` 也在 toggle `#jar-window` 自己的 .hidden（罐子空了就藏），
+ *      两边各用一个类，谁也不会把谁顶掉
+ *
+ * （这里原来是一对 `.window.minimized` 规则 —— 「收成只剩标题栏」。
+ *   那个中间态没有了：折叠分区 .fold 已经提供了紧凑形态，不必再多一层。）
+ */
+#hud.panel-away #panel,
+#hud.panel-away #jar-window {
 	display: none;
 }
 
-.window.minimized .titlebar {
-	border-bottom: none;
+/*
+ * 收起之后右下角那个把手。点一下把面板叫回来。
+ *
+ * ⚠ 它**必须点得到** —— 进了 ui._updateInteractive() 的 need（见 _overHandle）。
+ *   所以 pointer-events: auto，而且**不能**像 #starfield 那样铺满整屏：
+ *   铺满整屏的图层一旦吃掉鼠标，桌面点击会整个没反应
+ *
+ * 位置钉在右下角（任务栏正上方）。样式照 .jar-window 那一套 ——
+ * 半透明 + 描边 + backdrop-filter，一眼看得出是同一套 UI
+ */
+.panel-handle {
+	position: fixed;
+	right: 14px;
+	bottom: 14px;
+	z-index: 26;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 5px 10px 5px 7px;
+	border-radius: 999px;
+	background: var(--bg);
+	border: 1px solid var(--border);
+	backdrop-filter: blur(14px) saturate(1.25);
+	-webkit-backdrop-filter: blur(14px) saturate(1.25);
+	box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+	font-size: 11px;
+	color: var(--muted);
+	cursor: pointer;
+	pointer-events: auto;
+	transition: color 0.12s ease, border-color 0.12s ease;
+}
+
+.panel-handle:hover {
+	color: var(--text);
+	border-color: rgba(255, 255, 255, 0.28);
+}
+
+/* 那个小圆点：一个亮点，暗示「这里还留了东西」 */
+.handle-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--accent);
+	box-shadow: 0 0 6px rgba(224, 169, 79, 0.75);
+}
+
+/*
+ * ⚠ 这个项目**没有**通用的 `.hidden { display: none }` —— 每个 .hidden
+ *   都是各自限定作用域的，所以这里必须自己写一条，光加 class 不管用
+ */
+.panel-handle.hidden {
+	display: none;
 }
 
 .body {
@@ -2044,7 +2105,13 @@ body.booting .inspect {
 	min-width: 132px;
 	padding: 7px 9px 8px;
 	border-radius: 9px;
-	background: rgba(18, 16, 14, 0.9);
+	/*
+	 * ⚠ 卡片底色提成一个变量：传说生物那一档要用**两层 background** 把彩虹画进
+	 *   边框里（见 .tier-mythic 那段），第二层得把这同一个颜色再写一遍。
+	 *   写死两份的话，以后调底色必然只改一处，然后那一档的卡片会比别人歪一层
+	 */
+	--card-bg: rgba(18, 16, 14, 0.9);
+	background: var(--card-bg);
 	border: 1px solid var(--tier, #e8e2d8);
 	backdrop-filter: blur(10px);
 	-webkit-backdrop-filter: blur(10px);
@@ -2292,30 +2359,76 @@ body.booting .inspect {
 }
 
 /*
- * 边框流动 / 反光扫过。
+ * 描边流光（极稀有 / 超级稀有 / 传说生物 三档）。
  *
- * 两档共用 .fx 这个类（由 ui.js 按价值档加上），各自用伪元素：
- *   ::before 画边框 —— 和 .gold 是同一套 mask 裁切
- *   ::after  扫反光 —— 一道斜着的白色高光横穿整张卡片
+ * 做法：**把渐变画进边框本身**，再拿 `border-flow` 推着它走。
+ *   · `border-color: transparent` 把那 1px 让出来
+ *   · 第一层 background（clip: padding-box）= 卡片底色，只铺内容区
+ *   · 第二层 background（clip: border-box，宽 300%）= 会流动的渐变，
+ *     铺满整张但**只有边框那一圈露得出来**
  *
- * ⚠ ::after 的 transform 会和卡片自身的定位抢属性，所以卡片的位置只用 left/top，
- *   动画全交给伪元素
+ * ⚠⚠ 这里**以前不是这么做的**，改法值得记一笔：原来是在边框**内侧**再套一个
+ *   伪元素，用 `mask: 整块 ⊕ content-box` 挖空中间挖出一圈来。那个做法有个
+ *   一直没被发现的硬伤 —— **四个角上它根本没画出来**：
+ *
+ *     mask 挖的洞是 `content-box`，一个**方角**矩形；而卡片是
+ *     `border-radius: 9px` 的圆角。圆角那段弧离盒子角大约 2.6px，
+ *     方洞的角却只离 1px —— 方洞把整个圆角区域**吃干净了**。
+ *     于是四个角上光环完全不存在，只剩卡片自己那条 1px 实线，
+ *     看上去就是「角上缺一块、透着桌面」。
+ *     （实测：8 倍截图看不出来 —— 得换成亮背景再逐像素扫才抓得到。
+ *       把环的圆角从 9px 改成 8px 是**没用**的：方洞的角永远比圆弧更靠近盒角。）
+ *
+ *   画进边框里就没这回事了：边框的形状完全由卡片自己的 border-radius 决定。
+ *   **要动这一块，别退回伪元素 + mask 那套。**
+ *
+ * ⚠ 渐变的首尾**必须同色**（这里都是 `var(--tier)`）。图是 300% 宽、会 repeat 的，
+ *   首尾不同色的话每一圈接缝处会闪一下。同理，底色也必须是实心的 --tier 而不是
+ *   transparent —— 边框现在是**这一层在画**，中间挖个透明的谷就等于那一段边框
+ *   直接消失、桌面透出来（这个坑上一版踩过：光画一道会跑的高光，安静期边框是空的）
+ *
+ * ⚠ 卡片上现在有**两个**动画：入场淡入 + 这条流动。写成逗号分隔的两条。
+ *   `border-flow` 的关键帧只动 `background-position`，对第一层（100% 宽）没有
+ *   任何影响，所以不会把卡片底色也推着跑
  */
-.inspect.fx::before {
-	content: '';
-	position: absolute;
-	inset: 0;
-	border-radius: inherit;
-	padding: 1px;
-	background: linear-gradient(90deg, transparent, var(--tier), #fff, var(--tier), transparent);
-	background-size: 300% 100%;
-	-webkit-mask:
-		linear-gradient(#fff 0 0) content-box,
-		linear-gradient(#fff 0 0);
-	-webkit-mask-composite: xor;
-	mask-composite: exclude;
-	animation: border-flow 2.4s linear infinite;
-	pointer-events: none;
+.inspect.fx {
+	border-color: transparent;
+	/*
+	 * ⚠ 内芯那层**叠了两遍**，不是写重复了。
+	 *
+	 * 描边那层是 `border-box` 的 —— 它铺满**整个卡片矩形**，不是只铺边框那一圈
+	 * （CSS 没有「只画边框」的裁剪，能用的只有 mask 挖洞，而那套会把四个圆角吃掉，
+	 *   见上面那段）。上面的内芯层把它盖住，可是内芯是 `rgba(18,16,14,0.9)` ——
+	 * **10% 透光**，于是那道流光会从内部透出来，在卡片中间多出一道会动的光，
+	 * 和反光扫过叠在一起。用户的原话是「内部也有，观感不好」。
+	 *
+	 * 叠两遍就把它压到 1%（0.1 × 0.1），肉眼看不见了；
+	 * 而这一档该有的半透感还在 —— 桌面仍然从那 1% 里透出来。
+	 * 换成不透明的底色也行，但那会让这三档和另外三档**看着不一样**，不划算
+	 */
+	background:
+		linear-gradient(var(--card-bg), var(--card-bg)) padding-box,
+		linear-gradient(var(--card-bg), var(--card-bg)) padding-box,
+		linear-gradient(
+				90deg,
+				var(--tier) 0%,
+				var(--tier) 44%,
+				#fff 50%,
+				var(--tier) 56%,
+				var(--tier) 100%
+			)
+			border-box;
+	background-size:
+		100% 100%,
+		100% 100%,
+		300% 100%;
+	/*
+	 * 一轮 3.4s 里渐变推两个循环，也就是光每 1.7 秒扫过一趟。
+	 * 觉得快/慢就改这一个数
+	 */
+	animation:
+		inspect-in 0.14s ease,
+		border-flow 3.4s linear infinite;
 }
 
 .inspect.sheen::after {
@@ -2370,16 +2483,65 @@ body.booting .inspect {
 	--tier: #b98cff; /* 紫 */
 }
 .inspect.tier-epic {
-	--tier: #f0c04a; /* 金 + 边框流动 */
+	--tier: #f0c04a; /* 金 */
 }
 .inspect.tier-legendary {
-	--tier: #ff6b5e; /* 红 + 流动 + 反光扫过 */
+	--tier: #ff6b5e; /* 红 + 反光扫过 */
 }
 .inspect.tier-mythic {
 	/*
-	 * 最高那一档：淡彩。
-	 * 基色取偏青的浅色，和流动的高光叠起来就是「彩虹感」——
-	 * 这是六档里唯一一个**故意不固定**的颜色，所以它才读得出「传说」。
+	 * 最高那一档：淡彩 + **会流动的炫彩描边**。
+	 *
+	 * ⚠ 上面这个 `--tier` **不要动**：它同时喂着卡片上另外四处 —— 稀有度那行小字、
+	 *   售价、性别符号、成长条。它只是「这一档的基准色」，描边那道彩虹是它之外的事。
+	 *   ⚠ 自检里有一条钉着 `borderTopColor`，而这一档的边框是**透明**的
+	 *     （见下面），所以那条断言对它是特例 —— 改这两处要一起改
 	 */
 	--tier: #9fe8d8;
+
+	/*
+	 * —— 炫彩描边 ——
+	 *
+	 * 和上面 `.inspect.fx` 是**同一套做法**（画进边框本身 + `border-flow` 推着走），
+	 * 只是换了渐变的内容：那边是「实色底 + 一道白光扫过」，
+	 * 这边是**一整条彩虹在慢慢淌**。用户要的就是这个 ——
+	 * 「像结晶突变的生物描边一样会流动」（结晶那圈就是慢慢转的彩虹）。
+	 *
+	 * ⚠ 这一段**必须排在 `.inspect.fx` 之后**：两者特异性一样（都是两个类），
+	 *   谁赢全靠源码顺序
+	 *
+	 * ⚠ 时长比另外两档慢得多（3.4s → 8s）。那两档是「一道光扫过去」，
+	 *   这一档是「颜色在淌」—— 用同样的速度，彩虹会转得像走马灯，反而廉价
+	 *
+	 * ⚠ 六个色标**首尾同色**（都是淡玫瑰）。图是 300% 宽、会 repeat 的，
+	 *   首尾不同色的话每转一圈会在接缝处闪一下
+	 *
+	 * ⚠ 颜色都是低饱和的淡彩，这是用户要的「淡淡的、不用太高饱和度」。
+	 *   想更艳就换深一点的色相，别加 alpha —— 这一层就是边框本身，
+	 *   带 alpha 的话边框会变半透明，桌面会从那 1px 里透出来
+	 */
+	border-color: transparent;
+	/* 内芯同样叠两遍 —— 理由和 `.inspect.fx` 那段一样：彩虹那一层铺满整个卡片矩形，
+	   单层 0.9 的底色会让它在内部透出来。这一档的彩虹虽然淡，透出来照样是和
+	   反光扫过打架的第二道光 */
+	background:
+		linear-gradient(var(--card-bg), var(--card-bg)) padding-box,
+		linear-gradient(var(--card-bg), var(--card-bg)) padding-box,
+		linear-gradient(
+				90deg,
+				#d9a7bb 0%,
+				#dcc191 20%,
+				#a6cfb4 40%,
+				#a3b8d9 60%,
+				#bcaed6 80%,
+				#d9a7bb 100%
+			)
+			border-box;
+	background-size:
+		100% 100%,
+		100% 100%,
+		300% 100%;
+	animation:
+		inspect-in 0.14s ease,
+		border-flow 8s linear infinite;
 }

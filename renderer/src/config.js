@@ -1208,6 +1208,15 @@ export const CONFIG = {
 		//   两者没有一一对应 —— 一只超重蝇落在「稀有」还是「极稀有」，
 		//   取决于它抽到的体重和身上带没带基因，光看 rarity 是不知道的
 		valueTiers: [
+			// `flow` = 描边会不会流动（在 style.css 的 `.inspect.fx` 里实现）。
+			// ⚠ 金 / 红 / 淡彩这三档的流法是**不一样**的：
+			//   金、红 = 实色底 + 一道白光扫过（3.4s）
+			//   淡彩   = 一整条彩虹慢慢淌（8s，`.inspect.tier-mythic` 里覆盖）
+			//   想调速度就改各自那条 `animation`
+			//
+			// ⚠ 加档位时留神：「流动」要真的看得见，底色就必须是**实心**的。
+			//   早先那版把流光画成「一道会跑的窄光 + 中间挖空」，安静期边框是空的 ——
+			//   桌面会从那一圈透出来
 			{ id: 'common', name: '普通', upper: 0.02, color: '#e8e2d8', flow: false, sheen: false },
 			{ id: 'uncommon', name: '罕见', upper: 0.1, color: '#6fb3ff', flow: false, sheen: false },
 			{ id: 'rare', name: '稀有', upper: 10, color: '#b98cff', flow: false, sheen: false },

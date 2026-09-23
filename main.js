@@ -10,12 +10,18 @@
  * 鼠标穿透的核心思路：
  *   窗口默认「穿透」——鼠标事件直接落到桌面上，你该怎么用电脑还怎么用。
  *   但 forward:true 让渲染进程依然收得到 mousemove，
- *   于是渲染进程可以判断「指针是不是压在工具栏上」：
- *     压在工具栏 / 手里拿着苍蝇拍  → 关闭穿透，接管鼠标
- *     其余时候                     → 恢复穿透，不挡路
+ *   于是渲染进程可以判断「指针是不是压在这扇窗口自己的 UI 上」：
+ *     压在面板 / 罐子小窗 / 小卡 / 收起后的把手上  → 关闭穿透，接管鼠标
+ *     其余时候（**包括手里拿着工具**）              → 恢复穿透，不挡路
+ *
+ * 窗口层级（置顶开关）：
+ *   开 → 'screen-saver' 层，压在所有窗口之上
+ *   关 → 先取消置顶，再用 Win32 的 SetWindowPos 把它推到**所有普通窗口之下**
+ *        （仍在桌面之上）。Electron 没有「往下推」这个 API，见 sinkToBottom()
  */
 
 const { app, BrowserWindow, ipcMain, globalShortcut, screen, Menu } = require('electron')
+const { execFile } = require('child_process')
 const path = require('path')
 const fs = require('fs')
 
@@ -68,7 +74,21 @@ function createWindow() {
 		minimizable: false,
 		maximizable: false,
 		fullscreenable: false,
-		skipTaskbar: true,
+		/*
+		 * ⚠ skipTaskbar **必须是 false**。这不是「多个图标好不好看」的取舍，
+		 *   是**窗口还能不能叫回来**的问题：
+		 *
+		 *   置顶一关，Win+D / 任务栏最右边那条「显示桌面」就会把它**最小化** ——
+		 *   而上面那句 `minimizable: false` **挡不住系统这一下**。
+		 *   实测（照抄这套窗口参数跑了一遍）：最小化前窗口在 z#38、桌面 z#49，
+		 *   在桌面之上；被 ShowWindow(SW_MINIMIZE) 之后变成 z#214、桌面 z#47 ——
+		 *   **沉到桌面下面去了**，桌面上什么都看不见。
+		 *
+		 *   跳过了任务栏就等于**没有任何入口能把它叫回来**：窗口不在任务栏里，
+		 *   全屏透明又没有标题栏可点，Ctrl+Shift+T 虽然还能切换置顶，
+		 *   但玩家根本不知道要按它 —— 表现就是「关掉置顶游戏就没了」。
+		 */
+		skipTaskbar: false,
 		show: false,
 		// 见到屏幕才显示，避免启动瞬间闪一下白框
 		webPreferences: {
@@ -83,6 +103,26 @@ function createWindow() {
 	// 'screen-saver' 层级能压住绝大多数全屏应用；普通 'floating' 会被盖
 	win.setAlwaysOnTop(true, 'screen-saver')
 	win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+	/*
+	 * 被系统最小化（Win+D / 点「显示桌面」）之后，**置顶状态下立刻抢回来**。
+	 *
+	 * 玩家既然开着置顶，意思就是「要它一直在我眼前」—— 「显示桌面」不该把它弄没。
+	 * 抢回来是安全的：置顶的窗口本来就压在别的东西上面，不占谁的位。
+	 *
+	 * ⚠ 置顶**关着**的时候不拦。那时它就是一个普通窗口，缩下去是正常的，
+	 *   而且现在有任务栏按钮，点一下就能回来（见 skipTaskbar 那段）
+	 */
+	win.on('minimize', () => {
+		if (alwaysOnTop && !win.isDestroyed()) win.restore()
+	})
+
+	// 从任务栏里叫回来之后，如果当前是「不置顶」，得**重新沉一次底** ——
+	// restore 之后窗口会回到普通窗口带，不推一把的话它会浮在其他窗口上面，
+	// 而玩家选的是「不置顶 = 别的窗口能盖住我」
+	win.on('restore', () => {
+		if (!alwaysOnTop) sinkToBottom()
+	})
 
 	// 自检模式带个 query 进去，渲染进程据此跳过启动存档弹窗 ——
 	// 那个弹窗要等人点，自检会一直卡在那儿。同时它也会关掉自动存档，
@@ -1219,14 +1259,89 @@ function runSelfTest() {
 				if (!panel || !bar || !minBtn) {
 					return { ok: false, reason: '工具栏小窗的 DOM 不完整（panel / titlebar / btn-min）' }
 				}
-				if (typeof pet.ui.toggleMinimize !== 'function') {
-					return { ok: false, reason: 'ui.toggleMinimize 不存在' }
+				// —— 面板收起 / 展开 ——
+				//
+				// 收起 = 面板和罐子小窗**整块**收掉，屏幕上只剩飞的虫 + 右下角那个把手；
+				// 点把手叫回来。类挂在 #hud 上（见 style.css），所以这里查的是 #hud。
+				//
+				// ⚠ 必须查**可见性**（offsetWidth / computed display），不能只查 class ——
+				//   「类加对了但 CSS 选择器写错」和「什么都对」在 class 上长得一模一样。
+				//   这个项目没有通用的 .hidden { display:none }，写漏一条就正好是这个症状
+				const handle = document.getElementById('panel-handle')
+				if (!handle) return { ok: false, reason: '卡片里没有 #panel-handle（收起之后叫不回面板）' }
+				if (typeof pet.ui.setPanelAway !== 'function') {
+					return { ok: false, reason: 'ui.setPanelAway 不存在' }
 				}
-				pet.ui.toggleMinimize()
-				const wentMin = panel.classList.contains('minimized')
-				pet.ui.toggleMinimize()
-				const cameBack = !panel.classList.contains('minimized')
-				if (!wentMin || !cameBack) return { ok: false, reason: '最小化切换不工作' }
+				const hud = document.getElementById('hud')
+				const jarWin = document.getElementById('jar-window')
+				const visible = (el) => el.offsetWidth > 0 || el.offsetHeight > 0
+
+				if (!visible(panel)) return { ok: false, reason: '一开始面板就是不可见的' }
+				if (visible(handle)) return { ok: false, reason: '没收起时右下角那个把手就已经露出来了' }
+
+				pet.ui.setPanelAway(true)
+				if (!hud.classList.contains('panel-away')) {
+					return { ok: false, reason: '收起之后 #hud 上没有 panel-away 类' }
+				}
+				if (visible(panel)) {
+					return { ok: false, reason: '收起之后面板还看得见 —— 检查 style.css 里 #hud.panel-away #panel 那条' }
+				}
+				if (jarWin && visible(jarWin)) {
+					return { ok: false, reason: '收起之后罐中果蝇小窗还看得见 —— 它应当跟着面板一起收' }
+				}
+				if (!visible(handle)) {
+					return { ok: false, reason: '收起之后把手没露出来 —— 那样面板就再也叫不回来了' }
+				}
+
+				// 把手必须**点得到**：它要进 _updateInteractive 的 need，
+				// 否则窗口穿透时那一下点击会落到桌面上（和「观察模式拖罐子」同一个坑）
+				const savedMouse = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+				const hr = handle.getBoundingClientRect()
+				pet.view.mouse.x = hr.left + hr.width / 2
+				pet.view.mouse.y = hr.top + hr.height / 2
+				pet.ui._updateInteractive()
+				const overHandle = pet.ui.interactive
+				pet.view.mouse.x = savedMouse.x
+				pet.view.mouse.y = savedMouse.y
+				if (!overHandle) {
+					return { ok: false, reason: '指针压在把手上，窗口却不接管鼠标 —— 那一下点击会落到桌面上，把手点不动' }
+				}
+
+				// 点一下把手 → 面板回来、把手收起来
+				handle.click()
+				if (hud.classList.contains('panel-away')) {
+					return { ok: false, reason: '点了把手，panel-away 类还在' }
+				}
+				if (!visible(panel)) return { ok: false, reason: '点了把手面板没回来' }
+				if (visible(handle)) return { ok: false, reason: '面板回来了，把手却还露着' }
+				pet.ui._updateInteractive()
+
+				// —— 穿透才是主开关 ——
+				//
+				// 手里拿着工具、指针在**空白画布**上 → 不该接管鼠标。
+				// 这一条以前是反的：_updateInteractive 的 need 里有一条
+				// 一句 this.view.tool !== 'none'，于是「一拿起工具，整扇全屏窗口
+				// 就把桌面点击全吃掉」。删掉那条之后，拿什么工具都能正常点桌面。
+				//
+				// ⚠ 这条和「穿透关掉时整扇窗口接管」是一对：那个由主进程的
+				//   clickThroughEnabled 决定，渲染进程这边看不见，所以自检只钉得住这一半
+				const savedTool = pet.view.tool
+				const savedM2 = { x: pet.view.mouse.x, y: pet.view.mouse.y }
+				pet.ui.setTool('swatter')
+				pet.view.mouse.x = 5
+				pet.view.mouse.y = 5 // 左上角，离面板、罐子窗、小卡都很远
+				pet.ui._updateInteractive()
+				const toolCaptured = pet.ui.interactive
+				pet.ui.setTool(savedTool)
+				pet.view.mouse.x = savedM2.x
+				pet.view.mouse.y = savedM2.y
+				pet.ui._updateInteractive()
+				if (toolCaptured) {
+					return {
+						ok: false,
+						reason: '手里拿着工具、指针在空白画布上，窗口还是接管了鼠标 —— 桌面点击会被整个吃掉',
+					}
+				}
 
 				// 工具折叠：默认收起 → 点开 → 五个按钮真的可见 → 点了工具标题行跟着变 → 再点收起。
 				// 这条链路上「展开后按钮还是不可见」是最容易出的错（display:none 挂错了层），
@@ -2292,16 +2407,22 @@ function runSelfTest() {
 					// ⚠ 价格区间改过一次（0.02 / 0.1 / 10 / 100 / 1000），
 					//   所以这里的取值也跟着挪了：$5 以前是极稀有，现在归稀有。
 					//   两个地方要一起改，漏掉的话报出来的是「名字不对」而其实是档位挪了
+					// ⚠ 边框色那一栏有个**特例**：会流动的那三档（金 / 红 / 淡彩）
+					//   边框是**透明**的 —— 它们描边的颜色来自 background 的
+					//   border-box 那一层，实色边框必须让成透明，不然会把它盖掉
+					//   （见 style.css 的 .inspect.fx）。那一层在不在由下面单独一条查
+					//
+					// 每行：[价值, 类名, 边框色, 名字, 描边流动, 反光扫过]
 					const cases = [
 						[0.002, 'tier-common', 'rgb(232, 226, 216)', '普通', false, false],
 						[0.05, 'tier-uncommon', 'rgb(111, 179, 255)', '罕见', false, false],
 						[0.5, 'tier-rare', 'rgb(185, 140, 255)', '稀有', false, false],
-						[50, 'tier-epic', 'rgb(240, 192, 74)', '极稀有', true, false],
-						[500, 'tier-legendary', 'rgb(255, 107, 94)', '超级稀有', true, true],
-						[5000, 'tier-mythic', 'rgb(159, 232, 216)', '传说生物', true, true],
+						[50, 'tier-epic', 'rgba(0, 0, 0, 0)', '极稀有', true, false],
+						[500, 'tier-legendary', 'rgba(0, 0, 0, 0)', '超级稀有', true, true],
+						[5000, 'tier-mythic', 'rgba(0, 0, 0, 0)', '传说生物', true, true],
 						// 多出来的这一行：最后一档的上界是 Infinity，
 						// 所以再贵也不会「超出范围」掉到 undefined
-						[9.9e9, 'tier-mythic', 'rgb(159, 232, 216)', '传说生物', true, true],
+						[9.9e9, 'tier-mythic', 'rgba(0, 0, 0, 0)', '传说生物', true, true],
 					]
 					// 档数要和配置对得上 —— 少写一行的话，那一档的颜色 / 名字
 					// 就完全没人查了，而表面上一切正常
@@ -2316,7 +2437,7 @@ function runSelfTest() {
 								' 档 —— 有档位没被检查到',
 						}
 					}
-					for (const [v, want, rgb, name, fx, sheen] of cases) {
+					for (const [v, want, rgb, name, flow, sheen] of cases) {
 						pet.ui._showInspect(fake(v))
 						if (!inspect.classList.contains(want)) {
 							return { ok: false, reason: '价值 $' + v + ' 的卡片类名里没有 ' + want + '（实际 ' + inspect.className + '）' }
@@ -2329,10 +2450,11 @@ function runSelfTest() {
 									'」，按价值分档应当是「' + name + '」',
 							}
 						}
-						// 金色及以上才有边框流动，最高档还多一层反光扫过
-						if (inspect.classList.contains('fx') !== fx) {
-							return { ok: false, reason: '价值 $' + v + ' 的流动特效开关不对（' + inspect.className + '）' }
+						// 金 / 红 / 淡彩三档的描边会流动
+						if (inspect.classList.contains('fx') !== flow) {
+							return { ok: false, reason: '价值 $' + v + ' 的描边流动开关不对（' + inspect.className + '）' }
 						}
+						// 最高两档多一层反光扫过
 						if (inspect.classList.contains('sheen') !== sheen) {
 							return { ok: false, reason: '价值 $' + v + ' 的反光扫过开关不对（' + inspect.className + '）' }
 						}
@@ -2345,8 +2467,21 @@ function runSelfTest() {
 						if (cs.display === 'none') {
 							return { ok: false, reason: '价值 $' + v + ' 的卡片是 display:none' }
 						}
-						if (cs.animationName !== 'inspect-in') {
-							return { ok: false, reason: '卡片的入场动画是 ' + cs.animationName + '，应当是 inspect-in' }
+						// ⚠ 卡片上有**两个**动画（入场淡入 + 描边流动），
+						//   animationName 读回来是「inspect-in, border-flow」这种
+						//   逗号分隔的串 —— 不能拿整串去 === 'inspect-in'，
+						//   那样只要加了流动就会红
+						const anims = cs.animationName.split(',').map((s) => s.trim())
+						if (!anims.includes('inspect-in')) {
+							return { ok: false, reason: '卡片的入场动画是 ' + cs.animationName + '，里面应当有 inspect-in' }
+						}
+						// 会流动的那三档必须**真的挂着** border-flow ——
+						// 只加类名不写动画的话，卡片看着一切正常，只是永远不动
+						if (flow !== anims.includes('border-flow')) {
+							return {
+								ok: false,
+								reason: '价值 $' + v + ' 的描边流动动画对不上（animation-name: ' + cs.animationName + '）',
+							}
 						}
 						// 卡片必须自己裁掉溢出的内容 —— 这是那道反光唯一的约束：
 						// 它是一条和卡片等大的横条，translateX 走到两头时整个身子在
@@ -2362,6 +2497,30 @@ function runSelfTest() {
 								reason:
 									'价值 $' + v + ' 的卡片没有裁掉溢出的内容（overflow: ' + cs.overflow +
 									'）—— 反光扫过会从卡片边上飞出去扫到桌面上',
+							}
+						}
+						// 会流动的那三档：靠**三层背景**画出来 ——
+						// 内芯两层（padding-box，叠两遍把透光压到 1%）+ 描边一层
+						// （border-box，会流动的渐变）。
+						//
+						// ⚠ 内芯少一层的话，描边那层会从那 10% 的透光里透出来，
+						//   卡片中间会多出一道会动的光，和反光扫过叠在一起
+						//   （用户报过这个）。内芯多一层没意义但也不出错，
+						//   所以这里卡的是**正好三层**
+						//
+						// ⚠ 用 split 而不是正则：这一段整个住在一个模板字符串里，
+						//   正则里那个「反斜杠 + 左括号」会被模板字符串当成转义、
+						//   吃掉反斜杠，于是只剩一个没配对的左括号 ——
+						//   整个自检当场 SyntaxError（这条我自己踩过一次）
+						if (flow) {
+							const layers = getComputedStyle(inspect).backgroundImage.split('linear-gradient(').length - 1
+							if (layers !== 3) {
+								return {
+									ok: false,
+									reason:
+										'价值 $' + v + ' 的流动描边有 ' + layers + ' 层背景，应当是 3 层' +
+										'（内芯两层 padding-box + 会流动的渐变 border-box）',
+								}
 							}
 						}
 						if (cs.borderTopColor !== rgb) {
@@ -4553,10 +4712,95 @@ function syncState() {
 	})
 }
 
+/*
+ * 把窗口沉到**所有普通窗口之下**（但仍高于桌面）。
+ *
+ * 为什么要绕这一下：Electron 只有 `setAlwaysOnTop(false)`（取消置顶，窗口留在
+ * 原来那一层）和 `moveTop()`（往上），**没有「推到最底」这个 API**。
+ * 玩家要的是「关掉置顶时，别的窗口能盖住它，但在桌面上还看得见」——
+ * 光取消置顶做不到：窗口会停在它当时那一层，别的窗口不一定盖得住它。
+ *
+ * 所以直接调 Win32 的 SetWindowPos：
+ *   hWndInsertAfter = HWND_BOTTOM(1)        —— 沉到普通窗口带的最底下
+ *   flags = SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE (0x13) —— 不动位置尺寸，也不激活
+ *
+ * ⚠ 拿不到 hwnd、或者 PowerShell 被安全策略拦下时**只记日志**：
+ *   退化成「窗口只是不置顶」（也就是改之前的样子），绝不能让游戏崩。
+ * ⚠ `SELFTEST` 下直接返回 —— 自检不能真去动窗口层级。
+ * ⚠ 命令走 `-EncodedCommand`（base64 UTF-16LE）：那段 C# 里全是引号和括号，
+ *   拼进命令行的话转义规则和 PowerShell 的解析规则会打架，编码过去最省心。
+ */
+function sinkToBottom() {
+	if (SELFTEST) return
+	if (!win || win.isDestroyed()) return
+
+	let hwnd
+	try {
+		const buf = win.getNativeWindowHandle()
+		hwnd = buf.length >= 8 ? buf.readBigUInt64LE(0).toString() : String(buf.readUInt32LE(0))
+	} catch (e) {
+		console.warn('[win] 拿不到窗口句柄，跳过沉底:', e.message)
+		return
+	}
+
+	const decl = [
+		'[DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr h);',
+		'[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint c);',
+		'[DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern IntPtr FindWindowEx(IntPtr p, IntPtr a, string c, string w);',
+		'[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);',
+		'public static string Sink(IntPtr win) {',
+		'  IntPtr host = IntPtr.Zero;',
+		// 桌面的图标宿主 = 子窗口里有 SHELLDLL_DefView 的那个顶层窗口。
+		// ⚠ 不能用 FindWindow("Progman") —— 这台机器上它返回 0。
+		//   而且这台机器上有好几层 WorkerW，光按类名找会挑到壁纸那一层
+		'  IntPtr h = GetTopWindow(IntPtr.Zero);',
+		'  int guard = 0;',
+		'  while (h != IntPtr.Zero && guard++ < 900) {',
+		'    if (FindWindowEx(h, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero) { host = h; break; }',
+		'    h = GetWindow(h, 2);', // 2 = GW_HWNDNEXT
+		'  }',
+		// 插到宿主**之上**（SetWindowPos 的第二参 = 排在谁后面）。
+		// 找不到宿主才退回 HWND_BOTTOM（1）—— 那时它至少还在所有普通窗口之下
+		'  IntPtr after = host != IntPtr.Zero ? host : (IntPtr)1;',
+		'  bool ok = SetWindowPos(win, after, 0, 0, 0, 0, 0x13);',
+		'  return (ok ? "ok" : "fail") + " host=" + host.ToInt64();',
+		'}',
+	].join('\n')
+	// ⚠ 用**跨行的单引号字符串**，不用 here-string（@'...'@）：
+	//   here-string 要求终止符独占一行且顶格，塞进 -Command 里很容易被解析器咬到。
+	//   单引号字符串里的换行是合法的，而且里面的双引号全是字面量，正好适合这段 C#
+	const ps =
+		"Add-Type -Namespace Ffw -Name Win -MemberDefinition '\n" +
+		decl +
+		"\n'\n[Ffw.Win]::Sink([IntPtr]" +
+		hwnd +
+		')'
+	const encoded = Buffer.from(ps, 'utf16le').toString('base64')
+
+	execFile(
+		'powershell.exe',
+		['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+		{ windowsHide: true, timeout: 5000 },
+		(err) => {
+			if (err) {
+				console.warn('[win] 沉到桌面层失败（不影响游戏，只是层级退化成「单纯不置顶」）:', err.message)
+			}
+		},
+	)
+}
+
 function setAlwaysOnTop(value) {
 	alwaysOnTop = value
 	if (win && !win.isDestroyed()) {
+		// ⚠ 缩在任务栏里的话**先叫回来**再改置顶。
+		//   不叫的话，玩家点「置顶」会看到「什么都没发生」—— 窗口还在任务栏里缩着，
+		//   而按钮已经亮了。上面那个 minimize 钩子只拦「置顶开着时被最小化」，
+		//   关着置顶缩下去的那种得在这里补
+		if (win.isMinimized()) win.restore()
 		win.setAlwaysOnTop(value, value ? 'screen-saver' : 'normal')
+		// 关掉置顶之后还要再推一把 —— 上面那行只取消 topmost，
+		// 窗口会停在它当时那一层，别的窗口不一定盖得住它
+		if (!value) sinkToBottom()
 	}
 	syncState()
 	return alwaysOnTop

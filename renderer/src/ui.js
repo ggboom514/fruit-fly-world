@@ -131,6 +131,9 @@ export class UI {
 		this.inspectHover = false
 		this.statTimer = 0
 		this.interactive = false
+		// 面板是不是收起了（屏幕上只剩飞的虫 + 右下角那个把手）。
+		// 和「三条杠开着还是关着」一样是纯界面状态，不存档
+		this.panelAway = false
 
 		// 拖动状态。drag 是被拎着的那个东西（食物或玻璃罐），
 		// dragKind 说明它是哪种 —— 松手时往哪儿结算、夹边界留多少余量都靠它。
@@ -167,9 +170,11 @@ export class UI {
 	_cacheDom() {
 		const $ = (id) => document.getElementById(id)
 		this.el = {
+			hud: $('hud'),
 			panel: $('panel'),
 			titlebar: $('titlebar'),
 			btnMin: $('btn-min'),
+			handle: $('panel-handle'),
 			toolsBox: $('tools-box'),
 			btnTools: $('btn-tools'),
 			toolsCurrent: $('tools-current'),
@@ -293,7 +298,12 @@ export class UI {
 		})
 
 		// —— 窗口控制 ——
-		this.el.btnMin.addEventListener('click', () => this.toggleMinimize())
+		this.el.btnMin.addEventListener('click', () => this.setPanelAway(true))
+		// 收起之后右下角那个把手：点一下叫回来。
+		//
+		// ⚠ 用 click 而不是 mouseenter —— 鼠标扫过屏幕右下角（关窗口、点托盘）
+		//   是常事，扫一下就弹一整个面板出来会很烦
+		this.el.handle.addEventListener('click', () => this.setPanelAway(false))
 		this._enableDrag()
 		this._enableJarDrag()
 
@@ -680,12 +690,24 @@ export class UI {
 
 	// ---------------------------------------------------------- 窗口行为
 
-	toggleMinimize() {
-		const minimized = this.el.panel.classList.toggle('minimized')
-		this.el.btnMin.textContent = minimized ? '+' : '–'
-		this.el.btnMin.title = minimized ? '展开面板' : '收起面板（只留标题栏）'
-		// 收起之后窗口变小，指针可能已经不在它上面了 —— 重新判定要不要继续接管鼠标
+	setPanelAway(away) {
+		const on = !!away
+		if (on === this.panelAway) return
+		this.panelAway = on
+
+		// 类挂在 #hud 上，面板和罐子小窗由 CSS 一起收 —— 见 style.css 那段注释
+		this.el.hud.classList.toggle('panel-away', on)
+		// 把手反过来：收起时才出现
+		this.el.handle.classList.toggle('hidden', !on)
+
+		// ⚠ 收起 / 展开都会改变「指针底下有没有东西」，必须重新判定要不要接管鼠标。
+		//   少了这一句，收起之后那一下点击会穿到桌面上；展开之后面板反而点不动
 		this._updateInteractive()
+	}
+
+	/** 现在是不是收起状态（自检要查） */
+	get panelAwayState() {
+		return !!this.panelAway
 	}
 
 	/**
@@ -1477,8 +1499,19 @@ export class UI {
 		const overGrabbable = this._overGrabbable()
 		const overInspectable = this._overInspectable()
 		const need =
-			this.view.tool !== 'none' ||
+			// ⚠ 这里**原来还有一条 `this.view.tool !== 'none'`** —— 「只要手里拿着工具，
+			//   整扇窗口就接管鼠标」。它被删掉了，因为「穿透」现在才是那个主开关：
+			//
+			//     穿透开（默认）→ 只有指针压在下面这些 UI 上才接管，画布一律穿透。
+			//                     手里拿什么工具都能正常点桌面上任何地方
+			//     穿透关         → main.js 那句 `passThrough = clickThroughEnabled && …`
+			//                     恒为 false，整扇窗口接管鼠标，工具照常能用
+			//
+			//   代价：穿透开着时工具是「按不动」的（点画布会点到桌面）。这不是漏掉了 ——
+			//   是这套开关的必然结果。玩家选中工具那一刻会闪一句提示告诉他去关穿透，
+			//   见 setTool()
 			this._overPanel() ||
+			this._overHandle() ||
 			overGrabbable ||
 			overInspectable ||
 			this.drag !== null ||
@@ -2067,6 +2100,25 @@ export class UI {
 		return m.x >= r.left - 4 && m.x <= r.right + 4 && m.y >= r.top - 4 && m.y <= r.bottom + 4
 	}
 
+	/**
+	 * 指针压在「收起面板之后右下角那个把手」上。
+	 *
+	 * ⚠ 这条**必须存在**，理由和 _overJarWindow 一字不差：窗口平时是穿透的，
+	 *   穿透时只有 mousemove 会被转发进来、**按下**会直接落到桌面上。
+	 *   不进 _updateInteractive() 的 need，把手就是「看得见但点不动」，
+	 *   而且不报任何错 —— 面板收起之后就再也叫不回来了。
+	 *
+	 * ⚠ 同样要显式查 .hidden：收起状态之外它是 display:none，
+	 *   getBoundingClientRect() 会给一个 0×0、(0,0) 的矩形，
+	 *   不查的话屏幕左上角会有一小块莫名吃掉桌面点击
+	 */
+	_overHandle() {
+		if (this.el.handle.classList.contains('hidden')) return false
+		const r = this.el.handle.getBoundingClientRect()
+		const m = this.view.mouse
+		return m.x >= r.left - 4 && m.x <= r.right + 4 && m.y >= r.top - 4 && m.y <= r.bottom + 4
+	}
+
 	_overPanel() {
 		const r = this.el.panel.getBoundingClientRect()
 		const m = this.view.mouse
@@ -2250,6 +2302,24 @@ export class UI {
 
 		this.view.tool = tool
 
+		/*
+		 * 穿透开着的时候，工具是**按不动**的 —— 画布全区穿透，点下去会点到桌面。
+		 *
+		 * 这是「穿透才是主开关」的必然结果（见 _updateInteractive 那段注释），
+		 * 但玩家不会自己想到这一层：他会觉得「工具坏了」。
+		 * 所以选中一个真工具的那一刻闪一句，把「去哪儿关」说清楚。
+		 *
+		 * ⚠ 只在**选中**时闪，不要每帧闪 —— _flashHint 自己带同句去重，
+		 *   但这里连调用都不该发生（选中是一次性的动作，不是每帧的）。
+		 * ⚠ 观察（none）不闪：它本来就该穿透。
+		 * ⚠ clickThrough 是主进程的状态，渲染进程这边只有 _applyWindowState 收到过 ——
+		 *   用 this.view.clickThrough 那份缓存，别去问 IPC（这是每选一次工具才跑一次的路径，
+		 *   异步问一下也不是不行，但没必要）
+		 */
+		if (tool !== 'none' && this.view.clickThrough) {
+			this._flashHint('穿透开着 —— 工具点不动，按 Ctrl+Shift+F 或点面板上的「穿透」关掉')
+		}
+
 		for (const btn of this.toolButtons) {
 			const on = btn.dataset.tool === tool
 			btn.classList.toggle('active', on)
@@ -2334,6 +2404,9 @@ export class UI {
 	_applyWindowState(state) {
 		this.el.top.classList.toggle('on', !!state.alwaysOnTop)
 		this.el.through.classList.toggle('on', !!state.clickThrough)
+		// 缓存一份给 setTool() 用 —— 它要在「选中工具」那一刻判断要不要闪提醒。
+		// 主进程才是真值来源，这边只是把推过来的状态记下来
+		this.view.clickThrough = !!state.clickThrough
 	}
 
 	// ---------------------------------------------------------- 每帧
@@ -2578,6 +2651,9 @@ export class UI {
 		// 类名换成 tier-<id>；顺带把「要不要流动 / 反光」两个特效类也切了。
 		// 特效开关来自 CONFIG.market.valueTiers，所以调档位不用改 CSS。
 		// ⚠ 这是**整体覆盖**赋值，卡片上的类全靠这一行，别在别处再 add
+		// `fx` = 描边会流动。⚠ 它**曾经**是「内侧再套一圈用 mask 挖出来的光环」，
+		// 那套在四个角上根本没画出来；现在改成把渐变画进边框本身了，
+		// 类名没变，怎么实现的全在 style.css 的 `.inspect.fx` 里
 		el.inspect.className = `inspect tier-${tier.id}${tier.flow ? ' fx' : ''}${tier.sheen ? ' sheen' : ''}`
 
 		el.inspectSex.textContent = f.sex === 'F' ? '♀' : '♂'

@@ -52,12 +52,26 @@
 			-->
 			<div id="starfield" class="starfield hidden"></div>
 
+			<!--
+				面板收起之后，屏幕右下角留的那个小把手。
+
+				⚠ 它**必须进 ui._updateInteractive() 的 need 算式**（走 _overHandle 的命中判定）。
+				   「观察模式也能拖罐子」踩过同一个坑：窗口穿透时只有 mousemove 会被转发进来，
+				   不先接管鼠标，就收不到那一下点击 —— 表现是「把手点不动」，而且不报错。
+
+				⚠ 它**不复用 .window**：那是面板专用的（底部居中 + 拖动 + overflow: hidden），
+				   把手要钉在右下角、而且永远不吃拖拽。
+			-->
+			<div id="panel-handle" class="panel-handle hidden" title="展开面板">
+				<span class="handle-dot"></span><span class="handle-text">果蝇世界</span>
+			</div>
+
 			<div class="window" id="panel">
-				<!-- 标题栏：拖动区 + 最小化 / 关闭 -->
+				<!-- 标题栏：拖动区 + 收起 / 关闭 -->
 				<div class="titlebar" id="titlebar">
 					<span class="title">果蝇世界</span>
 					<div class="winbtns">
-						<button id="btn-min" class="winbtn" title="收起面板（只留标题栏）">–</button>
+						<button id="btn-min" class="winbtn" title="收起面板（虫照常飞，右下角留个把手叫回来）">–</button>
 						<button id="btn-quit" class="winbtn close" title="退出（Ctrl+Shift+Q）">✕</button>
 					</div>
 				</div>
@@ -207,8 +221,8 @@
 
 					<!-- 窗口与生态控制 -->
 					<div class="group actions">
-						<button id="btn-top" class="toggle on" title="浮在所有窗口之上（Ctrl+Shift+T）">置顶</button>
-						<button id="btn-through" class="toggle on" title="开启时只有这扇窗口接管鼠标，其余地方不挡你操作桌面（Ctrl+Shift+F）">
+						<button id="btn-top" class="toggle on" title="开：浮在所有窗口之上。关：沉到所有窗口之下（仍在桌面之上），别的窗口能盖住它（Ctrl+Shift+T）">置顶</button>
+						<button id="btn-through" class="toggle on" title="开：只有面板 / 罐子小窗这些 UI 接管鼠标，画布一律穿透 —— 拿着工具也能正常点桌面。关：鼠标整屏归游戏，工具才点得动（Ctrl+Shift+F）">
 							穿透
 						</button>
 						<!--

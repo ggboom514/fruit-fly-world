@@ -252,7 +252,10 @@ lifespanMin: 960000,        // ❌ 别写裸数字，半年后没人看得懂
 | 出生体重 | `config.js` | `market.birthWeight` | 0.2 mg |
 | **售价公式** | `config.js` | `market.pricePerMg` | 0.01（每 0.1mg 得 $0.001） |
 | 体格三档（轻盈/超重/巨兽） | `config.js` | `market.rarity[]` | 出现率 / 满成长体重 / 速度倍率 |
-| 价值六档（白蓝紫金红淡彩） | `config.js` | `market.valueTiers[]` | 价格上界 / 颜色 / 有没有流动特效 |
+| 价值六档（白蓝紫金红淡彩） | `config.js` | `market.valueTiers[]` | 价格上界 / 颜色 / 描边流不流动 / 有没有反光扫过 |
+| **描边流动的速度** | `style.css` | `.inspect.fx` 里的 `border-flow 3.4s` | 金、红两档。一轮 3.4s 里光扫过两趟 |
+| **传说生物那道彩虹** | `style.css` | `.inspect.tier-mythic` | 六个色标 + 自己的时长（8s，比另外两档慢）。⚠ 色标不在 config 里 —— 彩虹是把 `background` 画进边框本身（两层：`padding-box` 底色 + `border-box` 彩虹），跟 `--tier` 那条实色边框是两回事 |
+| 描边流光的做法 | `style.css` | `.inspect.fx` | ⚠ 画在**边框本身**里。别退回「伪元素 + mask 挖洞」—— 那套在四个圆角上根本画不出来，桌面会从角上透出来 |
 | **商店里卖什么** | `config.js` | `market.shop[]` | 名字 / 价格 / 说明 |
 | 商店怎么分组 | `config.js` | `market.shopCats` | 分组 **和渲染顺序**的唯一来源 |
 | 投放弹窗怎么分组 | `config.js` | `market.feedCats` | 同上 |
