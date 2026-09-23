@@ -3176,7 +3176,11 @@ export class World {
 			// 写一律走 world.setKeeperOption()
 			keeperLv: this.shopLevel('keeper'),
 			keeper: this.keeper,
-			swarm: this.swarm.active,
+			// ⚠ 这里**删掉过** `swarm: this.swarm.active`。它唯一的读者是
+			//   「幼虫集群中」那颗浮标，用户要求去掉之后就没有消费方了 ——
+			//   留着它只会让下一个人以为界面上还有东西在看集群状态。
+			//   ⚠ 注意这不影响 `this.swarm` 本身：集群行为一行没动，
+			//   它照样进 serialize / restore
 		}
 	}
 }

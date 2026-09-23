@@ -1220,7 +1220,7 @@ button.toggle.on {
  * 它靠的是「同为定位元素、按 DOM 顺序叠」这条默认规则：在 index.html 里
  * 它紧跟在 #stage 后面、#hud 前面，正好夹在「画布之上、工具栏之下」。
  * 一旦写上 z-index（哪怕只是 1），它就会跳到所有 z-auto 的兄弟上面去 ——
- * 工具栏、启动选择框、集群提示条全是 z-auto，会被这个虚线框整个盖住。
+ * 工具栏、启动选择框、暂停浮标全是 z-auto，会被这个虚线框整个盖住。
  * 想调层叠顺序就改它在 index.html 里的位置，别改这里。
  *
  * ⚠ 另外 pointer-events: none，而且**不能**参与 ui._updateInteractive()。

@@ -276,7 +276,8 @@ export class UI {
 			starfield: $('starfield'),
 			btnReset: $('btn-reset'),
 			quit: $('btn-quit'),
-			swarm: $('swarm-badge'),
+			// ⚠ 这里**删掉过** swarm: $('swarm-badge') —— 那颗「幼虫集群中」
+			//   的浮标用户要求去掉了（见 index.html 那段注释）
 			pause: $('pause-badge'),
 
 			// —— 经济 ——
@@ -3134,7 +3135,6 @@ export class UI {
 		// 总价值和钱一样用 formatMoney，单位是游戏币 —— 它不是「第几个」而是一笔钱
 		this.el.value.textContent = formatMoney(c.value)
 
-		this.el.swarm.classList.toggle('hidden', !c.swarm)
 		this.el.pause.classList.toggle('hidden', !this.world.paused)
 
 		this.refreshJarList()
