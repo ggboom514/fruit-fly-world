@@ -291,6 +291,23 @@ function runSelfTest() {
 						}
 					}
 
+					// —— 老存档里那两个已经删掉的字段不能「复活」 ——
+					//
+					// ⚠ 遗传去掉之后 Fly 上不再有 fatherMutations / layMutations，
+					//   但**老存档里存着它们**。revive() 是「先建默认实例、
+					//   再逐个 canAssign 覆盖」，键在新实例上不存在就跳过 ——
+					//   这正是我们要的：静默丢掉、不报错、**不用升存档版本号**。
+					//
+					//   这一条守的就是那个「跳过」：哪天 canAssign 被改成
+					//   「先塞进去再说」，这两个字段会重新出现在每只虫身上，
+					//   而已经没有任何代码去清它们了（_endClutch 里那段删了）
+					const legacy = probe.flies[0]
+					for (const dead of ['fatherMutations', 'layMutations']) {
+						if (legacy && dead in legacy) {
+							return { ok: false, reason: '老存档里已经删掉的 ' + dead + ' 又长回果蝇身上了' }
+						}
+					}
+
 					await window.pet.clearSave()
 				} catch (e) {
 					return { ok: false, reason: '存档链路失败: ' + e.message }
@@ -314,6 +331,81 @@ function runSelfTest() {
 					if (pet.view.bootOpen !== false) return { ok: false, reason: '弹窗收起后鼠标没有被放开' }
 				} catch (e) {
 					return { ok: false, reason: '启动选择框流程失败: ' + e.message }
+				}
+
+				// —— 「重新开始」那条路 ——
+				//
+				// ⚠ 这里**曾经**是个盲区：上面只走了「继续」，boot-new 一次都没被点过。
+				//   而「重新开始」和面板上那颗重置是两个入口、同一件事 ——
+				//   只清一边的话，玩家走另一条路重开，会发现图鉴还是满的，
+				//   而没有任何地方解释为什么
+				try {
+					// ⚠ 这里**必须走 save.begin()**，不能直接调 _ask。
+					//
+					//   清 unlock 那一步在 begin() 的「选了 new」分支里，不在 _ask 里 ——
+					//   只测 _ask 的话，它照样返回 'new'，而「到底清没清」根本没碰到。
+					//   这正是这一节要守的东西，绕开它就等于没测
+					//
+					// ⚠ 但 save.available 在自检下是**硬关掉的**
+					//   （save.js 的 available 是 !SELFTEST && ...），begin() 会当场 return 'fresh'，
+					//   压根不弹框。所以这里临时把它打开，让 begin() 走完整条真路 ——
+					//   直接手写一遍 clear() + clearProgress() 就等于在测
+					//   「我照着 begin() 抄的这段」，而不是 begin() 本身
+					//
+					// 所以先造一份存档出来，让 begin() 有东西可读、才会弹框
+					await window.pet.saveGame(
+						JSON.stringify({ version: 1, savedAt: Date.now(), world: pet.world.serialize() }),
+					)
+					const wasAvailable = pet.save.available
+					pet.save.available = true
+					// 再造出「有进度可清」的状态
+					pet.ui.setStarUnlocked(true, { silent: true })
+					pet.ui.noteSeenGenes(['crystal'])
+					const seeded = await window.pet.loadUnlock()
+					if (!seeded.data.star || !seeded.data.seen.includes('crystal')) {
+						return { ok: false, reason: '「重新开始」那条断言的前置没造出来，测不出东西' }
+					}
+
+					const boot = document.getElementById('boot')
+					// ⚠ 不能先 await begin() 再点 —— 那样会死等（框一直开着，没人点）。
+					//   先拿到 promise，点掉按钮，**然后**才 await
+					const pending = pet.save.begin()
+
+					// ⚠⚠ 而且**必须等框真的弹出来**再点。
+					//
+					//   begin() 先 await 读盘、比版本号，之后才轮到 _ask 挂监听器。
+					//   begin() 一返回就 click 的话，那一刻 boot-new 上还没有
+					//   任何监听器 —— 那一下**点空了**，然后 _ask 弹着框永远等下去。
+					//   症状是自检**整个挂死**（实测踩过：跑满 5 分钟没动静），
+					//   而不是报一条错，所以特别值得写清楚
+					for (let i = 0; i < 200 && boot.classList.contains('hidden'); i++) {
+						await new Promise((r) => setTimeout(r, 10))
+					}
+					if (boot.classList.contains('hidden')) {
+						return { ok: false, reason: 'begin() 跑了两秒也没弹出启动选择框 —— 存档那一步失败了？' }
+					}
+
+					document.getElementById('boot-new').click()
+					const choice = await pending
+					pet.save.available = wasAvailable
+					if (choice !== 'fresh') return { ok: false, reason: '点「重新开始」没有走到新局，而是 ' + choice }
+					if (!boot.classList.contains('hidden')) return { ok: false, reason: '「重新开始」选完之后弹窗没有收起' }
+					if (pet.view.bootOpen !== false) {
+						return { ok: false, reason: '「重新开始」之后鼠标没有被放开' }
+					}
+
+					if (pet.ui.starUnlocked) return { ok: false, reason: '「重新开始」之后彩蛋还解锁着' }
+					const cleared = await window.pet.loadUnlock()
+					if (cleared.data.star) return { ok: false, reason: '「重新开始」之后 unlock.json 里的 star 还是 true' }
+					if (!Array.isArray(cleared.data.seen) || cleared.data.seen.length !== 0) {
+						return {
+							ok: false,
+							reason: '「重新开始」之后 unlock.json 里的 seen 不是空的：' + JSON.stringify(cleared.data.seen),
+						}
+					}
+				} catch (e) {
+					pet.save.available = false
+					return { ok: false, reason: '「重新开始」流程失败: ' + e.message }
 				}
 
 				// 玻璃罐：把「放罐子 → 网一只 → 列表出这一行 → 点放逐 → 行消失」走一遍。
@@ -781,44 +873,199 @@ function runSelfTest() {
 					return { ok: false, reason: '设置卡流程失败: ' + e.message }
 				}
 
-				// —— 重置：必须先弹确认，点「取消」不能清档 ——
+				// —— 重置：**三道**确认，一道比一道重 ——
+				//
+				// 三条不变式贯穿全程，每一步都要查：
+				//   · 钱（world）没动 —— 前三道里任何一下点击都不该清世界
+				//   · 图鉴没动 —— 同理
+				//   · 走到哪一道，就只有那一张卡是开着的
 				try {
 					const w6 = pet.world
+					const step = () => pet.view.resetStep
+					const shown = (id) => !document.getElementById(id).classList.contains('hidden')
+					const cardsOpen = () =>
+						['reset-pop', 'reset-pop2', 'reset-pop3'].filter(shown)
+
 					// 造一个「重置一定会抹掉」的标记
 					const beforeMoney = w6.money
+					const beforeSeen = pet.ui._seenGenes.slice()
 					w6.money = 12.345
+					pet.ui._seenGenes = ['crystal', 'berserk']
 					const jarCount = w6.jars.length
 
+					// 三道卡必须都在 _overCard 的名单里 ——
+					// 漏一张的症状是「卡画得好好的，但点上去穿到桌面、按钮全点不动」
+					const overCardSrc = pet.ui._overCard.toString()
+					for (const id of ['resetPop', 'resetPop2', 'resetPop3']) {
+						if (!overCardSrc.includes('this.el.' + id)) {
+							return { ok: false, reason: '重置卡 ' + id + ' 不在 _overCard 的名单里 —— 它会点不动' }
+						}
+					}
+
+					// —— 第一道 ——
 					document.getElementById('btn-reset').click()
-					if (document.getElementById('reset-pop').classList.contains('hidden')) {
-						return { ok: false, reason: '点了重置却没有弹确认卡 —— 误触一次就清档了' }
+					if (cardsOpen().join() !== 'reset-pop') {
+						return { ok: false, reason: '点了重置，开着的却是 ' + JSON.stringify(cardsOpen()) }
 					}
-					if (w6.money !== 12.345) {
-						return { ok: false, reason: '点了重置就立刻清档了，确认卡没起作用' }
-					}
-					if (w6.jars.length !== jarCount) {
-						return { ok: false, reason: '确认卡还没点，世界已经被清空了' }
+					if (w6.money !== 12.345 || w6.jars.length !== jarCount) {
+						return { ok: false, reason: '刚到第一道卡，世界就已经被清空了' }
 					}
 
 					// 「取消」应当什么都不做
 					document.getElementById('reset-cancel').click()
-					if (!document.getElementById('reset-pop').classList.contains('hidden')) {
-						return { ok: false, reason: '点了「取消」确认卡没有关掉' }
+					if (cardsOpen().length !== 0 || step() !== 0) {
+						return { ok: false, reason: '点了「取消」三道卡没有全部关掉' }
 					}
 					if (w6.money !== 12.345) {
 						return { ok: false, reason: '点了「取消」却还是清档了' }
 					}
 
-					// 「确定重置」才真的清
+					// —— 第二道 ——
 					document.getElementById('btn-reset').click()
 					document.getElementById('reset-ok').click()
+					if (cardsOpen().join() !== 'reset-pop2') {
+						return { ok: false, reason: '第一道的「我知道了」没有走到第二道：' + JSON.stringify(cardsOpen()) }
+					}
+					if (w6.money !== 12.345 || w6.jars.length !== jarCount) {
+						return { ok: false, reason: '走到第二道就把世界清了 —— 清空只该发生在第三道之后' }
+					}
+					document.getElementById('reset-cancel2').click()
+					if (cardsOpen().length !== 0) {
+						return { ok: false, reason: '第二道点「还是算了」没有全部关掉' }
+					}
+
+					// —— 第三道 ——
+					document.getElementById('btn-reset').click()
+					document.getElementById('reset-ok').click()
+					document.getElementById('reset-ok2').click()
+					if (cardsOpen().join() !== 'reset-pop3') {
+						return { ok: false, reason: '第二道的「确定要重置」没有走到第三道' }
+					}
+					if (w6.money !== 12.345 || w6.jars.length !== jarCount) {
+						return { ok: false, reason: '走到第三道就把世界清了 —— 第三道才是那道门' }
+					}
+
+					// 还没打字 → 确定按钮必须**点不动**。
+					// ⚠ 这是整个三道设计里唯一的硬门槛，写松了前面两道就白做
+					const typed = document.getElementById('reset-typed')
+					const ok3 = document.getElementById('reset-ok3')
+					if (!ok3.disabled) {
+						return { ok: false, reason: '第三道还没打字，「确定重置」就已经可以点了' }
+					}
+					// 打错也要挡住
+					typed.value = '重来'
+					typed.dispatchEvent(new Event('input', { bubbles: true }))
+					if (!ok3.disabled) {
+						return { ok: false, reason: '第三道打错字（「重来」）也能点确定' }
+					}
+					// 打对才放行
+					typed.value = '重置'
+					typed.dispatchEvent(new Event('input', { bubbles: true }))
+					if (ok3.disabled) {
+						return { ok: false, reason: '第三道打对了「重置」，「确定重置」却还是灰的' }
+					}
+
+					// —— ⚠ 在输入框里按键**不能**换掉手里的工具 ——
+					//
+					// 这条守的是一个很容易漏、又很难自查的坑：keydown 挂在 window 上，
+					// 而工具快捷键是裸字母。用拼音打「重置」会经过 chongzhi，
+					// 里面的 c（抹布）、g（手套）、b（扫帚）、w（喷水枪）、r（打火机）
+					// 全都会命中 —— 玩家一边打字一边把手里的工具换个遍
+					//
+					// ⚠ 派发时 target 必须是**输入框自己**（dispatchEvent 在谁身上、
+					//   target 就是谁），而且必须 bubbles —— 真实按键就是这样
+					//   一路冒泡到 window 上的
+					{
+						const before = pet.view.tool
+						for (const code of ['KeyC', 'KeyG', 'KeyB', 'KeyW', 'KeyR']) {
+							typed.dispatchEvent(new KeyboardEvent('keydown', { code, key: code.slice(3), bubbles: true }))
+						}
+						if (pet.view.tool !== before) {
+							return {
+								ok: false,
+								reason: '在重置的输入框里打字，手里的工具被换成了 ' + pet.view.tool +
+									'（原来是 ' + before + '）—— 拼音打「重置」会一路触发工具快捷键',
+							}
+						}
+					}
+
+					ok3.click()
 					if (w6.money !== 0) {
-						return { ok: false, reason: '点了「确定重置」但钱没有清零（现在是 ' + w6.money + '）' }
+						return { ok: false, reason: '走过三道之后钱没有清零（现在是 ' + w6.money + '）' }
 					}
-					if (!document.getElementById('reset-pop').classList.contains('hidden')) {
-						return { ok: false, reason: '重置完成后确认卡没有关掉' }
+					if (cardsOpen().length !== 0 || step() !== 0) {
+						return { ok: false, reason: '重置完成后三道卡没有全部关掉' }
 					}
+
+					// —— 图鉴和彩蛋也必须一起回到 0 ——
+					if (pet.ui._seenGenes.length !== 0) {
+						return {
+							ok: false,
+							reason: '重置之后图鉴还有 ' + pet.ui._seenGenes.length + ' 格是亮的：' +
+								JSON.stringify(pet.ui._seenGenes),
+						}
+					}
+					const afterReset = await window.pet.loadUnlock()
+					if (!afterReset || !afterReset.ok) {
+						return { ok: false, reason: '重置之后读不回 unlock —— 那个文件可能被删了而不是清空' }
+					}
+					if (afterReset.data.star) {
+						return { ok: false, reason: '重置之后彩蛋还是解锁状态 —— 应当锁回去' }
+					}
+					if (!Array.isArray(afterReset.data.seen) || afterReset.data.seen.length !== 0) {
+						return {
+							ok: false,
+							reason: '重置之后 unlock.json 里的 seen 不是空的：' +
+								JSON.stringify(afterReset.data.seen),
+						}
+					}
+					// 罐子的流光也要跟着回到「锁着」的配色
+					if (!document.getElementById('btn-donate').classList.contains('locked')) {
+						return { ok: false, reason: '重置之后捐款罐子没有回到「未解锁」的蓝紫配色' }
+					}
+
+					// —— 开局那几只不该带突变 ——
+					//
+					// ⚠ 这一条是「重置 = 图鉴从 0」能不能成立的关键：
+					//   开局几只一出生就会走 addFly → _noteGenes，骰出什么就点亮什么。
+					//   它们只要带突变，重置完图鉴立刻就是花的
+					//
+					// ⚠⚠ **必须跑很多次**，不能只看一次。
+					//   开局只有十来只，每只带上突变的概率约 8.7%（五种概率之和），
+					//   所以「一次性全野生型」的概率有 **四成左右** —— 只查一次的话，
+					//   这条断言有四成的时候是**空转**的。
+					//   实测：把 rollDeNovo() 加回 world.reset()，跑一次它照样绿
+					//
+					//   30 次 ≈ 三百多次骰子，至少中一次的概率是 1 - 0.913^300 ≈ 1，
+					//   这才钉得住「开局一律野生型」
+					let mutated = 0
+					let rolled = 0
+					for (let i = 0; i < 30; i++) {
+						w6.reset()
+						for (const c of w6.flies.concat(w6.larvae)) {
+							rolled++
+							if (c.mutations.length) mutated++
+						}
+					}
+					if (mutated) {
+						return {
+							ok: false,
+							reason:
+								'重置投放的开局那几只带着突变（' + rolled + ' 只里中了 ' + mutated + ' 只）' +
+								'—— 它们一出生就会把图鉴点亮，图鉴就不是从 0 开始了',
+						}
+					}
+					if (w6.seenGenes.length) {
+						return { ok: false, reason: '重置之后 world.seenGenes 还有残留：' + JSON.stringify(w6.seenGenes) }
+					}
+
+					// 把这一节造成的破坏还原，后面的断言还要用。
+					// ⚠ 内存态和文件都要还原 —— 只改内存的话，后面某一条
+					//   触发落盘时会拿这份内存去整份覆写，文件里就冒出一份
+					//   「没重置过」的 seen，而那时世界已经重置了
 					w6.money = beforeMoney
+					pet.ui.setSeenGenes(beforeSeen)
+					pet.ui._persistUnlock()
 				} catch (e) {
 					return { ok: false, reason: '重置确认流程失败: ' + e.message }
 				}
@@ -4917,7 +5164,9 @@ function runSelfTest() {
 					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
 						'  越界等级：老存档里超出链长的等级被夹回来（表现为满级），商店照常重建、不抛异常\n' +
 					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +
-					'  重置：先弹确认，点「取消」什么都不动，点「确定」才清档\n' +
+					'  重置：**三道**确认（说明 → 标红再问 → 手打「重置」才能点确定），前三道里世界一动不动；' +
+						'走完三道才清世界 + 图鉴 + 彩蛋，开局那几只不带突变；' +
+						'输入框里打字不会触发工具快捷键\n' +
 					'  苍蝇拍：杀伤落点正好在拍面上（指针左上方），不在指针上；打死拍头那只、指针上那只不死（挥空也放一圈灰勾出杀伤半径）\n' +
 					'  工具粒子：工具图案和范围圈全删了，只剩系统指针 —— body 上没有 tool-active；' +
 						'举着打火机跑 20 帧粒子真的变多、画一帧不抛（证明自绘光标删干净了）、放下就停\n' +
@@ -4940,7 +5189,7 @@ function runSelfTest() {
 					'  罐中批量：全部出售 / 全部放逐逐罐结算不跳只；出售带二次确认，点「取消」什么都不卖\n' +
 					'  罐中配对：一对成熟异性在罐里会生，卵**产在罐外底部**、母体不进 laying（不收翅）；' +
 						'拍子仍旧打不进罐子\n' +
-					'  基因突变：遗传（单方 20% / 双方 36%）、新发突变、售价倍率、金光光环会复位、生命值不吃体重、疯狂自限 + 寿命砍半 + 够不着罐中虫、石化受惊不起飞\n' +
+					'  基因突变：**不遗传**（每颗卵按自己的 chance 骰，父母带什么都不影响）、售价倍率、金光光环会复位、生命值不吃体重、疯狂自限 + 寿命砍半 + 够不着罐中虫、石化受惊不起飞\n' +
 					'  设置 / 捐款：点图标那一层也能弹出（closest 判定，不是比 e.target）、再点能收起、层级高过面板与数据面板\n' +
 					'  养蝇人：升级走 upgradeShopItem、配置按钮买后才出现、卡片真的接管鼠标、点选项能改状态且选中态跟着走、Lv1 时自动出售那几行是禁用的\n' +
 					'  卖哪档：六档价值档齐全；卡片上不再有任何输入控件、world.keeper 也没有 minValue（价格滑条已删干净）；' +
@@ -5128,16 +5377,22 @@ function backupFile() {
 }
 
 /**
- * 跨局的进度，**单独一个文件**。现在装两样：
+ * 图鉴 + 彩蛋的进度，**单独一个文件**。装两样：
  *
  *   `star`  —— 彩蛋（星空苹果 / 星云）解锁了没有
  *   `seen`  —— 图鉴里「见过」的突变 id（出生过就算，见 world.seenGenes）
  *
- * ⚠ 为什么不塞进存档里：存档是「这一局养了什么」，玩家点「重新开始」
- *   会把它整个删掉（见 save.js 的 clear()）。而这两样都是**跨局**的 ——
- *   重开一局之后彩蛋又锁上、图鉴又全灰，玩家只会觉得
- *   「我上次明明解开了，坏了」，而且没有任何提示告诉他为什么。
- *   用户要的是「永久」。
+ * ⚠ **它现在不跨局了。** 这个文件曾经被刻意保护成「跨过『重新开始』」，
+ *   注释里写的理由是「重开一局之后彩蛋又锁上，玩家会觉得坏了」。
+ *   用户后来明确要了反过来的行为：**重置 = 真的从 0**，图鉴全灰、
+ *   彩蛋锁回去、罐子还要重新点十下（见 ui.clearProgress）。
+ *
+ *   所以它现在的作用只是「把这两样从 R 里单独捞出来放一个文件」，
+ *   方便一起清、也方便自检隔离。**别再按「永久解锁」去理解它** ——
+ *   玩家点一次重置，这个文件就空了。
+ *
+ * ⚠ 单独一个文件的**真正**理由变成了：主进程能一次把它删干净，
+ *   不用去动存档结构；而且自检读写的是另一个文件，碰不到玩家的真状态
  *
  * ⚠ 自检读写的是另一个文件，理由和 saveFile 一字不差：
  *   自检跑的是临时造出来的世界，不能把玩家的真状态顶掉

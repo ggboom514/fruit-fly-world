@@ -1912,6 +1912,47 @@ body.over-grabbable {
 	color: #fff;
 }
 
+/*
+ * ⚠ 禁用态必须**看得出来**。重置第三道那道门槛全靠它：
+ *   没打字时确定按钮是灰的，打了字才亮 —— 两者长得一样的话，
+ *   玩家会以为按钮坏了，而不是「哦我还得打两个字」
+ */
+.confirm-btn:disabled,
+.confirm-btn:disabled:hover {
+	background: rgba(255, 255, 255, 0.04);
+	color: rgba(230, 224, 214, 0.3);
+	cursor: not-allowed;
+}
+
+/*
+ * 重置第三道那个输入框。配色跟 .confirm-btn 一套 ——
+ * 它就是同一张卡里的一个控件，不该长得像另一个界面的东西
+ */
+.confirm-input {
+	width: 100%;
+	box-sizing: border-box;
+	margin: 10px 0 2px;
+	padding: 7px 10px;
+	border-radius: 7px;
+	border: 1px solid var(--border);
+	background: rgba(0, 0, 0, 0.28);
+	color: var(--text);
+	font-size: 13px;
+	font-family: inherit;
+	text-align: center;
+	letter-spacing: 2px;
+	outline: none;
+}
+
+.confirm-input:focus {
+	border-color: rgba(220, 70, 55, 0.55);
+}
+
+.confirm-input::placeholder {
+	color: rgba(200, 190, 175, 0.32);
+	letter-spacing: 0;
+}
+
 @keyframes donate-in {
 	from {
 		opacity: 0;

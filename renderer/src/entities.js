@@ -29,9 +29,7 @@ import {
 	valueMulOf,
 	weightMulOf,
 	speedMulOf,
-	inheritFrom,
 	rollDeNovo,
-	combineGenes,
 	berserkLifespanMul,
 	MUTATION_TYPES,
 } from './mutations.js'
@@ -76,8 +74,9 @@ export class Fly {
 		//   字段静默不进存档，每次读档突变全部消失，不报错也不崩溃。
 		//   那正是 snapshot 那段注释想挡的事，但它挡不住 Set
 		//
-		// ⚠ 拷一份而不是直接用传进来的数组：那个数组可能是母体的 layMutations，
-		//   直接引用的话，给这只加突变会同时改到它的兄弟姐妹
+		// ⚠ 拷一份而不是直接用传进来的数组。传进来的那个可能被别处还握着
+		//   （比如同一颗卵的 mutations 会一路递到幼虫、再递到成虫），
+		//   直接引用的话，给这只加突变会同时改到别处
 		this.mutations = copyGenes(mutations)
 
 		this.age = 0
@@ -210,16 +209,11 @@ export class Fly {
 		this.laySite = null // 挑好的产卵点 { x, y }，飞到了才开始产
 		this.laySeekTimer = 0
 
-		// —— 这一窝的基因 ——
-		//
-		// 父本的突变在**交配那一刻**存下来，因为真正产卵的 startLaying()
-		// 有四个调用点（就地开产 / 飞到产卵点 / devtools / sim），
-		// 只有 beginClutch 那条路上手上才有父本。
-		//
-		// ⚠ fatherMutations 必须在 _endClutch() 里清掉。
-		//   那个方法存在的原因本身就是「上一窝的字段漏到了下一窝」
-		this.fatherMutations = []
-		this.layMutations = [] // 这一窝每颗卵的基础基因（父母各传一半 + 新发）
+		// ⚠ 这里**删掉过** fatherMutations / layMutations 两个字段。
+		//   它们装的是「这一窝从父母那儿继承来的基因」，遗传机制去掉之后
+		//   就没有东西可装了 —— 每颗卵自己骰新发突变（见 _lay）。
+		//   老存档里还有这两个键：revive() 是「先建默认实例再逐键覆盖」，
+		//   键在新实例上不存在就跳过，所以会静默丢掉，不会报错也不用升版本号
 
 		this.dead = false
 		this.causeOfDeath = null
@@ -407,7 +401,7 @@ export class Fly {
 	 *   startLaying() 到了地方，真正进入产卵
 	 * 早先是就地开产，卵散落在「她那一刻恰好在的位置」上，看着就是走到哪儿下到哪儿。
 	 */
-	beginClutch(world, fatherGenes = null) {
+	beginClutch(world) {
 		const E = CONFIG.egg
 		const L = CONFIG.laying
 
@@ -416,10 +410,9 @@ export class Fly {
 		// 一窝共用的基准孵化时间，每颗只在它附近抖 ±clutchJitter
 		this.layHatch = rand(E.hatchMin, E.hatchMax)
 
-		// 父本的基因在这里存下来 —— 产卵要飞到地方才开始，
-		// 而那时 world._tryMate 早就返回了，父本对象也未必还在手边。
-		// 存一份拷贝：父本之后可能被卖掉 / 拍死，留引用会读到一只死蝇的基因
-		this.fatherMutations = copyGenes(fatherGenes)
+		// ⚠ 这里**曾经**要接收父本的基因并存下来（产卵要飞到地方才开始，
+		//   而那时 world._tryMate 早就返回了）。遗传去掉之后没有东西要存了，
+		//   所以这个参数也一起删掉 —— world 那边不用再传 father.mutations
 
 		// 「偶尔也会分散开来」：这个概率下偷懒，就地开产，不挑地方。
 		// 完全不偷懒的话，场上会渐渐变成「卵永远只出现在那几个完美点」，
@@ -440,36 +433,30 @@ export class Fly {
 	 * 位置由调用方保证（要么已经飞到产卵点，要么决定就地开产）。
 	 */
 	/**
-	 * 一窝的**内容**：整窝共用的基础基因、卵多大、幼虫什么体型。
+	 * 一窝的**内容**：卵多大、幼虫什么体型。
 	 *
 	 * ⚠ 返回**纯数据**、而且**不改自己身上任何字段** —— 这一点是刻意的：
 	 *   罐中配对那条路（world._tryJarMate）里产卵的是**罐子**，母体根本没有
 	 *   进入 laying 状态，不能顺手把她身上那套产卵字段写脏
-	 *   （写脏了就会「上一窝的基因漏到下一窝」，_endClutch 那段注释讲的正是这个）。
+	 *   （写脏了就会「上一窝的东西漏到下一窝」，_endClutch 那段注释讲的正是这个）。
 	 *
 	 * ⚠ 两条路**共用这一份公式**：外面那条走 startLaying()，罐里那条由 world
-	 *   直接调。各写一份的话，罐里那窝会静默地少继承父亲的基因 —— 看不出来。
+	 *   直接调。各写一份的话两边会长出不一样的手感，而且看不出来。
 	 *
-	 * @param {string[]|null} fatherGenes 父本的基因。不传就用身上存的那份
-	 *   （外面那条路：交配那一刻存进 fatherMutations，产卵时再读）
+	 * ⚠ 这里**不再有 `genes`**。以前它算的是「母亲传一半、父亲传一半」，
+	 *   整窝共用；遗传去掉之后每颗卵自己骰（见 _lay），没有「整窝基础基因」
+	 *   这回事了
 	 */
-	clutchPlan(fatherGenes = this.fatherMutations) {
+	clutchPlan() {
 		const grow = clamp(this.age / this.lifespan, 0, 1)
 		const L = CONFIG.larva
 		return {
-			// 这一窝每颗卵的**基础基因**：母亲传一半、父亲传一半。
-			//
-			// ⚠ 算一次、整窝共用，而不是每颗卵各算一次。
-			//   现实里每个卵是独立的一次减数分裂 + 受精，理论上该各抽各的 ——
-			//   但那样同一窝的兄弟姐妹会各带一套完全不同的基因，
-			//   玩家会看到「一窝里随机蹦出各种变异」，反而看不出**遗传**这条规律。
-			//   整窝共用一份，「父母带什么，孩子就大概率带什么」才一眼看得出来。
-			//
-			// ⚠ 新发突变**不在这里**骰 —— 那个是每颗卵各骰一次（见 _lay）
-			genes: cleanGenes([...inheritFrom(this.mutations), ...inheritFrom(fatherGenes)]),
 			// 卵多大 = 个体个性 × 当前体型（越老的母体卵越大）
 			scale: this.eggTrait * lerp(0.9, 1.08, grow),
 			// 幼虫的体型性状：从她自己遗传下来（带向均值回归，避免逐代漂移）
+			//
+			// ⚠ 这是**体型性状**的遗传，和被删掉的**突变遗传**是两回事，别一起删。
+			//   突变是离散的「有没有某个基因」，体型是连续量，用均值回归才不漂
 			shape: {
 				length: inheritTrait(this.shape.length, L.lengthMin, L.lengthMax),
 				slim: inheritTrait(this.shape.slim, L.slimMin, L.slimMax),
@@ -488,7 +475,6 @@ export class Fly {
 		const plan = this.clutchPlan()
 		this.layScale = plan.scale
 		this.layShape = plan.shape
-		this.layMutations = plan.genes
 	}
 
 	/**
@@ -640,12 +626,13 @@ export class Fly {
 			this.layShape,
 			this.layClutch,
 			this.layHatch,
-			// ⚠ 每颗卵各骰一次新发突变，并且**发一份拷贝**。
-			//   直接发 this.layMutations 的话，整窝卵会共享同一个数组 ——
-			//   给其中一颗加上新发突变，等于给全部同胞都加上了。
-			//   layShape 那个对象就是这么共享的（有意为之，体型整窝一致），
-			//   但基因不行：突变本来就该是**每个配子各自**发生的事件
-			cleanGenes([...this.layMutations, ...rollDeNovo()]),
+			// ⚠ **每颗卵各骰一次**，而且是一个全新的数组。
+			//   这是全项目**唯一**产生突变的地方（除了幼虫吃星空苹果那一条），
+			//   和父母带什么完全无关 —— 见 mutations.js 文件头那段
+			//
+			//   layShape 那个对象是整窝共享的（有意为之，体型整窝一致），
+			//   但基因不行：突变是每个配子各自发生的事件
+			rollDeNovo(),
 		)
 
 		if (this.layRemaining <= 0) this._endClutch()
@@ -663,14 +650,9 @@ export class Fly {
 		this.laying = false
 		this.layClutch = 0
 		this.layHatch = 0
-		// ⚠ 父本的基因也要一起断掉，理由和窝号完全一样：
-		//   留着的话，下一次交配万一是**就地开产**那条路径
-		//   （beginClutch 里 scatterChance 命中的那支），
-		//   或者干脆是被别处直接调 startLaying()，
-		//   上一窝的父本基因就会混进新的一窝里 —— 孩子带着一个
-		//   跟这次交配毫无关系的雄蝇的基因，而且完全看不出来
-		this.fatherMutations = []
-		this.layMutations = []
+		// ⚠ 这里**曾经**还要清 fatherMutations / layMutations，理由和窝号一样
+		//   （留着会把上一窝的父本基因混进下一窝）。遗传去掉之后没有这两个
+		//   字段了，「漏到下一窝」这件事从根上不可能发生
 	}
 
 	/**

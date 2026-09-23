@@ -394,19 +394,70 @@
 			</div>
 
 			<!--
-				重置的二次确认。⚠ 这张卡是**必须**的：重置会连存档一起清掉，
-				而工具栏上那颗按钮和「重开一局」只差一次误触。
+				重置的**三道**确认。⚠ 这三张卡是**必须**的：重置会连存档、
+				图鉴、彩蛋一起清掉，而工具栏上那颗按钮和「重开一局」只差一次误触。
+
+				三道一道比一道重：
+				  1. 说清楚会丢什么
+				  2. 再问一次（按钮标红）
+				  3. 手打「重置」两个字才放行
+				最后那道用**输入框**而不是再点一次，是因为三次点击是同一个动作，
+				连点三下和点一下没有区别 —— 打字拦得住手滑，拦不住故意
 			-->
 			<div id="reset-pop" class="donate-pop hidden">
 				<div class="donate-card">
-					<p class="donate-slogan">确定要重置吗？</p>
+					<p class="donate-slogan">重置会清空这些东西</p>
 					<p class="confirm-body">
-						会把果蝇、食物、<b>游戏币和已买的道具</b>全部清空，<br />
+						果蝇、食物、<b>游戏币和已买的道具</b><br />
+						<b>图鉴</b> —— 已发现的食物和突变全部变回灰的<br />
+						<b>彩蛋</b> —— 星空苹果要重新点罐子十下<br />
 						并且<strong>覆盖掉存档</strong>。这一步没法撤销。
 					</p>
 					<div class="confirm-btns">
 						<button id="reset-cancel" class="confirm-btn">取消</button>
-						<button id="reset-ok" class="confirm-btn danger">确定重置</button>
+						<button id="reset-ok" class="confirm-btn">我知道了</button>
+					</div>
+				</div>
+			</div>
+
+			<!-- 第二道：再问一次 -->
+			<div id="reset-pop2" class="donate-pop hidden">
+				<div class="donate-card">
+					<p class="donate-slogan">真的要从头开始吗？</p>
+					<p class="confirm-body">
+						养了这么久的生态、攒下的钱、<br />
+						以及<strong>图鉴和彩蛋的全部进度</strong>都会没掉，<br />
+						而且<strong>没有办法找回</strong>。
+					</p>
+					<div class="confirm-btns">
+						<button id="reset-cancel2" class="confirm-btn">还是算了</button>
+						<button id="reset-ok2" class="confirm-btn danger">确定要重置</button>
+					</div>
+				</div>
+			</div>
+
+			<!--
+				第三道：手打「重置」。
+				⚠ 输入框必须能正常输入中文 —— 见 ui._onKey 开头那个守卫：
+				   不打字拦掉的话，用拼音打「重置」时的 c/g/b/w/r 会一路换掉手里的工具
+			-->
+			<div id="reset-pop3" class="donate-pop hidden">
+				<div class="donate-card">
+					<p class="donate-slogan">最后一步</p>
+					<p class="confirm-body">
+						在下面打出 <b>重置</b> 两个字，确定按钮才会亮。
+					</p>
+					<input
+						id="reset-typed"
+						class="confirm-input"
+						type="text"
+						autocomplete="off"
+						spellcheck="false"
+						placeholder="在这里打「重置」"
+					/>
+					<div class="confirm-btns">
+						<button id="reset-cancel3" class="confirm-btn">取消</button>
+						<button id="reset-ok3" class="confirm-btn danger" disabled>确定重置</button>
 					</div>
 				</div>
 			</div>

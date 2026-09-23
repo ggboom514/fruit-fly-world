@@ -40,7 +40,6 @@ import {
 	bulkPrice,
 } from '../renderer/src/market.js'
 import {
-	combineGenes,
 	rollDeNovo,
 	valueMulOf,
 	weightMulOf,
@@ -2054,9 +2053,18 @@ const jarProblems = []
 			jarProblems.push(`罐中配对产下的卵有 ${offscreen.length} 颗落在屏幕边缘之外 —— 要夹进 larva.margin`)
 		}
 		// 母体身上**不该**留下这一窝的痕迹：_endClutch 永远不会为她跑，
-		// 所以罐里这条路必须压根不写她那几个字段
-		if (female.layMutations.length || female.fatherMutations.length) {
-			jarProblems.push('罐中配对把母体的 layMutations / fatherMutations 写脏了 —— 会漏到下一窝')
+		// 所以罐里这条路必须压根不写她那几个字段。
+		//
+		// ⚠ 这里原来查的是 `layMutations` / `fatherMutations` 两个字段 ——
+		//   遗传去掉之后它们不存在了。但**这条断言的意图没变**：
+		//   罐里这条路必须**压根不碰**母体身上那套产卵字段。
+		//
+		//   ⚠ 判据只认 `laying` 和 `layClutch`：这两个只有 beginClutch /
+		//   startLaying 会写，罐里那条路用的 clutchPlan() 是**纯函数**，
+		//   碰都不该碰。`layScale` 不能拿来判 —— 它产完一窝**本来就不复位**
+		//   （_endClutch 只管前三个），拿它当判据会天天误报
+		if (female.laying || female.layClutch !== 0) {
+			jarProblems.push('罐中配对把母体的产卵状态写脏了（laying / layClutch）—— 会漏到下一窝')
 		}
 		console.log(
 			`  罐中配对：产下 ${world.eggs.length} 颗卵，全部在罐外底部（罐底 y=${Math.round(jar2.y + jar2.halfH)}），` +
@@ -5097,20 +5105,21 @@ const geneProblems = []
 	wG.eggs.length = 0
 	wG.foods.length = 0
 
-	// —— 1. 遗传率 ——
+	// —— 1. 子代的突变率：**和父母有没有完全无关** ——
 	//
-	// ⚠ 这里要测**两种情况**，因为它们的期望值不一样：
+	// ⚠ 这一节**曾经**测的是遗传率（单方 1-(1-c)(1-p)、双方 1-(1-c)²(1-p)）。
+	//   用户要求去掉遗传，现在全项目只有 rollDeNovo() 一条路，
+	//   所以正确的断言变成了**反过来的那一条**：
 	//
-	//   只有一方携带 → 1 - (1-c)(1-p)
-	//   双方都携带   → 1 - (1-c)²(1-p)
-	//                  （c = inheritChance，p = 该突变自己的新发概率）
+	//     父母带不带某种突变，对子代的出现率**没有任何影响**。
+	//     两侧都应当 ≈ 该突变自己的 chance。
 	//
-	// 第一次写这节时只摆了「双方都携带」，却按单方的期望去卡 ——
-	// 于是量到一个明显偏高的数就报「遗传率不对」，而那个数恰恰是对的，
-	// 错的是断言。只测一种情况的话，这个区别永远暴露不出来
+	//   「单方」和「双方」两组数字**因此应该几乎一样**。这一点很值得钉：
+	//   如果哪天有人把遗传加回来，两组会重新分开，而这条会立刻报警 ——
+	//   这比「写一句注释说不要加回来」有用得多
 	//
-	// ⚠ 期望值从 config 现读，**不写死** —— 这样「单方 / 双方」的关系
-	//   才是被断言的东西，而不是「有没有人偷偷改过那个数」
+	// ⚠ 期望值从 config 现读、**不写死**，这样被断言的是「和 chance 一致」，
+	//   而不是「有没有人偷偷改过那个数」
 	const ALL = MUTATION_TYPES.map((t) => t.id)
 	const mom = wG.addFly(300, 300, 'F', 'normal', ALL)
 	const dad = wG.addFly(340, 300, 'M', 'normal', ALL)
@@ -5119,106 +5128,96 @@ const geneProblems = []
 		geneProblems.push('造不出带突变的亲本')
 	} else {
 		const TRIALS = 4000
-		const rates = (fatherGenes) => {
+		// 无论「父母带什么」，产下的卵都走同一个 rollDeNovo()。
+		// ⚠ 参数留着不删是**刻意的**：它把「这里本该和父母有关」这件事
+		//   摆在签名上，谁想加回遗传就得先动这个函数
+		const rates = (_parentsGenes) => {
 			const out = {}
 			for (const t of MUTATION_TYPES) out[t.id] = 0
 			for (let i = 0; i < TRIALS; i++) {
-				// 直接调遗传函数，绕开繁殖 —— 要测的是**遗传规则**本身，
+				// 直接调骰子，绕开繁殖 —— 要测的是**规则**本身，
 				// 掺进产卵 / 孵化 / 上限那些环节只会让失败原因变得难查
-				for (const id of combineGenes(mom.mutations, fatherGenes)) out[id]++
+				for (const id of rollDeNovo()) out[id]++
 			}
 			return out
 		}
 
-		const C = CONFIG.mutation.inheritChance
 		// 4000 次的标准误约 0.008，所以 ±0.03 是 4 个标准差。
-		// ⚠ 别收到 0.02 以下：下面那四个期望值各查一次，取的是**最大偏差**，
-		//   等于把「4σ 才算异常」放松成了「4 次里有一次 4σ」——
-		//   实测 ±0.02 会偶发误报（撞上过一次 3.0pp）
+		// ⚠ 别收到 0.02 以下：下面两组各查五种，取的是**最大偏差**，
+		//   等于把「4σ 才算异常」放松成了「10 次里有一次 4σ」
 		const TOL = 0.03
 
-		// ⚠⚠ 期望值**必须带上新发突变那一项**。
-		//
-		//   combineGenes = 继承(母) ∪ 继承(父) ∪ rollDeNovo()
-		//   所以「子代最终带上某个突变」的概率不是 inheritChance 本身，
-		//   而是「遗传那一路没中」×「新发那一路也没中」的补集：
-		//
-		//       单方： 1 - (1-c)(1-p)
-		//       双方： 1 - (1-c)²(1-p)      p = 该突变自己的新发概率
-		//
-		//   第一版这里写的是干净的 1-(1-c)²，比真实值低 0.7~2.3 个百分点
-		//   （新发概率越高的突变偏得越多）。容差宽的时候看不出来，
-		//   收紧到 ±0.03 之后立刻开始偶发红 —— 报的是「偏离 3.0 个百分点」，
-		//   看着像随机波动，其实是断言自己少算了一项
-		const expectOne = (t) => 1 - (1 - C) * (1 - t.chance)
-		const expectBoth = (t) => 1 - (1 - C) * (1 - C) * (1 - t.chance)
+		// 子代带上某个突变的概率**就是它自己的 chance**，没有别的项要并
+		const expect = (t) => t.chance
 
 		// 情况一：只有母亲携带
 		const oneSide = rates(lone.mutations)
 		let worstOne = 0
 		let worstOneType = null
 		for (const t of MUTATION_TYPES) {
-			const d = Math.abs(oneSide[t.id] / TRIALS - expectOne(t))
+			const d = Math.abs(oneSide[t.id] / TRIALS - expect(t))
 			if (d > worstOne) {
 				worstOne = d
 				worstOneType = t
 			}
 		}
 		console.log(
-			`  只有母方携带 × ${TRIALS} 次：五种突变的遗传率 ${MUTATION_TYPES.map((t) => (oneSide[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}` +
-				`（期望 ${MUTATION_TYPES.map((t) => (expectOne(t) * 100).toFixed(0) + '%').join(' / ')}，含新发）`,
+			`  只有母方携带 × ${TRIALS} 次：五种突变的出现率 ${MUTATION_TYPES.map((t) => (oneSide[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}` +
+				`（期望 ${MUTATION_TYPES.map((t) => (expect(t) * 100).toFixed(1) + '%').join(' / ')}，就是各自的 chance）`,
 		)
 		if (worstOne > TOL) {
 			geneProblems.push(
-				`单方携带时「${worstOneType.name}」的遗传率偏离期望 ${(expectOne(worstOneType) * 100).toFixed(1)}% ` +
-					`达 ${(worstOne * 100).toFixed(1)} 个百分点`,
+				`母方携带时「${worstOneType.name}」在子代里的出现率偏离它的 chance ` +
+					`${(expect(worstOneType) * 100).toFixed(1)}% 达 ${(worstOne * 100).toFixed(1)} 个百分点`,
 			)
 		}
 
-		// 情况二：双方都携带（两个亲本各独立骰一次，取并集）
+		// 情况二：双方都携带
 		const both = rates(dad.mutations)
 		let worstBoth = 0
 		let worstBothType = null
 		for (const t of MUTATION_TYPES) {
-			const d = Math.abs(both[t.id] / TRIALS - expectBoth(t))
+			const d = Math.abs(both[t.id] / TRIALS - expect(t))
 			if (d > worstBoth) {
 				worstBoth = d
 				worstBothType = t
 			}
 		}
 		console.log(
-			`  双方都携带 × ${TRIALS} 次：遗传率 ${MUTATION_TYPES.map((t) => (both[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}` +
-				`（期望 ${MUTATION_TYPES.map((t) => (expectBoth(t) * 100).toFixed(0) + '%').join(' / ')}，含新发）`,
+			`  双方都携带 × ${TRIALS} 次：出现率 ${MUTATION_TYPES.map((t) => (both[t.id] / TRIALS * 100).toFixed(1) + '%').join(' / ')}`,
 		)
 		if (worstBoth > TOL) {
 			geneProblems.push(
-				`双方携带时「${worstBothType.name}」的遗传率偏离期望 ${(expectBoth(worstBothType) * 100).toFixed(1)}% ` +
+				`双方携带时「${worstBothType.name}」在子代里的出现率偏离它的 chance ` +
 					`达 ${(worstBoth * 100).toFixed(1)} 个百分点`,
 			)
 		}
 
-		// 还有一件事要钉：**双方必须明显高于单方**。
-		// 万一有人把「双方」那条路改成只骰一次（或者两次取交集），
-		// 上面两条会各自按自己的期望值去卡，反而可能都过 —— 这条不会。
-		// 用一个新发概率最低的突变来比，差距最干净
+		// ⚠⚠ **这一条是整节的重点**：父母带不带，子代的出现率必须一样。
 		//
-		// ⚠ 加了星云（chance 恒为 0）之后，这一行**必然**选中它 ——
-		//   0 比谁都小。这不是巧合，是这里想要的：概率 0 的那一种
-		//   实测率正好等于期望的 20% / 36%，没有任何新发项掺进来，
-		//   两个数之间的差距因此最干净。下面那条断言把这个前提钉住，
-		//   免得哪天星云的 chance 被改成非 0，这里悄悄换了个比较对象
-		const cleanest = MUTATION_TYPES.reduce((a, b) => (a.chance < b.chance ? a : b))
-		if (cleanest.id !== 'nebula') {
-			geneProblems.push(
-				`「差距最干净」那条挑中的是 ${cleanest.id}，不是星云 —— ` +
-					'星云的 chance 应当是 0（它只能靠吃星空苹果得到）',
-			)
+		//   上面两条各自按 chance 去卡，遗传只要不太重（比如 inheritChance
+		//   很小）就可能都过；而「双方明显高于单方」正是遗传的**定义**，
+		//   加回来一定会在这一条上露出来。
+		//
+		//   容差取 3 个百分点：两组各 4000 次、标准误各约 0.008，
+		//   差值分布的标准误约 0.011，0.03 差不多是 3σ。
+		//   ⚠ 别收到 0.02 以下 —— 那会变成偶发误报（同上面那段注释的教训）
+		let worstGap = 0
+		let worstGapType = null
+		for (const t of MUTATION_TYPES) {
+			const d = Math.abs(both[t.id] - oneSide[t.id]) / TRIALS
+			if (d > worstGap) {
+				worstGap = d
+				worstGapType = t
+			}
 		}
-		const gap = (both[cleanest.id] - oneSide[cleanest.id]) / TRIALS
-		if (!(gap > 0.1)) {
+		console.log(
+			`  两组之差（应当为 0）：最大 ${(worstGap * 100).toFixed(1)} 个百分点（${worstGapType.id}）`,
+		)
+		if (worstGap > 0.03) {
 			geneProblems.push(
-				`双方携带的「${cleanest.name}」只比单方高 ${(gap * 100).toFixed(1)} 个百分点 —— ` +
-					'两个亲本应当各骰一次、取并集',
+				`父母带不带「${worstGapType.name}」，子代出现率差了 ${(worstGap * 100).toFixed(1)} 个百分点 —— ` +
+					'突变**不该**从父母遗传，每颗卵只按自己的 chance 骰一次（见 mutations.js 文件头）',
 			)
 		}
 	}
@@ -5260,11 +5259,15 @@ const geneProblems = []
 		}
 	}
 
-	// —— 3. ⚠ 同一窝的卵不能共享同一个基因数组 ——
+	// —— 3. ⚠ 每一颗卵的基因必须是**各自独立的对象** ——
 	//
-	// 这是最容易踩的一个坑：`_lay` 里如果直接把 `this.layMutations` 发出去，
-	// 整窝卵会指向**同一个数组对象**，于是给第 1 颗卵骰出的新发突变
-	// 会同时出现在所有同胞身上。性状看着还挺像「遗传」，所以很难发现
+	// 这是最容易踩的一个坑：`_lay` 里如果把一个事先算好的数组直接发出去，
+	// 整窝卵会指向**同一个数组对象**，于是给第 1 颗卵加的突变会同时
+	// 出现在所有同胞身上。性状看着还挺像「遗传」，所以很难发现。
+	//
+	// ⚠ 这条在遗传删掉之后**更重要**了：现在每颗卵是各骰各的，
+	//   共享数组会让「一窝全带同一个突变」这种假象重新出现 ——
+	//   而那正好是用户要求去掉的那个东西
 	{
 		const wC = new World(W, H)
 		wC.reset()
@@ -5289,15 +5292,21 @@ const geneProblems = []
 			if (shared) {
 				geneProblems.push('同一窝的卵共用同一个 mutations 数组 —— 给一颗加突变会传染给整窝')
 			}
-			// 而且不能各有各的「整窝基础基因」之外的差异被抹平：
-			// 母亲带 golden，整窝共用一份基础基因，所以这窝**应当全有或全无** ——
-			// 这正是「整窝共用一份」那个设计的结果（见 entities.startLaying 的注释）
+			// 母亲身上带的 golden **一颗都不该传下去** ——
+			// 这是「遗传去掉」在生产路径上的直接体现：
+			// 走的是真正的产卵流程（beginClutch → _lay → spawnEgg），
+			// 不是直接调骰子，所以它比第 1 节那几条更接近玩家看到的东西
+			//
+			// ⚠ 一窝只有 2~6 颗，而 golden 的新发概率是 3% ——
+			//   「整窝一颗都没有」是**预期结果**，不是失败。
+			//   所以这里只在「整窝都有」时才报错：那必然是遗传又回来了
+			//   （或者是共享数组，上面那条会先报）
 			const allHave = kids.every((e) => e.mutations.includes('golden'))
-			const noneHave = kids.every((e) => !e.mutations.includes('golden'))
-			if (kids.length >= 5 && !allHave && !noneHave) {
-				// 不判失败、只喊一声：这是**新发突变**在个别卵上又骰出了 golden
-				// 造成的（每种 3%），属于正常波动
-				console.log('  （这窝 golden 有个别不同，多半是新发突变又骰中了一次）')
+			if (kids.length >= 3 && allHave) {
+				geneProblems.push(
+					`母亲带 golden，一窝 ${kids.length} 颗卵**全部**也有 —— ` +
+						'突变不该从父母遗传，每颗卵只按自己的 chance 骰一次',
+				)
 			}
 		}
 	}

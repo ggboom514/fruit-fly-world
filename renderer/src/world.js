@@ -154,14 +154,15 @@ export class World {
 		 *   不是「你现在养着一只」。
 		 *
 		 * ⚠ **不是世界状态，不进 serialize()**（那份字段表是手写的，不加就进不去）。
-		 *   它的真身在 UI 那边、落在 unlock.json 里，因为「见过」要跨得过
-		 *   「重新开始」。这里只是个**当场的收件箱**：世界往里丢，
-		 *   app.js 每帧把它抽干、交给 ui 去合并和落盘
+		 *   它的真身在 UI 那边、落在 unlock.json 里。这里只是个**当场的收件箱**：
+		 *   世界往里丢，app.js 每帧把它抽干、交给 ui 去合并和落盘
 		 *
 		 * ⚠ 必须是普通 Array，不能是 Set —— 同 config.js 里那条注释
 		 *
-		 * ⚠ 也**不在 reset() 里清**：它是「本场运行观察到的事件」，
-		 *   和这一局养了什么没关系。清的话，重置那一瞬间还没被抽干的记录会丢
+		 * ⚠ **在 reset() 里清掉**。它是「这个世界的观察记录」，
+		 *   而重置就是换一个世界 —— 留着的话，重置前一帧出生的那只虫
+		 *   还躺在收件箱里，重置完立刻被抽干、把新世界的图鉴点亮一格。
+		 *   用户要的是「重置之后图鉴从 0 开始」，所以这里必须断干净
 		 */
 		this.seenGenes = []
 
@@ -261,22 +262,30 @@ export class World {
 		// ⚠ settings **不在这里清**。它是个**偏好**，不是这一局养成的东西 ——
 		// 顺手把模式退回正常的话，玩家在烦人模式下每重置一次就得回去重设一次
 
-		// 开局的几只**要骰新发突变**。
+		// ⚠ 「本场观察到的事件」收件箱也一起清。
+		//   不清的话，重置**前一帧**刚出生的那只虫还躺在里面，
+		//   重置完立刻被主循环抽干、把图鉴又点亮一格 —— 而那个世界已经没了
+		this.seenGenes.length = 0
+
+		// 开局的这几只**不骰突变**，全是野生型。
 		//
-		// ⚠ 这是个刻意的例外。突变正常只在产卵时产生（见 Fly._lay），
-		//   所以投放 / 购买出来的果蝇都是野生型 —— 那样的话，
-		//   玩家要等整整一代（20 多分钟）才可能见到第一个变异，
-		//   等于新功能开局看不见。开局这几只走的是「生物学的出生」那条路，
-		//   骰一次是合理的；花钱买的那条路不骰（见 buyFlies）
+		// ⚠ 这里**曾经**是反的：那几只各骰一次 rollDeNovo()，理由是
+		//   「不然玩家要等整整一代才见得到第一个变异，新功能开局看不见」。
+		//   改成不骰是因为用户要「重置之后图鉴从 0 开始」——
+		//   开局就白送一格点亮的话，那句话就是假的
+		//   （实测：这批骰出至少一个变异的概率约六成，重置完图鉴往往是花的）
+		//
+		//   代价：重置后想见到第一个变异要等一整代，或者自己去喂星空苹果。
+		//   这是刻意的，别按「开局要有东西看」把它改回去
 		const W = CONFIG.world
 		for (let i = 0; i < W.initialFemales; i++) {
-			this.addFly(rand(0, this.w), rand(0, this.h), 'F', null, rollDeNovo())
+			this.addFly(rand(0, this.w), rand(0, this.h), 'F')
 		}
 		for (let i = 0; i < W.initialMales; i++) {
-			this.addFly(rand(0, this.w), rand(0, this.h), 'M', null, rollDeNovo())
+			this.addFly(rand(0, this.w), rand(0, this.h), 'M')
 		}
 		for (let i = 0; i < W.initialLarvae; i++) {
-			this.addLarva(rand(0, this.w), rand(0, this.h), null, 0, rollDeNovo())
+			this.addLarva(rand(0, this.w), rand(0, this.h))
 		}
 
 		// 开局先摆一份食物，不然前十几分钟屏幕是空的、也没什么可看的
@@ -399,7 +408,8 @@ export class World {
 	 * @param {{length:number, slim:number}|null} shape 这一批的幼虫体型性状
 	 * @param {number} clutch 窝号
 	 * @param {number} hatchBase 这一窝共用的基准孵化时间（毫秒）
-	 * @param {string[]} [mutations] 这颗卵的基因（父母遗传 + 新发，由母体在 _lay 里算好）
+	 * @param {string[]} [mutations] 这颗卵的基因 —— 由母体在 _lay 里**为它单独骰一次**
+	 *   （`rollDeNovo()`）。⚠ 和父母的基因没有任何关系，见 mutations.js 文件头
 	 */
 	spawnEgg(x, y, scale = 1, shape = null, clutch = 0, hatchBase = null, mutations = null) {
 		if (this.eggs.length >= this.maxEggs) return null
@@ -1144,17 +1154,19 @@ export class World {
 		}
 		if (!mother || !father) return
 
-		// ⚠ 用 clutchPlan(father.mutations) 而不是先写进 mother.fatherMutations
-		//   再调 startLaying —— 那样会把母体身上那套产卵字段写脏，
-		//   而罐里这条路**永远不会**走到 _endClutch 去清它
-		const plan = mother.clutchPlan(father.mutations)
+		// ⚠ 用 clutchPlan() 而不是先往母体身上写一套产卵字段再调 startLaying ——
+		//   那样会把母体身上那套字段写脏，而罐里这条路**永远不会**走到
+		//   _endClutch 去清它
+		//
+		// ⚠ 没有 genes：遗传去掉之后每颗卵自己骰（见 _layJarPending）。
+		//   clutchPlan 现在只算「卵多大 / 幼虫什么体型」
+		const plan = mother.clutchPlan()
 		const E = CONFIG.egg
 		const M = CONFIG.mating
 
 		jar.pending = {
 			left: randInt(M.eggsMin, M.eggsMax),
 			timer: 0, // 第一颗立刻产下，让玩家马上看到因果（和 startLaying 一致）
-			genes: plan.genes,
 			scale: plan.scale,
 			shape: plan.shape,
 			hatch: rand(E.hatchMin, E.hatchMax),
@@ -1196,10 +1208,9 @@ export class World {
 			this.h - margin,
 		)
 
-		// ⚠ 每颗卵**各骰一次新发突变**、而且是**新数组**。
-		//   直接发 p.genes 的话整窝共享同一个数组 —— 给一颗加突变等于给全部加
-		//   （外面那条路在 _lay 里有同样的注释，sim 里也有断言盯着）
-		this.spawnEgg(x, y, p.scale, p.shape, p.clutch, p.hatch, cleanGenes([...p.genes, ...rollDeNovo()]))
+		// ⚠ 每颗卵**各骰一次**，和父母的基因无关 ——
+		//   外面那条路在 Fly._lay 里有同样的注释，sim 里也有断言盯着
+		this.spawnEgg(x, y, p.scale, p.shape, p.clutch, p.hatch, rollDeNovo())
 
 		p.left--
 		if (p.left <= 0) jar.pending = null
@@ -1957,10 +1968,9 @@ export class World {
 				// 注意是 beginClutch 不是 startLaying：她还要先挑个安全的地方
 				// 飞过去，到了才开始产（见 Fly.beginClutch）
 				//
-				// ⚠ 父本的基因必须**在这里**交出去：她挑地方 + 飞过去要好几秒，
-				//   而这期间 father 可能被卖掉、被拍死、被关进罐子。
-				//   beginClutch 会拷一份存下来，之后就算父本没了也不影响这一窝
-				mother.beginClutch(this, father.mutations)
+				// ⚠ 这里**曾经**还要把 father.mutations 交出去存起来。遗传去掉
+				//   之后父本的基因对后代没有任何影响，那个参数也一起删了
+				mother.beginClutch(this)
 				mother.cooldown = CONFIG.mating.cooldown
 				father.cooldown = CONFIG.mating.cooldown
 				break

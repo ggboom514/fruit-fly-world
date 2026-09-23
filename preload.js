@@ -41,10 +41,11 @@ contextBridge.exposeInMainWorld('pet', {
 	/** 删掉存档（「重新开始」时用） */
 	clearSave: () => ipcRenderer.invoke('pet:clear-save'),
 
-	// —— 跨局进度（彩蛋解锁 + 图鉴见过哪些突变） ——
+	// —— 图鉴 + 彩蛋的进度 ——
 	//
-	// ⚠ 和存档**分开两个文件**：存档会被「重新开始」删掉，
-	//   而这两样要跨过那一步。详见主进程里 unlockFile() 那段注释
+	// ⚠ 和存档**分开两个文件**只是为了方便一起清、以及让自检能隔离，
+	//   **不是**因为要跨局：重置会把这两样连同存档一起清掉（真的是从 0）。
+	//   详见主进程里 unlockFile() 那段注释
 
 	/** 读跨局进度。没解锁过返回 {ok:true, data:{}} */
 	loadUnlock: () => ipcRenderer.invoke('pet:load-unlock'),

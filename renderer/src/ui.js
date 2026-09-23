@@ -59,6 +59,14 @@ const FOOD_NAME = { apple: '苹果', gold: '金苹果', star: '星空苹果' }
  */
 const CODEX_HIDDEN = '？？？'
 
+/**
+ * 重置第三道要玩家手打的那两个字。
+ *
+ * ⚠ 抽成常量是因为**自检要引用同一份** —— 断言里再写一遍字面量的话，
+ *   改了这里、忘了改断言，那条断言就会永远绿着（它自己跟自己对）
+ */
+const RESET_CONFIRM_WORD = '重置'
+
 export class UI {
 	/**
 	 * @param {import('./world.js').World} world
@@ -247,6 +255,15 @@ export class UI {
 			resetPop: $('reset-pop'),
 			resetOk: $('reset-ok'),
 			resetCancel: $('reset-cancel'),
+			// 第二、三道。⚠ 三道都要登记到 _overCard 的 pops 里，
+			// 漏一张的症状是「卡看得见、点不动」—— 不接管鼠标，点击穿到桌面上
+			resetPop2: $('reset-pop2'),
+			resetOk2: $('reset-ok2'),
+			resetCancel2: $('reset-cancel2'),
+			resetPop3: $('reset-pop3'),
+			resetOk3: $('reset-ok3'),
+			resetCancel3: $('reset-cancel3'),
+			resetTyped: $('reset-typed'),
 			sellAllPop: $('sellall-pop'),
 			sellAllOk: $('sellall-ok'),
 			sellAllCancel: $('sellall-cancel'),
@@ -427,8 +444,17 @@ export class UI {
 		// 关法就是上面这三种
 		// 点面板别处就关掉所有居中小卡。⚠ 用 closest 逐个判，不能只看
 		// 是不是捐了几张卡之一 —— 那样点在设置卡上会把设置卡自己关掉
+		// ⚠ 重置那三道**都要**列进来。漏掉后面两道的症状是：做到第二/第三道时
+		//   手滑点到面板上，卡片被关掉 —— 而那是「取消」的意思，玩家没想取消
 		const inAnyCard = (t) =>
-			!!(t.closest && (t.closest('#donate-pop') || t.closest('#settings-pop') || t.closest('#reset-pop')))
+			!!(
+				t.closest &&
+				(t.closest('#donate-pop') ||
+					t.closest('#settings-pop') ||
+					t.closest('#reset-pop') ||
+					t.closest('#reset-pop2') ||
+					t.closest('#reset-pop3'))
+			)
 		// ⚠ 这一次点击**同时也是彩蛋的计数器**（点十下解锁星空苹果）。
 		//   两件事共用一次点击是有意的：那颗罐子本来就长在那儿、本来就在发光，
 		//   不必再加第二颗藏起来的按钮 —— 藏起来的东西没人会去找。
@@ -495,18 +521,16 @@ export class UI {
 			this.setAnnoying(btn.dataset.mode === 'annoying')
 		})
 
-		// —— 重置：二次确认 ——
+		// —— 重置：**三道**确认 ——
 		//
-		// ⚠ 重置会连存档一起清掉，而工具栏那颗按钮和「重开一局」只差一次误触。
-		// 所以点它**只开确认卡**，真正清空在 #reset-ok 上
+		// ⚠ 重置会连存档、图鉴、彩蛋一起清掉，而工具栏那颗按钮和「重开一局」
+		//   只差一次误触。所以是 1 说明 → 2 标红再问 → 3 手打「重置」。
+		//
+		// ⚠ 三道用的是三张**并列**的卡，不是同一个 DOM 换文案：
+		//   换文案的话「取消」要按当前在第几步决定回到哪儿，迟早写错；
+		//   三张卡各自的取消都只是「全部关掉」，没有状态可记
 		this.el.btnReset.addEventListener('click', () => this.setResetOpen(true))
-		this.el.resetCancel.addEventListener('click', () => this.setResetOpen(false))
-		this.el.resetOk.addEventListener('click', () => {
-			this.setResetOpen(false)
-			this.world.reset()
-			this.refreshStats()
-			this._flashHint('已经重置了')
-		})
+		for (const step of [1, 2, 3]) this._bindResetStep(step)
 		this.el.panel.addEventListener('click', (e) => {
 			if (inAnyCard(e.target)) return
 			// ⚠ 这两条判的是「点在不在那颗按钮上」，所以必须用 closest 往上找 ——
@@ -1879,6 +1903,34 @@ export class UI {
 	}
 
 	/**
+	 * 把跨局进度整个清回零：彩蛋锁上、图鉴全灰。**重置和「重新开始」都走它。**
+	 *
+	 * ⚠ 不能用 `setStarUnlocked(false)` 代替 —— 那个方法在「本来就是 false」时
+	 *   **直接早退**（见它的第一行），根本不会落盘。而这个方法存在的意义
+	 *   恰恰是**确保写下去**
+	 *
+	 * ⚠ 也要清 `world.seenGenes`。那是「本场观察到的突变」的收件箱，
+	 *   重置前一帧出生的虫可能还躺在里面，不清的话几毫秒后就被抽干、
+	 *   把刚清空的图鉴又点亮
+	 */
+	clearProgress() {
+		this._starUnlocked = false
+		this._seenGenes = []
+		// world.reset() 里也清了一次，这里再兜一道：启动那条路（「重新开始」）
+		// 走的是 save.begin()，调用方未必顺手 reset 过世界
+		if (Array.isArray(this.world?.seenGenes)) this.world.seenGenes.length = 0
+		this._persistUnlock()
+
+		// 罐子的流光配色：默认态（锁着）是蓝紫的。⚠ 这里要显式加上 locked，
+		// 不能指望 setStarUnlocked —— 上面说了它会早退
+		this.el.btnDonate?.classList.toggle('locked', true)
+
+		// 投放面板和图鉴都是整块重建的，重建一次就跟着变了
+		this.refreshFeed()
+		if (this.view.codexOpen) this.refreshCodex()
+	}
+
+	/**
 	 * 设置解锁状态。
 	 *
 	 * @param {boolean} on
@@ -1948,18 +2000,106 @@ export class UI {
 	}
 
 	/**
-	 * 重置确认卡开 / 关。
+	 * 重置的第几道卡开着（0 = 都关着）。
 	 *
-	 * ⚠ 这张卡**没有右上角的 ✕** —— 它是个「你确定吗」的岔路口，
-	 * 不是一张随便看看的信息卡。想关就明确点「取消」或者按 Esc。
-	 * （Esc 那条在 _onKey 里，和捐款 / 设置一起处理）
+	 * ⚠ 用一个数字而不是三个布尔：三张卡**不可能同时开**，
+	 *   用三个布尔的话「同时开两张」是个能写出来但没意义的状态，
+	 *   而 _updateInteractive / Esc 都得为此各写一坨分支
 	 */
-	setResetOpen(open) {
-		const on = !!open
-		if (on === this.view.resetOpen) return
-		this.view.resetOpen = on
-		this.el.resetPop.classList.toggle('hidden', !on)
+	get resetStep() {
+		return this.view.resetStep
+	}
+
+	/** 第 step 道开 / 关。step = 0 表示三道全关 */
+	setResetStep(step) {
+		const n = step === 1 || step === 2 || step === 3 ? step : 0
+		if (n === this.view.resetStep) return
+		this.view.resetStep = n
+
+		for (const [i, el] of [
+			[1, this.el.resetPop],
+			[2, this.el.resetPop2],
+			[3, this.el.resetPop3],
+		]) {
+			el.classList.toggle('hidden', i !== n)
+		}
+
+		// 进第三道时把输入框清空、焦点给它 —— 这是个「手打两个字」的关卡，
+		// 不自动聚焦的话玩家得先自己点一下框，而那一下很容易被当成没反应
+		if (n === 3) {
+			this.el.resetTyped.value = ''
+			this.el.resetOk3.disabled = true
+			this.el.resetTyped.focus()
+		}
+
 		this._updateInteractive()
+	}
+
+	/** 兼容老名字：打开 = 进第一道，关闭 = 三道全关 */
+	setResetOpen(open) {
+		this.setResetStep(open ? 1 : 0)
+	}
+
+	/**
+	 * 绑定重置的某一道：取消 / 下一步 / 输入框。
+	 *
+	 * 第 1、2 道的「确定」只是**走到下一道**，真正的清空在第三道 —— 所以
+	 * 走到哪一步都不会动世界。
+	 */
+	_bindResetStep(step) {
+		const cancel = [this.el.resetCancel, this.el.resetCancel2, this.el.resetCancel3][step - 1]
+		cancel.addEventListener('click', () => this.setResetStep(0))
+
+		if (step === 1) {
+			this.el.resetOk.addEventListener('click', () => this.setResetStep(2))
+			return
+		}
+		if (step === 2) {
+			this.el.resetOk2.addEventListener('click', () => this.setResetStep(3))
+			return
+		}
+
+		// —— 第三道：手打「重置」才放行 ——
+		//
+		// ⚠ 用 `input` 事件而不是 `keyup` / `change`：input 才是「内容变了」的
+		//   唯一权威信号，输入法上屏（拼音候选词选完）走的也是它。
+		//   keyup 在中文输入法下经常拿不到最终文本
+		const input = this.el.resetTyped
+		const sync = () => {
+			this.el.resetOk3.disabled = input.value.trim() !== RESET_CONFIRM_WORD
+		}
+		input.addEventListener('input', sync)
+		// 回车 = 打对了就直接确认，打错了什么也不做（不要弹提示，那很吵）
+		input.addEventListener('keydown', (e) => {
+			if (e.key !== 'Enter') return
+			e.preventDefault()
+			if (!this.el.resetOk3.disabled) this._doReset()
+		})
+
+		this.el.resetOk3.addEventListener('click', () => this._doReset())
+	}
+
+	/**
+	 * 真的重置。**只有第三道那道门放行之后才会走到这里。**
+	 *
+	 * 三样一起清，缺一不可：
+	 *   · world.reset()      —— 这一局养的生态
+	 *   · ui.clearProgress() —— 图鉴 + 彩蛋（跨局进度）
+	 *   · save.clear()       —— 磁盘上的存档文件
+	 *
+	 * ⚠ 以前这里**只有 world.reset()**，存档是靠 15 秒一次的自动存档覆盖掉的。
+	 *   现在既然要清 unlock.json，就顺手把存档也真删了 ——
+	 *   「重置」这个词不该有一部分是靠「反正等会儿会被覆盖」实现的
+	 */
+	_doReset() {
+		this.setResetStep(0)
+		this.world.reset()
+		this.clearProgress()
+		// 存档是异步删的，不等它 —— 失败了也只是留着旧文件，
+		// 反正下一次自动存档会覆盖，不该卡住界面
+		this.save?.clear?.()
+		this.refreshStats()
+		this._flashHint('已经重置了 —— 图鉴和彩蛋也回到了 0')
 	}
 
 	/**
@@ -2265,7 +2405,12 @@ export class UI {
 		const pops = [
 			this.el.donatePop,
 			this.el.settingsPop,
+			// ⚠ 重置的三道**都要**列进来。漏掉后面两道的症状是：
+			//   卡片画得好好的，但指针压上去窗口不接管鼠标 ——
+			//   于是「确定」和输入框全点不动，点击直接穿到桌面上
 			this.el.resetPop,
+			this.el.resetPop2,
+			this.el.resetPop3,
 			this.el.keeperPop,
 			this.el.sellAllPop,
 			this.el.feedPop,
@@ -2348,6 +2493,20 @@ export class UI {
 	// ---------------------------------------------------------- 键盘
 
 	_onKey(e) {
+		// ⚠⚠ 焦点在输入框里时**整段让路**，一个键都不拦。
+		//
+		// 这条不是「顺手加的礼貌」，是必须的：这个监听挂在 `window` 上，
+		// 而工具快捷键是**裸字母**（F/N/G/C/V/B/W/R）。重置第三道要求玩家
+		// 手打「重置」两个字 —— 用拼音的话中间会经过 chongzhi 这一串，
+		// 里面的 c（抹布）、g（手套）、b（扫帚）、w（喷水枪）、r（打火机）
+		// **全部命中**。玩家一边打字一边把手里的工具换个遍，而且没有任何提示，
+		// 只会觉得「这个输入框邪门」。
+		//
+		// Esc 也一起挡掉：想取消第三道就点「取消」，那是明确的动作 ——
+		// 打字打到一半按 Esc 把整张卡关掉反而更像误触
+		const t = e.target
+		if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+
 		switch (e.code) {
 			case 'Escape':
 				// 弹窗开着时，Esc 先关弹窗，**不**顺手把工具也放掉 ——
@@ -2357,8 +2516,13 @@ export class UI {
 				// ⚠ 顺序有讲究：重置确认是**最上面**那一层（它是从设置之外
 				// 的另一条路弹出来的），所以排在前面。三张卡同时开着是不可能的，
 				// 但顺序写清楚比依赖「反正只会开一张」稳
-				if (this.view.resetOpen) {
-					this.setResetOpen(false)
+				// ⚠ 重置现在的三道用**一个** view.resetStep 表示，所以这里
+				//   一条分支就够了 —— 但撤销的粒度是「全关」：
+				//   按一下 Esc 从第三道直接跳回没有卡，而不是退回第二道。
+				//   「按一下只撤销最上面那一层」的直觉在这三道之间不成立 ——
+				//   它们是同一个动作的三道门，不是三层重叠的界面
+				if (this.view.resetStep) {
+					this.setResetStep(0)
 					break
 				}
 				// 卖光确认和重置确认是同一层的岔路口，排在别的卡片之前

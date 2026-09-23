@@ -34,7 +34,9 @@ const view = {
 	bootOpen: false, // 启动选择框开着时，整屏都要接管鼠标
 	donateOpen: false, // 捐款弹窗同理 —— 它上面有点得着的东西（见 ui.setDonateOpen）
 	settingsOpen: false, // 设置卡。和捐款卡同一套「居中小卡」的规矩
-	resetOpen: false, // 重置确认卡。同上
+	// 重置走到第几道确认（0 = 三道全关）。⚠ 是一个数字不是三个布尔：
+	// 三张卡不可能同时开，用三个布尔就会多出「同时开两张」这种没意义的状态
+	resetStep: 0,
 	keeperOpen: false, // 养蝇人配置卡。同上，入口在商店那一行里
 	sellAllOpen: false, // 罐子「全部出售」的二次确认卡。同上
 	feedOpen: false, // 投放弹窗。同上
@@ -62,6 +64,10 @@ const view = {
 
 const ui = new UI(world, view)
 const save = new SaveManager(world, ui)
+// ⚠ 反向引用：重置要连存档一起删（ui._doReset 里调 save.clear()）。
+//   不是可有可无的 —— 少了它 `.clear?.()` 那个可选链会**静默不做事**，
+//   看起来一切正常，只有存档文件静静地留着
+ui.save = save
 
 /**
  * 世界要不要推进。
