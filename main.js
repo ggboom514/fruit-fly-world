@@ -4847,7 +4847,7 @@ function runSelfTest() {
 									: t.fromStar
 										? '吃星空苹果获得'
 										: t.fromTool
-											? '金锤敲出来'
+											? '用 Banhammer 敲出来'
 											: '无法自然获得'
 							if (!cell.textContent.includes(want)) {
 								return {
@@ -5226,6 +5226,34 @@ function runSelfTest() {
 							}
 						}
 
+						// 结晶那格的**淡彩流动**（同一套做法的第二个实例）
+						//
+						// ⚠ 这里有个特别容易漏的点：**光查「填充是透明的」是不够的**。
+						//   少了 background-clip:text 的话，文字是**完全看不见**的，
+						//   而「fill 透明」那一条照样绿（透明 + 不裁到字形上 = 消失）。
+						//   所以两条必须成对查
+						const cryName = document.querySelector('[data-gene="crystal"] .codex-name')
+						if (!cryName) return { ok: false, reason: '图鉴里找不到结晶那格的说明文字' }
+						const cy = getComputedStyle(cryName)
+						if (cy.webkitTextFillColor.indexOf('0, 0, 0, 0') < 0) {
+							return { ok: false, reason: '结晶的说明文字不是渐变填充（淡彩流动没挂上）' }
+						}
+						const cyClip = cy.webkitBackgroundClip || cy.backgroundClip
+						if (cyClip !== 'text') {
+							return {
+								ok: false,
+								reason:
+									'结晶的说明文字没裁到字形上（background-clip = ' + cyClip +
+									'）—— 填充是透明的，再没裁上去的话这行字**整个看不见**',
+							}
+						}
+						if (cy.animationName !== 'border-flow') {
+							return {
+								ok: false,
+								reason: '结晶的说明文字没有在流动（animation-name = ' + cy.animationName + '）',
+							}
+						}
+
 						// —— 灰着的时候 ——
 						//
 						// ⚠ 只靠 .codex-cell.locked .gene-badge 那条 grayscale 是不够的：
@@ -5256,11 +5284,37 @@ function runSelfTest() {
 							}
 						}
 
+						// 结晶**没解锁**时也必须是静止的（和封禁同一条规矩）。
+						//
+						// ⚠ 得**另摆一次 seen**：上面那一步把它设成 ['crystal']，
+						//   那个状态下结晶是**亮着**的，灰态根本查不到
+						pet.ui._seenGenes = ['ban']
+						pet.ui.refreshCodex()
+						const cryLocked = document.querySelector('[data-gene="crystal"]')
+						if (!cryLocked || !cryLocked.classList.contains('locked')) {
+							return { ok: false, reason: '把结晶标成没见过，图鉴里那一格却没变灰' }
+						}
+						const cln = getComputedStyle(cryLocked.querySelector('.codex-name'))
+						if (cln.animationName !== 'none') {
+							return {
+								ok: false,
+								reason:
+									'没解锁的结晶格还在流动（' + cln.animationName +
+									'）—— 一格「？？？」不该是整张图鉴里最抢眼的',
+							}
+						}
+						if (cln.webkitTextFillColor.indexOf('0, 0, 0, 0') >= 0) {
+							return {
+								ok: false,
+								reason: '没解锁的结晶格文字还是渐变填充 —— locked 那条改的是 color，撤不掉渐变',
+							}
+						}
+
 						// 还原
 						pet.ui._seenGenes = savedSeen
 						pet.ui.refreshCodex()
 					} catch (e) {
-						return { ok: false, reason: '封禁那格的样式断言失败: ' + e.message }
+						return { ok: false, reason: '封禁 / 结晶那格的样式断言失败: ' + e.message }
 					}
 
 					pet.ui._onKey({ code: 'Escape' })

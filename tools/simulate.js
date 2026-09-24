@@ -5028,6 +5028,39 @@ const lifeProblems = []
 	}
 	console.log('  受惊：悬停的被踢出悬停、走路的起飞、方向背离指针')
 
+	// ⚠ 灵敏度。这条来自用户的**第二次**反馈：「成虫太容易被吓走了，
+	//   灵敏度调低一点」—— 而第一次是**反过来**的（「鼠标移动就会受惊飞走」）。
+	//   所以两头都要钉：中等强度**不许**起飞，贴脸全速**必须**起飞。
+	//   只钉一头的话，把 startleWakeAt 改回 0.06 或直接调到 1.0 都会全绿
+	const wokeAt = (power, dist) => {
+		wS.flies.length = 0
+		const f = wS.addFly(500, 500, 'M')
+		f.mode = 'walk'
+		f.pausing = true
+		f.aim = 0
+		wS.startle.x = 500 + dist
+		wS.startle.y = 500
+		wS.startle.power = power
+		wS._applyStartle()
+		return f.mode === 'fly'
+	}
+	// 中等强度 = 「稍微动一下手」。⚠ 这个点的 k 不是随手挑的 ——
+	// 它正是旧阈值 0.06 会误判成「起飞」的那一类，也就是用户抱怨的那种手感
+	const midK = 0.3 * (1 - 100 / CONFIG.tools.startleRadius)
+	if (wokeAt(0.3, 100)) {
+		lifeProblems.push(
+			`中等强度的挥手（k≈${midK.toFixed(2)}）就把果蝇惊飞了 —— ` +
+				`startleWakeAt=${CONFIG.tools.startleWakeAt} 太低，灵敏度又回去了`,
+		)
+	}
+	if (!wokeAt(1, 10)) {
+		lifeProblems.push('贴脸全速挥手都惊不飞果蝇 —— startleWakeAt 调过头了')
+	}
+	console.log(
+		`  灵敏度：中等挥手（k≈${midK.toFixed(2)}）不惊飞、贴脸全速（k≈1）才飞` +
+			`（阈值 ${CONFIG.tools.startleWakeAt}）`,
+	)
+
 	// —— 6. 饥饿：吃不到就饿死，留下尸体 ——
 	const wL = new World(W, H)
 	wL.reset()

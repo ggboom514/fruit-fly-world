@@ -1190,7 +1190,7 @@ export class UI {
 				CONFIG.tools.grabFlyRadius,
 				(f) => !f.canMove,
 			)
-			if (blocked) this._flashHint('封禁的果蝇拖不动 —— 拿金锤再敲一下卖掉它')
+			if (blocked) this._flashHint('封禁的果蝇拖不动 —— 拿 Banhammer 再敲一下卖掉它')
 			return
 		}
 
@@ -4493,7 +4493,11 @@ export class UI {
 			//   「无法自然获得」—— 对玩家来说等于「这格永远拿不到」，
 			//   而它其实买把 $999 的锤子就能敲出来。
 			//   ⚠ main.js 自检里**照抄了一份同样的三元表达式**，改这里要一起改
-			const origin = t.fromStar ? '吃星空苹果获得' : t.fromTool ? '金锤敲出来' : '无法自然获得'
+			// ⚠ 这里写的是**界面上真正的名字**（Banhammer），不是内部叫惯的「金锤」。
+			//   工具改名之后这两处漏了改，玩家会在图鉴里读到一把**商店里找不到的**
+			//   锤子 —— 这正是「介绍要只留对玩家有用的」那条的后半截：
+			//   说得再对，指不到东西也是废话
+			const origin = t.fromStar ? '吃星空苹果获得' : t.fromTool ? '用 Banhammer 敲出来' : '无法自然获得'
 			desc.textContent = t.chance > 0 ? `${(t.chance * 100).toFixed(1)}% · ${how}` : `${origin} · ${how}`
 		}
 		// ⚠ 胶囊在文字**上面**，和另外两行一样是 codex-text 的子节点 ——

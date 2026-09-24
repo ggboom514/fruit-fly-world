@@ -2892,6 +2892,69 @@ body.booting .inspect {
 }
 
 /*
+ * 结晶的**淡彩流动**：图鉴里那一格的说明文字。
+ *
+ * ⚠ 只做**文字**，没动胶囊外框 —— 用户要的是「结晶突变的**文字**也加上
+ *   淡彩流动」。封禁那格当初是先要了外框、后要的文字，两格长得不一样是对的，
+ *   别顺手把结晶的胶囊也改成流光的
+ *
+ * 做法和封禁那张一字不差（渐变填充 + 一圈实心描边 + `border-flow` 推着走），
+ * 只有配色换成结晶自己的**炫彩** —— 和 `crystalRim` 那圈会转的彩虹同一个色系。
+ * 刻意用**淡彩**（明度高的粉 / 蓝 / 紫 / 橙）而不是饱和原色：
+ * 深色弹窗底上饱和原色会往外跳，而且和「结晶」那种玻璃感对不上
+ *
+ * ⚠ 渐变**首尾必须同色**（都是 #8ee8dc）。图是 300% 宽、会 repeat 的，
+ *   首尾不同色的话每一圈接缝处会闪一下
+ * ⚠ 中途那几个色标是**按 RGB 排的**，不是按色相 —— 相邻两档之间要是跨得太远，
+ *   插值会从中间穿出一段发灰的泥色（peach 直接跳回 teal 就会）
+ */
+.codex-cell[data-gene='crystal'] {
+	--crystal-text: linear-gradient(
+		100deg,
+		#8ee8dc 0%,
+		#8fd4ff 14%,
+		#b3b6ff 28%,
+		#e3a8f0 42%,
+		#ffb3cf 56%,
+		#ffd9a8 70%,
+		#d6f0a8 84%,
+		#8ee8dc 100%
+	);
+}
+
+.codex-cell[data-gene='crystal'] .codex-name,
+.codex-cell[data-gene='crystal'] .codex-desc {
+	-webkit-text-stroke: 0.045em rgba(190, 250, 242, 0.55);
+	background: var(--crystal-text);
+	background-size: 300% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+	/* ⚠ 比封禁慢一档（3.2s → 5.4s）：结晶的设定是「慢慢转的彩虹」，
+	   跟金锤那一下的快闪不是一种东西 */
+	animation: border-flow 5.4s linear infinite;
+}
+
+.codex-cell[data-gene='crystal'] .codex-desc {
+	-webkit-text-stroke-color: rgba(190, 250, 242, 0.38);
+}
+
+/*
+ * 没解锁的结晶格：和封禁同一条规矩 —— 流光停掉、渐变整体撤掉。
+ *
+ * ⚠ 必须显式撤 `background` + `-webkit-text-fill-color`：locked 那条
+ *   `.codex-cell.locked .codex-name { color }` 改的是 `color`，
+ *   对渐变填充**完全无效**，不撤的话一格「？？？」会比亮着的格子还显眼
+ */
+.codex-cell.locked[data-gene='crystal'] .codex-name,
+.codex-cell.locked[data-gene='crystal'] .codex-desc {
+	animation: none;
+	-webkit-text-stroke: 0;
+	background: none;
+	-webkit-text-fill-color: currentColor;
+}
+
+/*
  * 描边流光（极稀有 / 超级稀有 / 传说生物 三档）。
  *
  * 做法：**把渐变画进边框本身**，再拿 `border-flow` 推着它走。
