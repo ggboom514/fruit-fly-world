@@ -5254,6 +5254,42 @@ function runSelfTest() {
 							}
 						}
 
+						// 胶囊里那两个字（「◇ 结晶」）
+						//
+						// ⚠ 这里要查的是**两层背景都在**，不只是「有没有渐变」。
+						//   胶囊的底也是拿 background 画的，一旦 background-clip 设成 text
+						//   把它一起裁到字形上，胶囊就变成一枚**空壳** ——
+						//   字还是流动的、断言里的前两条照样绿，
+						//   只有「比旁边几枚少了一层底」这一点不对
+						const cyBadge = document.querySelector('[data-gene="crystal"] .gene-badge')
+						if (!cyBadge) return { ok: false, reason: '图鉴里找不到结晶那枚胶囊' }
+						const cb2 = getComputedStyle(cyBadge)
+						if (cb2.webkitTextFillColor.indexOf('0, 0, 0, 0') < 0) {
+							return { ok: false, reason: '结晶胶囊里的字不是渐变填充' }
+						}
+						const cbClip = cb2.webkitBackgroundClip || cb2.backgroundClip
+						if (cbClip.indexOf('text') < 0) {
+							return {
+								ok: false,
+								reason: '结晶胶囊里的字没裁到字形上（background-clip = ' + cbClip + '）',
+							}
+						}
+						const cbLayers = cb2.backgroundImage.split('linear-gradient').length - 1
+						if (cbLayers < 2) {
+							return {
+								ok: false,
+								reason:
+									'结晶胶囊只剩 ' + cbLayers + ' 层背景，应当是 2 层' +
+									'（渐变 + 胶囊底色）—— 底被 background-clip:text 一起裁掉了，胶囊成了空壳',
+							}
+						}
+						if (cb2.animationName !== 'border-flow') {
+							return {
+								ok: false,
+								reason: '结晶胶囊里的字没有在流动（animation-name = ' + cb2.animationName + '）',
+							}
+						}
+
 						// —— 灰着的时候 ——
 						//
 						// ⚠ 只靠 .codex-cell.locked .gene-badge 那条 grayscale 是不够的：
@@ -5307,6 +5343,33 @@ function runSelfTest() {
 							return {
 								ok: false,
 								reason: '没解锁的结晶格文字还是渐变填充 —— locked 那条改的是 color，撤不掉渐变',
+							}
+						}
+						const clb = getComputedStyle(cryLocked.querySelector('.gene-badge'))
+						if (clb.animationName !== 'none') {
+							return { ok: false, reason: '没解锁的结晶胶囊还在流动（' + clb.animationName + '）' }
+						}
+						if (clb.webkitTextFillColor.indexOf('0, 0, 0, 0') >= 0) {
+							return {
+								ok: false,
+								reason: '没解锁的结晶胶囊里的字还是渐变填充',
+							}
+						}
+						// ⚠ 灰态下**底要还回来**：撤渐变时顺手把 background 清空的话，
+						//   这一枚会比旁边几枚少一层底（看着像空壳），而前面几条照样绿
+						//
+						// ⚠ 判据是「**还看得见底**」，不是「有没有渐变图层」——
+						//   底可以用 background-color 画（基类就是），也可以用 background-image。
+						//   第一版只数了 image 图层，于是把「用 background-color 把底还回来」
+						//   这个**正确**写法判成了 bug（实测当场红）——
+						//   断言写窄了比不写还坏：它会逼着人把对的代码改错
+						const clbLayers = clb.backgroundImage.split('linear-gradient').length - 1
+						const clbNoFill =
+							clb.backgroundColor.indexOf('0, 0, 0, 0') >= 0 && clbLayers < 1
+						if (clbNoFill) {
+							return {
+								ok: false,
+								reason: '没解锁的结晶胶囊连底色都没了 —— 撤渐变时把底一起抹掉了',
 							}
 						}
 

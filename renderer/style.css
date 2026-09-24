@@ -2940,6 +2940,39 @@ body.booting .inspect {
 }
 
 /*
+ * 胶囊里那两个字（「◇ 结晶」）也要流动。
+ *
+ * ⚠ 和封禁那枚**做法不同**，不是抄一份就完事：
+ *   封禁是「把渐变画进边框」，牌子内部靠两层不透明底色挡住；
+ *   这里要的是**字流动、胶囊本身照旧**（底还是那层 7% 白、边框还是实心青），
+ *   所以改成两层背景，各自裁各自的地方：
+ *     第 1 层（在上面）= 渐变，`background-clip: text` → 只画在字形里
+ *     第 2 层           = 原来那层 7% 白，`padding-box` → 照旧铺满胶囊
+ *   ⚠ 顺序不能反：背景是**先画的在下**，渐变放第二层就会被白底盖掉
+ *
+ * ⚠ 必须显式写 `background-color: transparent` —— 基类那条
+ *   `background: rgba(255,255,255,.07)` 是**简写**，它把颜色算进 background-color；
+ *   不清掉的话，`background-clip: text` 会把这层颜色也一起裁到字形上，
+ *   胶囊的底就没了（看着像一枚空壳，而这是没人会去查的那种「就是有点怪」）
+ *
+ * ⚠ `border-flow` 只动 `background-position`，对第 2 层（100% 宽）没有影响 ——
+ *   和 `.inspect.fx` 那边是同一个道理，两层不会一起被推着跑
+ */
+.codex-cell[data-gene='crystal'] .gene-badge {
+	background-color: transparent;
+	background-image:
+		var(--crystal-text),
+		linear-gradient(rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.07));
+	background-size:
+		300% 100%,
+		100% 100%;
+	background-clip: text, padding-box;
+	-webkit-background-clip: text, padding-box;
+	-webkit-text-fill-color: transparent;
+	animation: border-flow 5.4s linear infinite;
+}
+
+/*
  * 没解锁的结晶格：和封禁同一条规矩 —— 流光停掉、渐变整体撤掉。
  *
  * ⚠ 必须显式撤 `background` + `-webkit-text-fill-color`：locked 那条
@@ -2951,6 +2984,23 @@ body.booting .inspect {
 	animation: none;
 	-webkit-text-stroke: 0;
 	background: none;
+	-webkit-text-fill-color: currentColor;
+}
+
+/*
+ * 灰态下胶囊里的字也要撤干净。
+ *
+ * ⚠ 单独写一条，**不能并进上面去** —— 那几条里有 `background: none`，
+ *   而胶囊的底本来就是靠 background 画的，并进去会把底一起抹掉
+ *   （灰态下会变成一枚空壳，和旁边几枚长得不一样）。
+ *   这里要的是「撤掉渐变、把原来那层 7% 白还回来」
+ */
+.codex-cell.locked[data-gene='crystal'] .gene-badge {
+	animation: none;
+	background-image: none;
+	background-color: rgba(255, 255, 255, 0.07);
+	background-clip: border-box;
+	-webkit-background-clip: border-box;
 	-webkit-text-fill-color: currentColor;
 }
 
