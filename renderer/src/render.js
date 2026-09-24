@@ -260,6 +260,38 @@ const GOLD_PALETTE = {
 }
 
 /**
+ * 封禁蝇的调色板：**近黑的玻璃**。
+ *
+ * ⚠ 不能是纯黑。游戏是覆盖在桌面上的**透明**窗口，颜色再深也只是叠在壁纸上，
+ *   纯黑在深色壁纸上等于不存在 —— 所以真正让它「看得见」的是
+ *   `banSheen` 那几道流动的断口弧，这一套底色只负责「玻璃的暗」。
+ *   `_rim` 因此是**浅**的（石化那套是深的，别照抄）：黑玻璃需要一圈亮边
+ *   才能从深色壁纸上分出来
+ *
+ * ⚠ 眼睛跟着去色成灰蓝。理由和石化一模一样（见 STONE_PALETTE 那段）：
+ *   红眼是整只虫上饱和度最高的东西，它一留，「玻璃」就散了
+ */
+const OBSIDIAN_PALETTE = {
+	bodyColor: '#2f3743',
+	bodyColorLight: '#4e5867',
+	bodyColorDark: '#161a21',
+	thoraxColor: '#364050',
+	thoraxColorLight: '#5a6576',
+	headColor: '#232935',
+	eyeColor: '#93a0b2',
+	eyeColorHi: '#dae3f0',
+	eyeColorLo: '#4b5462',
+	legColor: 'rgba(58, 64, 76, 0.92)',
+	bristleColor: 'rgba(140, 154, 174, 0.38)',
+	femaleStripeColor: 'rgba(104, 116, 134, 0.4)',
+	maleAbdomenTip: 'rgba(86, 96, 112, 0.6)',
+	bodyGrainColor: 'rgba(160, 176, 198, 0.09)',
+	wingColor: 'rgba(132, 150, 176, 0.2)',
+	wingRootColor: 'rgba(158, 176, 200, 0.34)',
+	_rim: 'rgba(150, 168, 192, 0.5)',
+}
+
+/**
  * 按基因组合取调色板。没有突变就返回 CONFIG.visual 本身（零开销）。
  *
  * ⚠ 结果要**缓存**。drawFly 是每帧对每只果蝇各调一次，
@@ -277,9 +309,15 @@ function flyVisual(f) {
 	const hit = PALETTE_CACHE.get(key)
 	if (hit) return hit
 
-	// 叠加顺序：先石化再点石成金。两个都有时金色胜出 ——
-	// 金是更稀有、更「值钱」的那一个，被灰盖掉会很莫名其妙
+	// 叠加顺序：封禁 → 石化 → 点石成金，**后面的盖前面的**。
+	//
+	// ⚠ 封禁排**最前**（最弱），是有意的：它是一只虫**随时可能被敲上**的状态，
+	//   而石化 / 点石成金是它本来就有的身份。敲一锤就把人家养出来的金蝇
+	//   变成一块黑石头，玩家会觉得「我的金蝇被敲没了」。
+	//   封禁的身份靠 `banSheen` 那几道弧**叠**出来 —— 叠层在任何底色上都看得见，
+	//   所以并不需要靠调色板去抢
 	let v = CONFIG.visual
+	if (genes.includes('ban')) v = { ...v, ...OBSIDIAN_PALETTE }
 	if (genes.includes('stone')) v = { ...v, ...STONE_PALETTE }
 	if (genes.includes('golden')) v = { ...v, ...GOLD_PALETTE }
 	// 结晶不改颜色（它整只是透明的），但要走缓存，所以也得有个条目
@@ -379,24 +417,67 @@ function clamp01(v) {
 }
 
 /**
- * 封禁的金色流光：一条亮带沿着身体长轴扫过去。
+ * 封禁的黑曜石断口：一簇**同心弧**从焦点往外扩，像黑曜石被敲开时
+ * 那种一圈圈往外漾的贝壳状断口。
  *
- * ⚠ 和「点石成金」刻意做得**不一样**，两者同屏时要一眼分得开：
- *   · 点石成金 = `GOLD_PALETTE` **整只换一套金色** + 5 颗闪光点
- *   · 封禁     = **体色不动**，只有一条金带流过身体
- *   体色不动是刻意的：任何「整体偏金」的调色板都会往点石成金上靠，
- *   而且会让「流光到底画上没有」的像素断言变成空的（体色本身就能让它过）
+ * 一个「环」= 径向渐变里凸起的一小段。亮度走 `sin(πu)` 窗口：
  *
- * ⚠ 用 **clip + fillRect**，不用 stroke。文件末尾「关于描边」那条规矩是
+ *   ⚠ 两头必须都是 0。相位是 `% 1` 循环的，环走到 u=1 的下一帧会**跳回圆心**；
+ *     常数 alpha 的话这一跳看得清清楚楚（一道亮环凭空出现在正中间）。
+ *     两头淡出之后，环是「从中心浮现 → 最亮 → 扩到边上淡掉」，跳变刚好落在
+ *     全透明的那一刻，看不见
+ *   ⚠ 环数是 4、间隔 1/4 个周期 —— 任意时刻画面里都有 3~4 道，
+ *     而且是**一起**往外扩的（各扩各的会变成一团乱纹，不是断口）
+ *
+ * ⚠ 用径向渐变 + fillRect，**不用 stroke**。文件末尾「关于描边」那条规矩是
  *   「给填充形状勾边一律不要」，结晶那圈描边是**唯一**的例外，别当先例
  *
- * ⚠ 时间从 `f.frozenNow` 取（图鉴图标会把它定死成 0），没有才退回实时 ——
- *   和 crystalRim / drawGoldSparkle / 疯狂眼部呼吸同一条规矩
+ * @param {number} fx,fy 焦点的相对位置（乘 s）
+ * @param {number} sx,sy 压扁比例。≠1 时环变成椭圆弧 —— 断口不是正圆
+ * @param {number} phase 0~1 的相位
+ * @param {number} peak 最亮时的 alpha
+ */
+function obsidianRing(ctx, s, fx, fy, sx, sy, rot, phase, peak) {
+	const R = s * 1.9
+	ctx.save()
+	ctx.translate(s * fx, s * fy)
+	ctx.rotate(rot)
+	ctx.scale(sx, sy)
+
+	const g = ctx.createRadialGradient(0, 0, 0, 0, 0, R)
+	const N = 5
+	const W = 0.085 // 环的宽度（占半径的比例）
+	for (let i = 0; i < N; i++) {
+		// ⚠ 相位可能为负（下面那处调用减了个常数），所以要先 +1 再取模
+		const u = (((phase + i / N) % 1) + 1) % 1
+		const a = Math.sin(Math.PI * u) * peak
+		if (a < 0.005) continue
+		// 三个 offset 递增，clamp01 之后仍然递增 —— 越界会让 canvas 抛
+		// IndexSizeError，而那一帧的 draw 是被 try/catch 包住的，
+		// 表现是「这一帧后面所有东西都不画」，看起来像随机丢物件
+		g.addColorStop(clamp01(u - W), 'rgba(150, 176, 210, 0)')
+		g.addColorStop(clamp01(u), 'rgba(222, 238, 255, ' + a.toFixed(3) + ')')
+		g.addColorStop(clamp01(u + W), 'rgba(150, 176, 210, 0)')
+	}
+	ctx.fillStyle = g
+	ctx.fillRect(-R, -R, R * 2, R * 2)
+	ctx.restore()
+}
+
+/**
+ * 封禁的黑曜石流光：身体变成一块黑玻璃，断口弧在里面往外扩，外加一道扫过的玻璃高光。
  *
- * ⚠ 三个 offset 一律过 `clamp01`。越界时 canvas 抛 IndexSizeError，
- *   而 `app.js` 那一帧的 `renderer.draw` 是被 try/catch 包住的 ——
- *   表现是**这一帧后面所有东西都不画**（罐子 / 粒子 / 飘字全没了，
- *   只有虫还在），看起来像随机丢物件，极难归因
+ * ⚠ 和「点石成金」刻意做得**不一样**，两者同屏时要一眼分得开：
+ *   · 点石成金 = `GOLD_PALETTE` **整只换一套金色** + 5 颗闪光点（暖色、点状）
+ *   · 封禁     = 近黑玻璃 + **冷白**的弧线（冷色、线状）
+ *
+ * ⚠ 冷白是唯一的选择，不是审美：游戏是覆盖在桌面上的**透明**窗口，
+ *   任何「暗色描边 / 暗色字」在深色壁纸上都等于不存在。
+ *   黑曜石之所以看着是黑曜石，靠的是断口上那几道**反光**，不是它的黑。
+ *   所以这里的亮部要足够亮（峰值接近纯白），暗部只负责「看不见」。
+ *
+ * ⚠ 时间从 `f.frozenNow` 取（图鉴图标会把它定死），没有才退回实时 ——
+ *   和 crystalRim / drawGoldSparkle / 疯狂眼部呼吸同一条规矩
  *
  * @param {object} obj 带 `frozenNow` / `seed` 的东西（Fly 或 Larva）
  * @param {number} s 尺寸
@@ -404,11 +485,6 @@ function clamp01(v) {
  */
 function banSheen(ctx, obj, s, buildPath) {
 	const t = (obj.frozenNow ?? performance.now()) / 1000
-	// 相位从 -0.3 走到 1.3：进和出都在身体外面，两头都完整
-	const u = -0.3 + ((t * 0.55 + obj.seed * 0.137) % 1.6)
-	const a = clamp01(u - 0.2)
-	const b = clamp01(u)
-	const c = clamp01(u + 0.2)
 
 	ctx.save()
 	// ⚠ 必须自己兜住 globalAlpha：结晶把整个身体的 alpha 设成 0.14 一直留着，
@@ -417,13 +493,34 @@ function banSheen(ctx, obj, s, buildPath) {
 	ctx.globalAlpha = 1
 	buildPath()
 	ctx.clip()
-	const g = ctx.createLinearGradient(-s * 0.55, 0, s * 0.45, 0)
-	g.addColorStop(a, 'rgba(255, 214, 110, 0)')
-	// 中间那档比任何静态体色都亮 —— 像素断言就靠它区分「有流光 / 没流光」
-	g.addColorStop(b, 'rgba(255, 240, 190, 0.9)')
-	g.addColorStop(c, 'rgba(255, 214, 110, 0)')
+
+	// ① 玻璃底：把身体再压暗一档。
+	//    ⚠ 只压 0.34。压到 0.7 以上时虫会退化成一个纯黑的洞 ——
+	//    腿、翅脉、体节全被抹平，看着不像「黑玻璃」像「没画完」。
+	//    这东西的辨识度**只能**来自断口弧那几道反光，底色不该去抢
+	ctx.fillStyle = 'rgba(9, 12, 17, 0.34)'
+	ctx.fillRect(-s, -s * 0.9, s * 2, s * 1.8)
+
+	// ② 断口弧：**两簇**，焦点错开、压扁比例和倾角都不同。
+	//    一簇只是同心圆（像水波），两簇斜着交错才有贝壳断口那种斜切的弧
+	const ph = (t * 0.22 + obj.seed * 0.137) % 1
+	obsidianRing(ctx, s, -0.1, 0, 1.5, 0.85, 0, ph, 0.85)
+	obsidianRing(ctx, s, 0.2, 0, 1.1, 1.25, 0.5, ph * 0.78 - 0.31, 0.62)
+
+	// ③ 玻璃高光：一道宽而柔的亮带斜着扫过，和弧线交叉着走。
+	//    相位从 -0.35 走到 1.35：进和出都在身体外面，两头都完整
+	const u = -0.35 + ((t * 0.42 + obj.seed * 0.211) % 1.7)
+	const a = clamp01(u - 0.26)
+	const b = clamp01(u)
+	const c = clamp01(u + 0.26)
+	// 斜的不是正的 —— 正着扫会跟身体长轴平行，看起来像条纹背景在滚动
+	const g = ctx.createLinearGradient(-s * 0.6, -s * 0.5, s * 0.5, s * 0.5)
+	g.addColorStop(a, 'rgba(190, 214, 245, 0)')
+	g.addColorStop(b, 'rgba(240, 248, 255, 0.55)')
+	g.addColorStop(c, 'rgba(190, 214, 245, 0)')
 	ctx.fillStyle = g
-	ctx.fillRect(-s, -s * 0.8, s * 2, s * 1.6) // 铺满整个裁剪区
+	ctx.fillRect(-s, -s * 0.9, s * 2, s * 1.8)
+
 	ctx.restore()
 }
 
@@ -1808,7 +1905,15 @@ export function drawFoodIcon(ctx, type, size, seed = 7) {
  *   ⚠ 暗影**只取决于 size 和 sex，和基因无关** —— 这是它最本质的性质，
  *   自检靠它断言「所有灰格长得一模一样」
  */
-export function drawFlyIcon(ctx, mutations, size, seed = 7, silhouette = false) {
+/**
+ * @param {number} now 把效果的时间**定死**在某一刻（秒）。
+ *
+ * ⚠ 图鉴传默认值 0 就行。这个参数存在是为了让**离屏对照图**能画出动画的
+ *   不同相位 —— `tools/probe-obsidian.js` 就是靠它在同一张图上排出
+ *   「这一秒 / 下一秒」两列，否则一帧静止的图根本看不出「流动感」够不够。
+ *   实体对象永远不传，走 `performance.now()`
+ */
+export function drawFlyIcon(ctx, mutations, size, seed = 7, silhouette = false, now = 0) {
 	// —— 没见过的那几格：一个认不出品种的暗影 ——
 	//
 	// ⚠ 用的是**很淡的浅灰**，不是纯黑。弹窗底色本身是深色
@@ -1823,10 +1928,14 @@ export function drawFlyIcon(ctx, mutations, size, seed = 7, silhouette = false) 
 
 	// ⚠ 时间**定死**。结晶的流光色相、金蝇的闪光、疯狂的眼部呼吸都吃时间，
 	//   取实时的话每次打开图鉴都长得不一样，自检也没法断言。
-	//   这个值挑的是「金蝇那 5 颗闪点至少亮 2 颗」的相位 ——
+	//   默认值 0 挑的是「金蝇那 5 颗闪点至少亮 2 颗」的相位 ——
 	//   闪点有 `if (tw <= 0.25) continue`，运气不好会 5 颗全暗，
 	//   画出一只没有闪光的金蝇。自检里有一条断言金蝇格真的有亮黄像素
-	const FROZEN_NOW = 0
+	//
+	// ⚠ **别把默认值改掉**。它不只是「图鉴那一格画在第 0 秒」——
+	//   自检里所有基因格的像素断言都建立在这个定值上，改了会让那些断言
+	//   随相位飘。要换相位就显式传第 6 个参数
+	const FROZEN_NOW = now
 
 	// ⚠ 这个对象的字段**一个都不能少**，而且缺失的后果是「静默画错」不是「报错」：
 	//   · wingPhase 缺 → Math.sin(undefined)=NaN → ctx.rotate(NaN) 被规范忽略

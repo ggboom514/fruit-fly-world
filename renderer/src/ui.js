@@ -4459,7 +4459,11 @@ export class UI {
 		const badge = document.createElement('span')
 		badge.className = 'gene-badge'
 		badge.style.color = t.color
-		badge.style.borderColor = t.color
+		// ⚠ 封禁那枚的**边框**交给 style.css（黑曜石流光，按
+		//   `.codex-cell[data-gene='ban']` 选中的）。这里不能再写 inline ——
+		//   inline 样式盖过类规则，写了就等于把那圈流光关掉，
+		//   而症状只是「看起来跟别的胶囊一样」，不会报错
+		if (id !== 'ban') badge.style.borderColor = t.color
 		badge.textContent = t.icon + ' ' + t.name
 
 		const text = document.createElement('div')
@@ -4529,7 +4533,7 @@ export class UI {
 		//   「价值 ×1.5」那一档上面会自动拼上（走 t.valueMul）；
 		//   「完全不能动」没有对应的字段，漏了这一句图鉴上就只剩钱的事
 		if (t.id === 'ban') bits.push('完全不能移动（拖都拖不走）')
-		if (t.id === 'ban') bits.push('身体流过一道金光')
+		if (t.id === 'ban') bits.push('身体是流动的黑曜石断口')
 		return bits.length ? bits.join(' · ') : t.name
 	}
 

@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  黑曜石封禁效果 · 离屏对照图（开发用，不进打包）
+
+  ⚠ E/F 两段用的是**真的图鉴 DOM + 真的 style.css**（`.codex-cell[data-gene=ban]`
+     那几条规则），不是这里另写一份仿的 —— 仿的验不出真样式
+  ⚠ 动画相位靠负的 animation-delay 排开。静止一帧判断不了「流动感」
+-->
+<link rel="stylesheet" href="../renderer/style.css">
+<style>
+  html, body { margin: 0; padding: 0; background: #1b1917; color: #e8e4dc;
+    font-family: "Microsoft YaHei", sans-serif; }
+  .probe { padding: 18px 22px; }
+  h2 { font-size: 13px; font-weight: 600; margin: 22px 0 10px; color: #b9b1a4; }
+  h2:first-child { margin-top: 0; }
+  .row { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+  .cell { text-align: center; }
+  .cell canvas { display: block; }
+  .cap { font-size: 10px; color: #7d766c; margin-top: 4px; }
+  .bg-mid { background: #6b6a68; padding: 10px 14px; border-radius: 6px; }
+  .bg-dark { background: #16181c; padding: 10px 14px; border-radius: 6px; }
+
+  /* 图鉴那张卡的外壳。宽度取真的 #codex-pop 的 400px */
+  .fake-pop { width: 400px; padding: 16px 18px 14px; border-radius: 12px;
+    background: #1b1917; border: 1px solid rgba(232,184,75,.45); }
+  .fake-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+  /* 相位。⚠ 特异性必须**高于**真的那条
+     `.codex-cell[data-gene='ban'] .gene-badge`（0,3,0），
+     否则 animation 简写里的 delay:0 会把下面这条压掉 */
+  .codex-cell.ph1[data-gene='ban'] .gene-badge,
+  .codex-cell.ph1[data-gene='ban'] .codex-name,
+  .codex-cell.ph1[data-gene='ban'] .codex-desc { animation-delay: -0.8s; }
+  .codex-cell.ph2[data-gene='ban'] .gene-badge,
+  .codex-cell.ph2[data-gene='ban'] .codex-name,
+  .codex-cell.ph2[data-gene='ban'] .codex-desc { animation-delay: -1.6s; }
+  .codex-cell.ph3[data-gene='ban'] .gene-badge,
+  .codex-cell.ph3[data-gene='ban'] .codex-name,
+  .codex-cell.ph3[data-gene='ban'] .codex-desc { animation-delay: -2.4s; }
+
+  /* G · 把同一套真样式放大，用来看清「渐变到底画上没有」。
+     11px 的字在任何截图里都是一坨糊块，判不出颜色 */
+  #zoomCard { width: 760px; }
+  #zoomCard .codex-name { font-size: 34px !important; line-height: 1.4; }
+  #zoomCard .codex-desc { font-size: 22px !important; }
+  #zoomCard .gene-badge { font-size: 24px !important; padding: 3px 14px; }
+  /* 对照：把同一个元素的手动关掉动画 / 关掉渐变，看成因 */
+  #zoomCard .no-anim { animation: none !important; }
+  #zoomCard .no-stroke { -webkit-text-stroke: 0 !important; }
+  #zoomCard .no-clip {
+    background: none !important;
+    -webkit-text-fill-color: currentColor !important;
+  }
+</style>
+</head>
+<body>
+<div class="probe">
+<!-- ⚠ ?onlyzoom 时只留 G 段。单独截那一张时**必须**让它是页面上唯一的内容 ——
+     `capturePage` 传矩形是按 DIP 算的，而这台机器的显示缩放是 125%，
+     页面 CSS 1320px 实际渲染成 1650 设备像素，按 CSS 坐标裁出来的
+     是**歪**的一块（实测裁到了 C/D 段）。整页只有一段就没有这个坐标系问题 -->
+<div id="floats">
+
+  <h2>A · 流动感：灰底，8 个时刻（size 22）</h2>
+  <div class="row bg-mid" id="rowA"></div>
+
+  <h2>B · 深色壁纸，8 个时刻（size 22）</h2>
+  <div class="row bg-dark" id="rowB"></div>
+
+  <h2>C · 同屏区分（size 24, t = 0.5）</h2>
+  <div class="row bg-mid" id="rowC"></div>
+
+  <h2>D · 尺寸梯度（t = 0.5）</h2>
+  <div class="row bg-mid" id="rowD"></div>
+
+</div><!-- /#floats -->
+
+<div id="cards">
+  <h2>E · 图鉴：真 DOM（4 个相位并排）</h2>
+  <div class="row" style="align-items:flex-start">
+    <div class="fake-pop">
+      <div class="fake-grid" id="gridPhase"></div>
+    </div>
+  </div>
+
+  <h2>F · 左：没解锁（应完全静止、不发光）　右：已解锁</h2>
+  <div class="row" style="align-items:flex-start">
+    <div class="fake-pop">
+      <div class="fake-grid">
+        <div class="codex-cell locked" data-gene="ban" data-locked="1" id="cellLocked">
+          <canvas class="codex-icon gene-preview" width="34" height="34"></canvas>
+          <div class="codex-text">
+            <span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>
+            <div class="codex-name">？？？</div>
+            <div class="codex-desc">？？？</div>
+          </div>
+        </div>
+        <div class="codex-cell" data-gene="ban" id="cellOpen">
+          <canvas class="codex-icon gene-preview" width="34" height="34"></canvas>
+          <div class="codex-text">
+            <span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>
+            <div class="codex-name">价值 ×1.5 · 完全不能移动（拖都拖不走） · 身体是流动的黑曜石断口</div>
+            <div class="codex-desc">金锤敲出来 · 幼虫和成虫都显形</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="fake-pop">
+      <div class="fake-grid">
+        <div class="codex-cell" data-gene="stone">
+          <canvas class="codex-icon gene-preview" width="34" height="34"></canvas>
+          <div class="codex-text">
+            <span class="gene-badge" style="color:#9a938a;border-color:#9a938a">✦ 石化</span>
+            <div class="codex-name">体重 ×1.5 · 失去飞行</div>
+            <div class="codex-desc">1.0% · 幼虫和成虫都显形</div>
+          </div>
+        </div>
+        <div class="codex-cell" data-gene="golden">
+          <canvas class="codex-icon gene-preview" width="34" height="34"></canvas>
+          <div class="codex-text">
+            <span class="gene-badge" style="color:#e8b84b;border-color:#e8b84b">✧ 点石成金</span>
+            <div class="codex-name">价值 ×2 · 通体金色、带闪光</div>
+            <div class="codex-desc">0.3% · 幼虫和成虫都显形</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /#cards -->
+
+<div id="zoomWrap">
+  <h2>G · 放大到 34px 看颜色（同一套真样式）</h2>
+  <div class="fake-pop" id="zoomCard">
+    <div style="color:#7d766c;font-size:11px;margin-bottom:4px">1 · 原样（渐变 + 描边 + 动画）</div>
+    <div class="codex-cell" data-gene="ban" style="margin-bottom:14px">
+      <div class="codex-text">
+        <span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>
+        <div class="codex-name">黑曜石断口 Aa</div>
+        <div class="codex-desc">金锤敲出来 Aa</div>
+      </div>
+    </div>
+    <div style="color:#7d766c;font-size:11px;margin-bottom:4px">2 · 关掉动画</div>
+    <div class="codex-cell no-anim" data-gene="ban" style="margin-bottom:14px">
+      <div class="codex-text"><div class="codex-name">黑曜石断口 Aa</div></div>
+    </div>
+    <div style="color:#7d766c;font-size:11px;margin-bottom:4px">3 · 关掉描边</div>
+    <div class="codex-cell no-stroke" data-gene="ban" style="margin-bottom:14px">
+      <div class="codex-text"><div class="codex-name">黑曜石断口 Aa</div></div>
+    </div>
+    <div style="color:#7d766c;font-size:11px;margin-bottom:4px">4 · 关掉渐变（看纯文字本该是什么色）</div>
+    <div class="codex-cell no-clip" data-gene="ban" style="margin-bottom:14px">
+      <div class="codex-text"><div class="codex-name">黑曜石断口 Aa</div></div>
+    </div>
+    <div style="color:#7d766c;font-size:11px;margin-bottom:4px">5 · 关掉描边 + 动画</div>
+    <div class="codex-cell no-anim no-stroke" data-gene="ban">
+      <div class="codex-text"><div class="codex-name">黑曜石断口 Aa</div></div>
+    </div>
+  </div>
+</div><!-- /#zoomWrap -->
+
+</div>
+
+<script>
+  // 只在页面上留一段 —— capturePage 传矩形会撞上 125% 显示缩放（裁歪），
+  // 所以「看某一段」的办法是让别的段整个不渲染
+  const mode = location.search
+  const hide = []
+  if (mode.indexOf('onlyzoom') >= 0) hide.push('#floats', '#cards')
+  if (mode.indexOf('onlycards') >= 0) hide.push('#floats', '#zoomWrap')
+  if (hide.length) {
+    const s = document.createElement('style')
+    s.textContent = hide.join(', ') + ' { display: none }'
+    document.head.append(s)
+  }
+</script>
+<script type="module">
+import { drawFlyIcon } from '../renderer/src/render.js'
+
+function mk(size) {
+  const dpr = window.devicePixelRatio || 1
+  const cv = document.createElement('canvas')
+  cv.width = Math.floor(size * dpr); cv.height = Math.floor(size * dpr)
+  cv.style.width = size + 'px'; cv.style.height = size + 'px'
+  const ctx = cv.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.translate(size / 2, size / 2)
+  return { cv, ctx }
+}
+function cell(parent, size, genes, now, cap) {
+  const box = document.createElement('div')
+  box.className = 'cell'
+  const { cv, ctx } = mk(size)
+  drawFlyIcon(ctx, genes, size * 0.58, 7, false, now)
+  box.append(cv)
+  if (cap) { const c = document.createElement('div'); c.className = 'cap'; c.textContent = cap; box.append(c) }
+  parent.append(box)
+}
+
+for (const id of ['rowA', 'rowB']) {
+  const row = document.getElementById(id)
+  for (let i = 0; i < 8; i++) cell(row, 22, ['ban'], i * 0.3, (i * 0.3).toFixed(1) + 's')
+}
+
+const rowC = document.getElementById('rowC')
+cell(rowC, 24, [], 0.5, '普通')
+cell(rowC, 24, ['stone'], 0.5, '石化')
+cell(rowC, 24, ['golden'], 0.5, '点石成金')
+cell(rowC, 24, ['ban'], 0.5, '封禁')
+cell(rowC, 24, ['crystal'], 0.5, '结晶')
+cell(rowC, 24, ['berserk'], 0.5, '疯狂')
+
+const rowD = document.getElementById('rowD')
+for (const sz of [11, 14, 18, 22, 30, 42]) cell(rowD, sz, ['ban'], 0.5, sz + 'px')
+
+// E · 真 DOM，4 个相位
+const NAME = '价值 ×1.5 · 完全不能移动（拖都拖不走） · 身体是流动的黑曜石断口'
+const DESC = '金锤敲出来 · 幼虫和成虫都显形'
+const grid = document.getElementById('gridPhase')
+for (let i = 0; i < 4; i++) {
+  const c = document.createElement('div')
+  c.className = 'codex-cell' + (i ? ' ph' + i : '')
+  c.dataset.gene = 'ban'
+  const cv = document.createElement('canvas')
+  cv.className = 'codex-icon gene-preview'
+  const t = document.createElement('div')
+  t.className = 'codex-text'
+  t.innerHTML =
+    '<span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>' +
+    '<div class="codex-name"></div><div class="codex-desc"></div>'
+  t.querySelector('.codex-name').textContent = NAME
+  t.querySelector('.codex-desc').textContent = DESC
+  c.append(cv, t)
+  grid.append(c)
+  const dpr = window.devicePixelRatio || 1
+  cv.width = Math.floor(34 * dpr); cv.height = Math.floor(34 * dpr)
+  const ctx = cv.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.translate(17, 17)
+  drawFlyIcon(ctx, ['ban'], 34 * 0.58, 7, false, 0)
+}
+
+// F · locked / unlocked 各 34px
+for (const id of ['cellLocked', 'cellOpen']) {
+  const cv = document.getElementById(id).querySelector('canvas')
+  const dpr = window.devicePixelRatio || 1
+  cv.width = Math.floor(34 * dpr); cv.height = Math.floor(34 * dpr)
+  const ctx = cv.getContext('2d')
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  ctx.translate(17, 17)
+  drawFlyIcon(ctx, ['ban'], 34 * 0.58, 7, document.getElementById(id).classList.contains('locked'), 0)
+}
+
+// 诊断：把真 DOM 上算出来的样式打出来，看是哪一条没生效
+{
+  const el = document.querySelector(".codex-cell[data-gene='ban'] .codex-name")
+  const bd = document.querySelector(".codex-cell[data-gene='ban'] .gene-badge")
+  const cs = getComputedStyle(el)
+  const cb = getComputedStyle(bd)
+  window.__diag = {
+    name: {
+      clip: cs.webkitBackgroundClip || cs.backgroundClip,
+      fill: cs.webkitTextFillColor,
+      img: (cs.backgroundImage || '').slice(0, 44),
+      size: cs.backgroundSize,
+      pos: cs.backgroundPosition,
+      strokeW: cs.webkitTextStrokeWidth,
+      strokeC: cs.webkitTextStrokeColor,
+      anim: cs.animationName + ' ' + cs.animationDuration,
+      color: cs.color,
+    },
+    badge: {
+      borderColor: cb.borderTopColor,
+      anim: cb.animationName + ' ' + cb.animationDuration,
+      layers: cb.backgroundImage.split('linear-gradient').length - 1,
+      size: cb.backgroundSize,
+    },
+  }
+}
+
+window.__probeReady = true
+</script>
+</body>
+</html>

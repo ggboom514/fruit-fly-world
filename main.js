@@ -1785,6 +1785,9 @@ function runSelfTest() {
 				// 图鉴基因格那张探针画出来的红能量：[普通蝇, 疯狂蝇]。
 				// 只为了打进成功日志 —— 下次调泛光强度时能直接看到数
 				let flyIconRed = null
+				// 图鉴基因格那张探针量出来的冷暖偏向：[普通蝇, 封禁蝇]。
+				// 正数 = 偏暖。同样只为打进成功日志
+				let flyIconPolarity = null
 				try {
 					const w3 = pet.world
 					w3.larvae.length = 0
@@ -5026,6 +5029,86 @@ function runSelfTest() {
 							}
 						}
 
+						// 4.6) 封禁那格**真的是冷色的黑玻璃，而且断口弧画上了**。
+						//
+						// ⚠ 判据只能走**相对量**，不能写死颜色：图鉴上写着
+						//   「身体是流动的黑曜石断口」，画出来却是一只暖色的普通蝇
+						//   也不报任何错。可用的对照是「普通蝇本来就是暖的」
+						//   （暗红头 + 红眼），封禁那只是冷的（近黑玻璃 + 冷白弧）
+						//
+						// ⚠ 两条必须成对。少了上面那条，「探针根本没画上」
+						//   （两张都是 0）也会让它绿
+						const coldOf = (cv) => {
+							const d = paintOf(cv)
+							let e = 0
+							for (let i = 0; i < d.length; i += 4) {
+								e += Math.max(0, d[i + 2] - d[i]) * (d[i + 3] / 255)
+							}
+							return e
+						}
+						const warmOf = (cv) => {
+							const d = paintOf(cv)
+							let e = 0
+							for (let i = 0; i < d.length; i += 4) {
+								e += Math.max(0, d[i] - d[i + 2]) * (d[i + 3] / 255)
+							}
+							return e
+						}
+
+						const banCell = document.querySelector('[data-gene="ban"]')
+						if (!banCell) return { ok: false, reason: '图鉴里找不到封禁那一格' }
+						const banCv = banCell.querySelector('canvas')
+						if (!banCv) return { ok: false, reason: '找不到封禁那一格的画布' }
+
+						const scratch = document.createElement('canvas')
+						scratch.width = 34
+						scratch.height = 34
+						const sctx = scratch.getContext('2d')
+						sctx.translate(17, 17)
+						// 尺寸和种子**和基因格里的完全一致**，量的才是玩家真看到的那张
+						pet.drawFlyIcon(sctx, [], 34 * 0.58, 7, false)
+
+						const plainCold = coldOf(scratch)
+						const plainWarm = warmOf(scratch)
+						const banCold = coldOf(banCv)
+						const banWarm = warmOf(banCv)
+						flyIconPolarity = [plainWarm - plainCold, banCold - banWarm]
+
+						if (!(plainWarm > plainCold)) {
+							return {
+								ok: false,
+								reason:
+									'普通蝇量出来居然不偏暖（暖 ' + plainWarm.toFixed(0) + ' / 冷 ' +
+									plainCold.toFixed(0) + '）—— 探针本身就不对，下面那条不算数',
+							}
+						}
+						if (!(banCold > banWarm)) {
+							return {
+								ok: false,
+								reason:
+									'封禁那格不偏冷（冷 ' + banCold.toFixed(0) + ' / 暖 ' + banWarm.toFixed(0) +
+									'）—— 图鉴上写着「身体是流动的黑曜石断口」，画出来却还是暖色的。' +
+									'多半是 OBSIDIAN_PALETTE 没进 flyVisual 的叠加链',
+							}
+						}
+
+						// 冷色里还得有**亮**的 —— 黑曜石的黑不提供辨识度，
+						// 全靠断口那几道反光（见 render.banSheen 的注释）。
+						// 只查「偏冷」的话，一只纯深蓝的死虫子也能过
+						const bd = paintOf(banCv)
+						let arc = 0
+						for (let i = 0; i < bd.length; i += 4) {
+							if (bd[i + 3] > 0 && bd[i + 2] > 170 && bd[i + 2] - bd[i] > 40) arc++
+						}
+						if (arc === 0) {
+							return {
+								ok: false,
+								reason:
+									'封禁那格一个亮的冷色像素都没有 —— 断口弧没画上。' +
+									'banSheen 里那两处 obsidianRing 调用多半没执行',
+							}
+						}
+
 						// 5) 疯狂的红光。
 						//    ⚠ 不能只查「有没有红色像素」：普通蝇自己就有红眼
 						//   （eyeColor #c62f22、headColor #63201c）。图鉴五格里也没有
@@ -5064,6 +5147,121 @@ function runSelfTest() {
 					// 查完了，把 seen 还原 —— 后面还有断言要看真实状态
 					pet.ui._seenGenes = savedSeen
 					pet.ui.refreshCodex()
+
+					// —— 封禁那格的**样式**：黑曜石流光真的挂上去了吗 ——
+					//
+					// ⚠ 这一段抓的是「CSS 选择器悄悄没匹配上」。ui.js 用
+					//   cell.dataset.gene = id 写属性，style.css 用
+					//   [data-gene='ban'] 去选 —— 任意一边改了名字，结果只是
+					//   **那枚胶囊长得和别的胶囊一样**：不报错、不崩、
+					//   上面那些像素断言也全绿（画像和样式是两回事）。
+					//
+					//   ui.js 里「封禁不写 inline borderColor」那句同理：
+					//   写回去就会盖掉 CSS，症状和上面一模一样
+					try {
+						const allGenes = pet.config.mutation.types.map((t) => t.id)
+
+						// —— 亮着的时候 ——
+						pet.ui._seenGenes = allGenes
+						pet.ui.refreshCodex()
+						let cell = document.querySelector('[data-gene="ban"]')
+						if (!cell) return { ok: false, reason: '图鉴里找不到封禁那一格' }
+						if (cell.classList.contains('locked')) {
+							return { ok: false, reason: '把封禁标成见过了，图鉴里那一格却还是灰的' }
+						}
+
+						const badge = cell.querySelector('.gene-badge')
+						if (!badge) return { ok: false, reason: '封禁那一格没有胶囊' }
+						const bc = getComputedStyle(badge)
+						if (bc.borderTopColor.indexOf('0, 0, 0, 0') < 0) {
+							return {
+								ok: false,
+								reason:
+									'封禁胶囊的边框不是透明的（' + bc.borderTopColor + '）—— ' +
+									'黑曜石那圈流光是拿 background 画进边框里的，边框不透明就把它整个盖住了。' +
+									'多半是 ui.js 又把 borderColor 写成了 inline',
+							}
+						}
+						if (bc.animationName !== 'border-flow') {
+							return {
+								ok: false,
+								reason:
+									'封禁胶囊没有在流动（animation-name = ' + bc.animationName + '）—— ' +
+									'多半是 [data-gene=ban] 那条选择器没匹配上',
+							}
+						}
+						const layers = bc.backgroundImage.split('linear-gradient').length - 1
+						if (layers < 3) {
+							return {
+								ok: false,
+								reason:
+									'封禁胶囊只有 ' + layers + ' 层背景，应当是 3 层' +
+									'（两层不透明内芯 + 一层会流动的渐变边框）',
+							}
+						}
+
+						const nm = cell.querySelector('.codex-name')
+						if (!nm) return { ok: false, reason: '封禁那一格没有说明文字' }
+						const nc = getComputedStyle(nm)
+						if (nc.webkitTextFillColor.indexOf('0, 0, 0, 0') < 0) {
+							return {
+								ok: false,
+								reason:
+									'封禁的说明文字不是渐变填充（-webkit-text-fill-color = ' +
+									nc.webkitTextFillColor + '）。少写那一句的话文字是实心灰的，' +
+									'渐变完全看不见，而且不会报错',
+							}
+						}
+						const clip = nc.webkitBackgroundClip || nc.backgroundClip
+						if (clip !== 'text') {
+							return {
+								ok: false,
+								reason: '封禁的说明文字没有裁到字形上（background-clip = ' + clip + '）',
+							}
+						}
+						if (nc.animationName !== 'border-flow') {
+							return {
+								ok: false,
+								reason: '封禁的说明文字没有在流动（animation-name = ' + nc.animationName + '）',
+							}
+						}
+
+						// —— 灰着的时候 ——
+						//
+						// ⚠ 只靠 .codex-cell.locked .gene-badge 那条 grayscale 是不够的：
+						//   filter 只改颜色，动画照跑。一格「？？？」会成为整张图鉴里
+						//   唯一在动的东西，而「在动」在余光里就是「值得看」
+						pet.ui._seenGenes = ['crystal']
+						pet.ui.refreshCodex()
+						cell = document.querySelector('[data-gene="ban"]')
+						if (!cell || !cell.classList.contains('locked')) {
+							return { ok: false, reason: '把封禁标成没见过，图鉴里那一格却没变灰' }
+						}
+						const ln = getComputedStyle(cell.querySelector('.codex-name'))
+						const lb = getComputedStyle(cell.querySelector('.gene-badge'))
+						if (ln.animationName !== 'none' || lb.animationName !== 'none') {
+							return {
+								ok: false,
+								reason:
+									'没解锁的封禁格还在流动（文字 ' + ln.animationName + ' / 胶囊 ' +
+									lb.animationName + '）—— 那一格现在是「你还没拿到」，不该是最抢眼的',
+							}
+						}
+						if (ln.webkitTextFillColor.indexOf('0, 0, 0, 0') >= 0) {
+							return {
+								ok: false,
+								reason:
+									'没解锁的封禁格文字还是渐变填充 —— locked 那条 rule 改的是 color，' +
+									'对渐变填充完全无效，必须显式把 background 和 fill 一起撤掉',
+							}
+						}
+
+						// 还原
+						pet.ui._seenGenes = savedSeen
+						pet.ui.refreshCodex()
+					} catch (e) {
+						return { ok: false, reason: '封禁那格的样式断言失败: ' + e.message }
+					}
 
 					pet.ui._onKey({ code: 'Escape' })
 					if (!cpop.classList.contains('hidden')) {
@@ -6577,6 +6775,7 @@ function runSelfTest() {
 					foodLockNeed: pet.config.market.foodUnlock.gold,
 					achievementCount: pet.config.achievements.length,
 					flyIconRed,
+					flyIconPolarity,
 					updateVersion: updateInfo ? updateInfo.version : null,
 					banTool: banTag,
 					toolIcons: iconTag,
@@ -6606,6 +6805,18 @@ function runSelfTest() {
 								`（红能量 ${report.flyIconRed[0].toFixed(0)} → ${report.flyIconRed[1].toFixed(0)}）`
 							: '疯狂的红眼泛光：**没量到**') +
 						'\n' +
+						// 封禁那格是**冷**的、普通蝇是**暖**的。这两个数就是那条断言量到的东西 ——
+						// 下次调黑曜石的亮度时能直接看到它有没有偏回去
+						//
+						// ⚠ 两个数的**符号含义相反**（一个是 暖-冷、一个是 冷-暖），
+						//   所以绝不能写成「正数=偏暖」一句带过 —— 那会让第二个数
+						//   读起来正好是反的。分开写清楚
+						(report.flyIconPolarity
+							? `  封禁画像：黑玻璃 + 冷白断口弧` +
+								`（普通蝇 偏暖 +${report.flyIconPolarity[0].toFixed(0)}，` +
+								`封禁 偏冷 +${report.flyIconPolarity[1].toFixed(0)}）；` +
+								`胶囊外框和说明文字的流动描边已挂上（[data-gene=ban] 那几条 rule 匹配成功）\n`
+							: '  封禁画像：**没量到**\n') +
 					`  食物解锁：**苹果没有门槛**（口粮永远买得到）；金苹果要**累计总收入** ≥ $${report.foodLockNeed}` +
 						'（不是手里的钱）。没过线时投放面板那一行不出现、底下写一句点名道姓的提示，图鉴照画但那格置灰\n' +
 					`  成就：${report.achievementCount} 条（四种突变 / 星云苹果 / 金苹果 / 四档财富），` +

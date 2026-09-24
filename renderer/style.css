@@ -2749,6 +2749,149 @@ body.booting .inspect {
 }
 
 /*
+ * 封禁的黑曜石流光：**胶囊外框 + 下面两行说明文字**。
+ *
+ * 配色只有一套，放在格子自己身上（`--obsidian-*`），胶囊和文字共用 ——
+ * 各写一份的话，改了其中一处两边就不再是同一种材质了。
+ *
+ * ⚠ 边框的做法抄的是 `.inspect.fx`：**把渐变画进边框本身**，再用
+ *   `border-flow` 推着走。别退回「伪元素 + mask 挖洞」那套 ——
+ *   胶囊是 `border-radius: 999px` 的圆角，方洞会把两端整个吃掉
+ *   （那个坑记在 .inspect.fx 上面那一段里）
+ *
+ * ⚠ 内芯那两层 `#2b2927` 是**算出来的**，不是随手挑的颜色：
+ *   别的胶囊是 `rgba(255,255,255,.07)` 铺在卡片底色 `#1b1917` 上，
+ *   合出来正好是 #2b2927（27+228×0.07 ≈ 43 = 0x2b）。这样封禁那枚的
+ *   内芯和旁边几枚**一模一样**。
+ *   用它而不是继续半透明，是因为 `border-box` 那层渐变铺满**整个胶囊矩形**
+ *   （CSS 没有「只画边框」的裁剪），内芯不透光它才只在边框那一圈露得出来；
+ *   半透明的话那道流光会从胶囊中间透出来，像里面还有一条在动的光
+ */
+.codex-cell[data-gene='ban'] {
+	--obsidian-lo: #2c333d;
+	--obsidian-mid: #8ea3bd;
+	--obsidian-hi: #f4f9ff;
+	/* 说明文字的渐变。亮的那份给效果行，暗的给来历行 —— 两行原文一个亮
+	   一个暗（.codex-name / .codex-desc），这里得把那个层次一起搬过来，
+	   否则来历行会和效果行一样抢眼 */
+	--obsidian-text: linear-gradient(
+		100deg,
+		#8fa2bb 0%,
+		#8fa2bb 28%,
+		#d8e6f8 42%,
+		#ffffff 50%,
+		#d8e6f8 58%,
+		#8fa2bb 72%,
+		#8fa2bb 100%
+	);
+	--obsidian-text-dim: linear-gradient(
+		100deg,
+		#5c6879 0%,
+		#5c6879 28%,
+		#8d9db4 42%,
+		#b9c8dc 50%,
+		#8d9db4 58%,
+		#5c6879 72%,
+		#5c6879 100%
+	);
+	/*
+	 * 一轮 3.2s 里渐变推两个循环，也就是光每 1.6 秒扫过一趟。
+	 *
+	 * ⚠ 这个是**给子元素取用的**，不能挂在 `.codex-cell` 自己身上 ——
+	 *   `border-flow` 动的是 `background-position`，只对**自己拥有背景**的
+	 *   那个元素起作用。挂在格子上的话三条规则一条都不会动，
+	 *   而且看起来只是「流光没生效」，不会报错
+	 */
+	--obsidian-flow: border-flow 3.2s linear infinite;
+}
+
+.codex-cell[data-gene='ban'] .gene-badge {
+	border-color: transparent;
+	animation: var(--obsidian-flow);
+	background:
+		linear-gradient(#2b2927, #2b2927) padding-box,
+		linear-gradient(#2b2927, #2b2927) padding-box,
+		linear-gradient(
+				100deg,
+				var(--obsidian-lo) 0%,
+				var(--obsidian-lo) 36%,
+				var(--obsidian-mid) 46%,
+				var(--obsidian-hi) 50%,
+				var(--obsidian-mid) 54%,
+				var(--obsidian-lo) 64%,
+				var(--obsidian-lo) 100%
+			)
+			border-box;
+	background-size: 100% 100%, 100% 100%, 300% 100%;
+}
+
+/*
+ * 说明文字：**渐变填充 + 一圈实心亮描边**。
+ *
+ * ⚠ 为什么不是「再叠一层同样的文字当描边」（那个做法更常见）：**长句会错位**。
+ *   描边层和正文各自换行，一旦文字折行，两层的断行位置对不上，看起来是
+ *   两行重影。试过 grid 同一格（`grid-area: 1/1`）也没用 ——
+ *   描边会把盒子的宽度撑大一点，于是折行点还是不一样。
+ *   渐变填充 + `-webkit-text-stroke` **不需要第二份文字，结构上就不可能错位**
+ *
+ * ⚠ 描边本身不流动（`-webkit-text-stroke` 只吃颜色，不吃渐变）——
+ *   会动的是 `background-clip: text` 那一层。两个叠起来才是
+ *   「玻璃的边缘一直被光照着，而那道光在走」
+ *
+ * ⚠ 这里必须写 `-webkit-text-fill-color`，不能只写 `color`：
+ *   `color` 会被上面那条 `-webkit-text-fill-color` 盖住，而 `.codex-name`
+ *   原来那个 `color` 还留在原地。少写这一句，文字就是**实心灰**的，
+ *   渐变完全看不见 —— 而且没有任何报错
+ */
+.codex-cell[data-gene='ban'] .codex-name,
+.codex-cell[data-gene='ban'] .codex-desc {
+	/*
+	 * ⚠ 单位是 **em，不是 px**。这两个字号差着一倍（效果行 11px、来历行 10px），
+	 *   写死 px 的话两行的描边一样粗 —— 而描边粗细是相对的：0.7px 在 11px 的
+	 *   字上占了 6% 的字高，字直接被糊成一团（实测：小号那版整行看着是**深色**
+	 *   的糊块，放大到 34px 才看出渐变其实是好的）
+	 */
+	-webkit-text-stroke: 0.045em rgba(196, 218, 245, 0.75);
+	background: var(--obsidian-text);
+	background-size: 300% 100%;
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+	animation: var(--obsidian-flow);
+}
+
+.codex-cell[data-gene='ban'] .codex-desc {
+	-webkit-text-stroke-color: rgba(196, 218, 245, 0.55);
+	background-image: var(--obsidian-text-dim);
+}
+
+/*
+ * 还没解锁的封禁格：**把流光停掉**。
+ *
+ * ⚠ 只靠上面那条 `.codex-cell.locked .gene-badge` 的 grayscale 是不够的 ——
+ *   `filter` 只改颜色，动画照跑，那一格会变成整张图鉴里唯一在动的东西。
+ *   而「在动」在余光里就是「值得看」，可这一格恰恰是「你还没拿到」。
+ *
+ * ⚠ 文字要把渐变整体撤掉，不能只靠 grayscale：文字是
+ *   `-webkit-text-fill-color: transparent` + 渐变当填充的，locked 那条
+ *   `.codex-cell.locked .codex-name { color: ... }` 改的是 `color`，
+ *   对渐变填充**完全无效** —— 不撤的话，一格「？？？」会比所有亮着的格子
+ *   都显眼。撤掉之后颜色自动落回 locked 那两条定的灰
+ */
+.codex-cell.locked[data-gene='ban'] .gene-badge,
+.codex-cell.locked[data-gene='ban'] .codex-name,
+.codex-cell.locked[data-gene='ban'] .codex-desc {
+	animation: none;
+}
+
+.codex-cell.locked[data-gene='ban'] .codex-name,
+.codex-cell.locked[data-gene='ban'] .codex-desc {
+	-webkit-text-stroke: 0;
+	background: none;
+	-webkit-text-fill-color: currentColor;
+}
+
+/*
  * 描边流光（极稀有 / 超级稀有 / 传说生物 三档）。
  *
  * 做法：**把渐变画进边框本身**，再拿 `border-flow` 推着它走。
