@@ -942,6 +942,15 @@ export class Fly {
 		this.vx = 0
 		this.vy = 0
 
+		// ⚠ 动不了的就到此为止 —— 包括下面那段「撞到边就掉头」。
+		//
+		//   那段是**直接写 `this.x` / `this.y`** 的，不走 `_shift`，
+		//   所以 `_shift` 那道闸门拦不住它：一只贴着屏幕边的虫被敲中之后，
+		//   会被钳制**一下弹进来十几像素**，看着像「封了但它动了一下」。
+		//   （`_updateMode` 的按回地面、`_fly` 的 `wrapFly` 也都是直接写坐标的，
+		//    但前者是位移本身、后者越不过边界，都不需要在这儿重复判）
+		if (!this.canMove) return
+
 		// 在地上是不会穿墙的：撞到边就掉头
 		const m = W.edgeMargin
 		if (this.x < m) {

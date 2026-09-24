@@ -2795,7 +2795,7 @@ function runSelfTest() {
 					else delete pet.world.shop.oven
 					pet.ui.refreshFeed()
 
-					// —— gold Banhammer：工具接线 ——
+					// —— Banhammer：工具接线 ——
 					//
 					// 机制那一半在 tools/simulate.js 里（半径 / 不能动 / 两次敲 / 售价），
 					// 这里只管**界面这一层**：按钮在不在、锁没锁、点了真的打到指针那儿
@@ -2811,7 +2811,7 @@ function runSelfTest() {
 						ui.refreshShop()
 						if (!shopRows.querySelector('[data-buy="banhammer"]')) {
 							ui._onKey({ code: 'Escape' })
-							return { ok: false, reason: '商店里没有 gold Banhammer —— shopCats 里漏归类了' }
+							return { ok: false, reason: '商店里没有 Banhammer —— shopCats 里漏归类了' }
 						}
 						ui._onKey({ code: 'Escape' })
 
@@ -2981,7 +2981,7 @@ function runSelfTest() {
 						// ⑤ 图标**不能污染按钮文字**：setTool 拿 btn.textContent
 						//    当「当前工具名」显示到收起状态的标题行
 						const bhBtn = document.getElementById('btn-banhammer')
-						if (bhBtn.textContent.trim() !== 'gold Banhammer') {
+						if (bhBtn.textContent.trim() !== 'Banhammer') {
 							return {
 								ok: false,
 								reason: '金锤按钮的 textContent 是「' + bhBtn.textContent.trim() + '」—— 图标把它污染了',
@@ -6832,7 +6832,7 @@ function runSelfTest() {
 					'  罐中列表防闪：连刷两次行节点不变、顺序被打乱能排回去\n' +
 					'  玻璃罐：观察模式就能拖（指针在罐上才接管，食物不算），移开后鼠标归还\n' +
 					'  商店升级链：逐级扣款、满级封顶、按钮跟着改名；捕虫网买前锁定买后可用\n' +
-						'  gold Banhammer：商店里归了类、没买是 .locked（**不是 disabled**）、买前切不过去买后能切、' +
+						'  Banhammer：商店里归了类、没买是 .locked（**不是 disabled**）、买前切不过去买后能切、' +
 						'H 键开合、**锤下去真的打在指针那一点**（圈内中圈外不中）、连着两下会被冷却挡住；' +
 						'机制那一半在 `bun run sim` 里（半径 / 五条路都动不了 / 两锤先封后卖 / 售价 ×1.5 / 幼虫价区间）\n' +
 						`  工具图标：${report.toolIcons ? report.toolIcons.count : '?'} 张 12×12 像素图，` +

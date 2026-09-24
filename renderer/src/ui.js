@@ -1739,7 +1739,7 @@ export class UI {
 			return
 		}
 
-		// gold Banhammer：**点一下**封、**再点一下**卖。
+		// Banhammer：**点一下**封、**再点一下**卖。
 		//
 		// 语义是**无状态**的（判据在 world.banStrike 里）：圈里还有没封的
 		// 就是「封」，全是封着的就是「卖」。这里只负责冷却 ——
@@ -1755,7 +1755,7 @@ export class UI {
 			// 不拦的话手里就攥着一把已经不该存在的锤子（和捕虫网同一处坑）
 			if (!this.world.hasShopItem('banhammer')) {
 				this.setTool('none')
-				this._flashHint('gold Banhammer 被重置掉了，要重新买')
+				this._flashHint('Banhammer 被重置掉了，要重新买')
 				return
 			}
 			const now = performance.now()
@@ -3094,7 +3094,7 @@ export class UI {
 		// 金锤同理。它是全场最贵的一件，提示里必须带上价钱 ——
 		// 不然玩家只看到一颗灰按钮，会以为是坏了
 		if (tool === 'banhammer' && !this.world.hasShopItem('banhammer')) {
-			this._flashHint(`gold Banhammer 在商店里，${formatMoney(shopItem('banhammer')?.price ?? 0)} 买断`)
+			this._flashHint(`Banhammer 在商店里，${formatMoney(shopItem('banhammer')?.price ?? 0)} 买断`)
 			return
 		}
 
@@ -3934,7 +3934,7 @@ export class UI {
 					: `要先买下${burnChain[0].name}，再花 ${formatMoney(tier.price)} 升级到${tier.name}`
 		}
 
-		// —— gold Banhammer ——
+		// —— Banhammer ——
 		//
 		// 和上面两颗同一套：一直显示、没买时 `.locked`（**不是 disabled**），
 		// 点了由 setTool 拦下来并说明原因。
@@ -4525,15 +4525,22 @@ export class UI {
 		} else if (t.larvaDamage) {
 			bits.push('随机咬死同伴')
 		}
+		// ⚠ 剩下这几条是**非数值**的，自动拼不出来，必须手写 ——
+		//   但它们全是**玩法**上的（飞不飞得起来、动不动得了），不是「长什么样」。
+		//   判据就是这个：写进来的是玩家**做不了什么**，而不是玩家**看得见什么**
 		if (t.id === 'stone') bits.push('失去飞行')
-		if (t.id === 'crystal') bits.push('全身透明只剩描边')
-		if (t.id === 'golden') bits.push('通体金色、带闪光')
-		if (t.id === 'nebula') bits.push('身体是星云上的一扇窗（星空钉在屏幕上不动）')
-		// ⚠ 封禁那两条是**非数值**的，自动拼不出来，必须在这儿手写。
-		//   「价值 ×1.5」那一档上面会自动拼上（走 t.valueMul）；
-		//   「完全不能动」没有对应的字段，漏了这一句图鉴上就只剩钱的事
+		// 「价值 ×1.5」那一档上面会自动拼上（走 t.valueMul）；
+		// 「完全不能动」没有对应的字段，漏了这一句图鉴上就只剩钱的事
 		if (t.id === 'ban') bits.push('完全不能移动（拖都拖不走）')
-		if (t.id === 'ban') bits.push('身体是流动的黑曜石断口')
+		//
+		// ⚠ 这里原来还有**四条外观描述**（结晶「全身透明只剩描边」、
+		//   点石成金「通体金色、带闪光」、星云「身体是星云上的一扇窗」、
+		//   封禁「身体是流动的黑曜石断口」）。按用户要求全删了。
+		//
+		//   理由站得住：每一格左边**本来就画着那只虫的样子**
+		//   （见 _codexGeneCell 里的 drawFlyIcon），拿一行字再描述一遍是重复；
+		//   而且文字是写死的，哪天空外观调了这里就开始说假话，没人会去核对。
+		//   图鉴这一行留给**数值和规则** —— 那些才是图里看不出来的
 		return bits.length ? bits.join(' · ') : t.name
 	}
 

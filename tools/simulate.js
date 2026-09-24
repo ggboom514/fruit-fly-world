@@ -5966,7 +5966,7 @@ if (!(travel1 > 0) || !(travel2 > 0)) problems.push('擦拭路程异常')
 if (travel2 <= travel1) problems.push('腐烂后并不比新鲜时更难擦 —— 检查 remains.wipeScrubFresh/Rotten')
 
 // ====================================================================
-//  gold Banhammer + 「封禁」突变
+//  Banhammer + 「封禁」突变
 // ====================================================================
 //
 // 这个工具同时踩了三件容易静默失效的事，所以断言比别的工具密：
@@ -5976,6 +5976,11 @@ if (travel2 <= travel1) problems.push('腐烂后并不比新鲜时更难擦 —�
 //   ③ 授予突变必须调 `_noteGenes`，漏了图鉴那一格永远灰、成就永远不弹
 
 const banProblems = []
+// 贴边的封禁蝇被钳制弹开了多少 px。修好之后应当是 0 ——
+// 打进日志是为了下次有人动 `_walk` 那一段时能直接看到数
+let banEdgeSnap = 0
+// 金锤一锤发多少颗粒子（关掉 ring 之后的下限就在下面那条断言里）
+let banStrikeParticles = 0
 {
 	const B = CONFIG.tools.ban
 	const R = B.radius
@@ -6022,6 +6027,108 @@ const banProblems = []
 		banProblems.push(`封禁的成虫 mode 是 ${inside.mode} —— 被敲中时如果在飞，应当被按回地面`)
 	}
 
+	// —— 受惊（挥手惊蝇）——
+	//
+	// ⚠ 这一条是**用户在实际游玩里发现的**：「被封禁的成虫跟着光标动」。
+	//   六个**位移**积分点全堵上了，可 `_panic` 改的是 `aim`（朝向）——
+	//   那是**行为**不是位移，`_shift` 那道闸门拦不住它。
+	//   症状正是「虫不动，但它的头一直跟着你的鼠标转」。
+	//
+	// ⚠ **直接调 `_panic`，不经过 `update`。**
+	//
+	//   绕开 `update` 是因为 `_walk` 里有随机数（重新挑方向、停顿计时），
+	//   同一个探针跑两遍本来就差一点 —— 拿「跑两遍的角度」对比是**测不准**的。
+	//   实测：有光标 0.078 / 没光标 0.088 弧度，差得和被修掉的那个信号
+	//   （3.1 弧度）不在一个量级上，但足以让「必须完全相等」变成一条永远红的断言。
+	//   直接调就一个随机数都掺不进来，判据可以写成「一点都不许变」
+	const panicCase = (genes) => {
+		clear()
+		const f = w.addFly(600, 600, {})
+		f.mutations = genes
+		f.aim = 1
+		f.pausing = true
+		f.hoverTimer = 500
+		const before = { aim: f.aim, dart: f.dartTimer, pausing: f.pausing, hover: f.hoverTimer }
+		w._panic(f, 2.5)
+		return { f, before }
+	}
+
+	const pb = panicCase(['ban'])
+	if (pb.f.aim !== pb.before.aim) {
+		banProblems.push(
+			`world._panic 改了封禁蝇的 aim（${pb.before.aim} → ${pb.f.aim}）—— ` +
+				'它一步都动不了，却会原地跟着光标转头。那道闸门要判 canMove',
+		)
+	}
+	if (pb.f.dartTimer !== pb.before.dart) {
+		banProblems.push('world._panic 改了封禁蝇的 dartTimer')
+	}
+	if (pb.f.pausing !== pb.before.pausing || pb.f.hoverTimer !== pb.before.hover) {
+		banProblems.push('world._panic 动了封禁蝇的停滞 / 悬停状态 —— 它该整段跳过')
+	}
+
+	// ⚠ 对照一：普通成虫必须真的被惊动。少了它，「没反应」在
+	//   「受惊整个没生效」时也会绿
+	const pc = panicCase([])
+	if (pc.f.aim === pc.before.aim) {
+		banProblems.push('普通成虫都没被 _panic 惊动 —— 上面那条「封禁不受惊」不算数')
+	}
+
+	// ⚠ 对照二：**石化蝇仍然要躲**。它 canFly 是 false 但 canMove 是 true，
+	//   「失去飞行」只该让它爬着走、不该把它定住。
+	//   那道闸门要是被写成 canFly，这一条当场就红 —— 而症状
+	//   （石化蝇被吓了不吭声）几乎没人会去试
+	const ps = panicCase(['stone'])
+	if (ps.f.aim === ps.before.aim) {
+		banProblems.push(
+			'石化蝇也不躲了 —— 受惊那道闸门多半判成了 canFly。' +
+				'它只该拦「动不了的」，不该拦「飞不起来的」',
+		)
+	}
+
+	// 端到端再过一遍：指针贴着它甩 90 帧，坐标一个像素都不许动
+	// （位置是确定的 —— `_shift` 吞掉之后 x/y 和随机数无关，所以这条不会飘）
+	const startleRun = (genes) => {
+		clear()
+		const f = w.addFly(600, 600, {})
+		f.mutations = genes
+		const before = { x: f.x, y: f.y, mode: f.mode }
+		w.startle.x = f.x + 8
+		w.startle.y = f.y
+		w.startle.power = 1
+		for (let i = 0; i < 90; i++) w.update(1 / 60)
+		w.startle.power = 0
+		return { f, before }
+	}
+	const ran = startleRun(['ban'])
+	if (ran.f.x !== ran.before.x || ran.f.y !== ran.before.y) {
+		banProblems.push(
+			`被封禁的成虫被光标惊动了：(${ran.before.x},${ran.before.y}) → ` +
+				`(${ran.f.x},${ran.f.y}) —— 它该纹丝不动`,
+		)
+	}
+	// ⚠ 这里**不能**写成「模式不许变」：封禁蝇被敲中时如果在飞，
+	//   本来就该被按回地面（那条断言在上面）。要查的是「受惊没把它弄上天」
+	if (ran.f.mode !== 'walk') {
+		banProblems.push(`被封禁的成虫受惊之后 mode 是 ${ran.f.mode} —— 它该一直待在地面`)
+	}
+
+	// —— 贴边的钳制 ——
+	//
+	// ⚠ 和受惊同一类：`_walk` 末尾那段「撞到边就掉头」是**直接写 this.x**
+	//   的，不走 `_shift`。被敲中时它恰好贴边的话，会被一下弹进来十几像素
+	//   （朝向那条不在这里查 —— 它自己走路也会转，见上面那段注释）
+	clear()
+	const ef = w.addFly(5, 600, {})
+	ef.mutations = ['ban']
+	ef.aim = 0
+	const efx = ef.x
+	for (let i = 0; i < 30; i++) w.update(1 / 60)
+	if (ef.x !== efx) {
+		banProblems.push(`贴边的封禁蝇被钳制弹了 ${(ef.x - efx).toFixed(1)}px —— 撞边那段是直接写 x 的`)
+	}
+	banEdgeSnap = ef.x - efx
+
 	// 产卵中的阻尼滑停（六个位移里最容易漏的那个）
 	clear()
 	const mom = w.addFly(700, 700, {})
@@ -6054,6 +6161,27 @@ const banProblems = []
 	for (let i = 0; i < 60; i++) w.update(1 / 60)
 	if (pushed !== 0) banProblems.push(`扫帚推到了 ${pushed} 只封禁幼虫 —— 它该推不动`)
 	if (bl.x !== blx || bl.pushVx !== 0) banProblems.push('被扫的封禁幼虫动了')
+
+	// —— 砸下去那一下的动静 ——
+	//
+	// ⚠ 不能只查「粒子数 > 0」：那样把三层砍成一层也照样绿，
+	//   而「看着少了点」正是这个项目里最不会有人去查的那种退化。
+	//   所以给下限，而且**火星单独数一遍** —— 它和 ring 是两种东西
+	//   （ring 摆在圆周上、速度 30~70；火星从圆心甩出去、150~380），
+	//   混在一个总数里的话，少了火星也看不出来
+	clear()
+	w.addFly(500, 500, {})
+	const pBefore = w.particles.length
+	w.banStrike(500, 500)
+	const made = w.particles.length - pBefore
+	banStrikeParticles = made
+	if (made < 40) {
+		banProblems.push(`金锤一锤只发了 ${made} 颗粒子 —— 砸下去看不出动静`)
+	}
+	const sparks = w.particles.filter((p) => Math.hypot(p.vx, p.vy) > 120).length
+	if (sparks < 8) {
+		banProblems.push(`金锤那一下只有 ${sparks} 颗高速火星 —— burstSparks 没发出来`)
+	}
 
 	// —— 售价 ×1.5 ——
 	//
@@ -6178,9 +6306,12 @@ const banProblems = []
 	else if (ach.gene !== 'ban') banProblems.push(`ban 成就挂的基因是 ${ach.gene}`)
 
 	console.log(
-		`\n—— 封禁 / gold Banhammer ——\n` +
+		`\n—— 封禁 / Banhammer ——\n` +
 			`  半径 ${R}px：圈内 ${r1.marked} 只全中，圈外 1 只没被误伤；成虫和幼虫一视同仁\n` +
-			`  完全不能移动：爬 / 飞 / 产卵滑停 / 罐中 / 扫帚推力 五条路各跑 60~120 帧，坐标一个像素没变\n` +
+			`  完全不能移动：爬 / 飞 / 产卵滑停 / 罐中 / 扫帚推力 / **受惊** / 贴边钳制 七条路` +
+			`各跑 30~120 帧，坐标一个像素没变（贴边那条钳制弹了 ${banEdgeSnap.toFixed(1)}px，应当是 0）；` +
+			`光标贴着它甩，aim 一点没动\n` +
+			`  砸下去那一下：一锤 ${banStrikeParticles} 颗粒子（外圈 + 内圈 + 火星三层）\n` +
 			`  售价 ×${(v1 / v0).toFixed(2)}（${v0.toFixed(4)} → ${v1.toFixed(4)}），weightMul 恒为 1（不是石化那条路）\n` +
 			`  两锤：第一锤封 3 卖 0 → 第二锤封 0 卖 3（+${second.gain.toFixed(3)}）→ 第三锤打出 0\n` +
 			`  卖掉不留尸体、不计死亡、不算拍死（跑满一帧再数的）\n` +

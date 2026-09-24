@@ -1584,6 +1584,18 @@ export class World {
 	 *   那时**不碰 aim**，让它照着自己的窜动节律乱飞，正是要的「慌」
 	 */
 	_panic(f, away) {
+		// ⚠ **动不了的一律跳过**，一整段都不执行。
+		//
+		//   原来这里只判了 `canFly`，而那只拦得住「起飞」，拦不住下面几行
+		//   改 `aim` 的。于是一只被封禁的虫虽然一步都挪不动，却会**原地
+		//   跟着光标转头** —— 用户报的「被附上封禁突变的成虫跟着光标动」
+		//   就是这个。`_shift` 拦的是位移，而 `aim` 是**行为**，它管不着。
+		//
+		//   ⚠ 判据必须是 `canMove`，**不能**换成 `canFly`：石化蝇 canFly 是
+		//   false 但 canMove 是 true，它本来就**该**能爬着躲开（见下面那段）。
+		//   用 canFly 的话这里看着一样是绿的，石化蝇却会连爬都不爬了
+		if (!f.canMove) return
+
 		f.pausing = false
 		f.hoverTimer = 0
 
@@ -2222,6 +2234,37 @@ export class World {
 	}
 
 	/**
+	 * 砸下去那一下从**圆心**迸出来的火星：快、小、亮、带重力。
+	 *
+	 * ⚠ 和 `burstRing` 是**互补**的，不是重复：
+	 *   · ring 把粒子摆在**圆周上** —— 它回答「打得有多远」
+	 *   · sparks 把粒子从**圆心甩出去** —— 它回答「打在哪儿、多用力」
+	 *   只有 ring 的话像地上画了个圈，只有 sparks 的话看不出范围。
+	 *   金锤那一下两个都放，才读得出「一锤砸下去」。
+	 *
+	 * ⚠ 速度比 ring 高一个量级（ring 是 30~70，这里 150~380）。
+	 *   一样快的话火星还没离开圆心就被 drag 拉停了，看着还是「一圈粒子」——
+	 *   而那种症状只是「加了跟没加一样」，不会报错
+	 */
+	burstSparks(x, y, count, hot = '#fff6d6', cool = '#ffd257') {
+		for (let i = 0; i < count; i++) {
+			const a = rand(0, TAU)
+			const spd = rand(150, 380)
+			this.spawnParticle(
+				x,
+				y,
+				Math.cos(a) * spd,
+				Math.sin(a) * spd,
+				Math.random() < 0.5 ? hot : cool,
+				rand(0.7, 1.6),
+				// gravity 是正的（往下掉），和火苗那个 -40 的「往上飘」正好相反：
+				// 火星是**掉下来**的，火苗是**窜上去**的
+				{ life: CONFIG.tools.fx.sparkLife, gravity: 320, drag: 4.2, grow: -0.6 },
+			)
+		}
+	}
+
+	/**
 	 * 工具特效的发射器。由 `ui.update()` 每帧写 `this.toolFx`，这里按**时间**发粒子。
 	 *
 	 * ⚠ 和 burstJuice / burstDust 是两种东西：那两个是**事件**（拍死、擦掉），
@@ -2751,6 +2794,29 @@ export class World {
 		const already = inRange.filter((e) => e.hasMutation('ban'))
 		const fresh = inRange.filter((e) => !e.hasMutation('ban'))
 
+		// —— 那一下的动静 ——
+		//
+		// ⚠ 抽成一个闭包让「封」和「卖」共用。各抄一份的话，改了这边忘了那边，
+		//   症状只是「卖的那一下看着比封的轻」—— 像个审美问题，没人会去查
+		//
+		// 三层叠起来才像「一锤砸下去」，缺一层都散：
+		//   · 外圈（28 颗）= 判定半径。工具范围圈删掉之后，这是玩家唯一
+		//     能看出「打得到哪儿」的东西，所以它必须在
+		//   · 内圈（12 颗）= 锤头砸在中心那一下
+		//   · 火星（16 颗，从圆心甩出去）= 用力的大小
+		const strikeFx = (hit) => {
+			const R = CONFIG.tools.ban.radius
+			this.burstRing(x, y, R, 28, hit ? 'rgba(255, 226, 140, 0.95)' : 'rgba(205, 205, 205, 0.8)')
+			this.burstRing(x, y, R * 0.42, 12, hit ? 'rgba(255, 246, 214, 0.95)' : 'rgba(228, 228, 228, 0.8)')
+			this.burstSparks(
+				x,
+				y,
+				16,
+				hit ? '#fff6d6' : '#e8e8e8',
+				hit ? '#ffd257' : '#c2c2c2',
+			)
+		}
+
 		let sold = 0
 		let gain = 0
 		if (already.length) {
@@ -2762,8 +2828,8 @@ export class World {
 					this.addFloatText(e.x, e.y, '+' + formatMoney(got))
 				}
 			}
-			this.burstRing(x, y, CONFIG.tools.ban.radius, 14, 'rgba(255, 226, 140, 0.95)')
-			this.burstDust(x, y, 8)
+			strikeFx(true)
+			this.burstDust(x, y, 16)
 			return { marked: 0, sold, gain }
 		}
 
@@ -2771,19 +2837,16 @@ export class World {
 		for (const e of fresh) {
 			e.mutations = cleanGenes([...e.mutations, 'ban'])
 			marked++
-			this.burstRing(e.x, e.y, 16, 5, 'rgba(255, 214, 110, 0.9)')
+			// 每只被敲中的虫身上也炸一下：一圈 + 几点火星。
+			// ⚠ 这一下是「**这只**被点到了」的反馈，和外圈那个「打得有多远」是两回事
+			this.burstRing(e.x, e.y, 16, 9, 'rgba(255, 214, 110, 0.9)')
+			this.burstSparks(e.x, e.y, 4)
 		}
 		// ⚠ 图鉴收件箱。**漏了这一步的症状是「图鉴那一格永远是灰的、
 		//   成就永远不弹」** —— 不报错，而且别的地方全绿。
 		//   卵 / 成虫 / 幼虫的四个出生入口都会调它，锤子是第五条路，得自己来
 		this._noteGenes(fresh.flatMap((e) => e.mutations))
-		this.burstRing(
-			x,
-			y,
-			CONFIG.tools.ban.radius,
-			14,
-			marked > 0 ? 'rgba(255, 226, 140, 0.95)' : 'rgba(205, 205, 205, 0.8)',
-		)
+		strikeFx(marked > 0)
 		return { marked, sold: 0, gain: 0 }
 	}
 

@@ -537,7 +537,7 @@ button.toggle.on {
 }
 
 /*
- * 金色流动 —— **只有 gold Banhammer 那一颗**。
+ * 金色流动 —— **只有 Banhammer 那一颗**。
  *
  * 渐变横向铺 300% 宽，靠 `@keyframes border-flow` 推 background-position，
  * 亮带就会从左到右反复扫过。形状被 mask 裁住，看起来就是金子在图标里流。
