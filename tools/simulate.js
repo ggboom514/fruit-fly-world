@@ -2628,7 +2628,7 @@ const moneyProblems = []
 	//      所以打印出来，并附带一句「调哪个数才能让它亮」
 	//
 	// 做法是**真的抽**：按每个体重档的区间抽满成长体重，换算成售价看落哪一档；
-	// 再叠上突变倍率（石化 ×1.5 体重、结晶 ×2、金 ×1.3）重抽一遍。
+	// 再叠上突变倍率（石化 ×1.5 体重、炫彩 ×2、金 ×1.3）重抽一遍。
 	// 倍率从 CONFIG.mutation.types 现算，不在测试里另抄一份 ——
 	// 抄一份的话，改了 config 而测试还按老倍率算，这条就会假绿
 	const hitTiers = new Set()
@@ -5370,10 +5370,10 @@ const geneProblems = []
 		const crystal = price(['crystal'])
 		const both = price(['golden', 'crystal'])
 		console.log(
-			`  售价倍率：点石成金 ${(gold / base).toFixed(2)}× / 结晶 ${(crystal / base).toFixed(2)}× / 两者兼有 ${(both / base).toFixed(2)}×`,
+			`  售价倍率：点石成金 ${(gold / base).toFixed(2)}× / 炫彩 ${(crystal / base).toFixed(2)}× / 两者兼有 ${(both / base).toFixed(2)}×`,
 		)
 		if (Math.abs(gold / base - 1.3) > 1e-6) geneProblems.push(`点石成金的自身倍率是 ${(gold / base).toFixed(3)}，应当是 1.3`)
-		if (Math.abs(crystal / base - 2) > 1e-6) geneProblems.push(`结晶的自身倍率是 ${(crystal / base).toFixed(3)}，应当是 2`)
+		if (Math.abs(crystal / base - 2) > 1e-6) geneProblems.push(`炫彩的自身倍率是 ${(crystal / base).toFixed(3)}，应当是 2`)
 		// 连乘而不是相加：1.3 × 2 = 2.6，不是 1 + 0.3 + 1 = 2.3
 		if (Math.abs(both / base - 2.6) > 1e-6) {
 			geneProblems.push(`两种价值突变同时存在时是 ${(both / base).toFixed(3)}×，应当是连乘 2.6×`)
@@ -5836,7 +5836,7 @@ const keeperProblems = []
 		//
 		// ⚠ 也**不要**为了「让测试好写」把价值突变换成不带倍率的（比如疯狂）——
 		//   那就绕开了这个耦合，而它正是玩家会遇到的：设了「只卖稀有档」
-		//   却发现带了结晶的那批怎么都不卖，原因就在这里
+		//   却发现带了炫彩的那批怎么都不卖，原因就在这里
 		const mutTier = valueTierOf(fMut.value).id
 		const tierMoved = mutTier !== w.keeper.tier
 		w.keeper.mutants = true
@@ -5848,7 +5848,7 @@ const keeperProblems = []
 			keeperProblems.push(`「含突变」那次的计数没有 +1（${soldBefore} → ${w.keeper.sold}）`)
 		}
 		console.log(
-			`  带结晶的那只：×2 之后价值档${tierMoved ? '**离开了** f0 那一档' : '仍在同一档'}，` +
+			`  带炫彩的那只：×2 之后价值档${tierMoved ? '**离开了** f0 那一档' : '仍在同一档'}，` +
 				`现在是「${valueTierOf(fMut.value).name}」—— 勾上「含突变」并对着它那一档之后卖掉了`,
 		)
 

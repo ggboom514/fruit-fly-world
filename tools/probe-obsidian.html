@@ -103,7 +103,7 @@
           <div class="codex-text">
             <span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>
             <div class="codex-name">价值 ×1.5 · 完全不能移动（拖都拖不走） · 身体是流动的黑曜石断口</div>
-            <div class="codex-desc">金锤敲出来 · 幼虫和成虫都显形</div>
+            <div class="codex-desc">用 Banhammer 敲出来 · 幼虫和成虫都显形</div>
           </div>
         </div>
       </div>
@@ -130,7 +130,7 @@
         <div class="codex-cell" data-gene="crystal">
           <canvas class="codex-icon gene-preview" width="34" height="34"></canvas>
           <div class="codex-text">
-            <span class="gene-badge" style="color:#7fe3d4;border-color:#7fe3d4">◇ 结晶</span>
+            <span class="gene-badge" style="color:#7fe3d4;border-color:#7fe3d4">◇ 炫彩</span>
             <div class="codex-name">价值 ×2</div>
             <div class="codex-desc">1.1% · 幼虫和成虫都显形</div>
           </div>
@@ -149,7 +149,7 @@
       <div class="codex-text">
         <span class="gene-badge" style="color:#b9c8dc">⊘ 封禁</span>
         <div class="codex-name">黑曜石断口 Aa</div>
-        <div class="codex-desc">金锤敲出来 Aa</div>
+        <div class="codex-desc">用 Banhammer 敲出来 Aa</div>
       </div>
     </div>
     <div style="color:#7d766c;font-size:11px;margin-bottom:4px">2 · 关掉动画</div>
@@ -219,7 +219,7 @@ cell(rowC, 24, [], 0.5, '普通')
 cell(rowC, 24, ['stone'], 0.5, '石化')
 cell(rowC, 24, ['golden'], 0.5, '点石成金')
 cell(rowC, 24, ['ban'], 0.5, '封禁')
-cell(rowC, 24, ['crystal'], 0.5, '结晶')
+cell(rowC, 24, ['crystal'], 0.5, '炫彩')
 cell(rowC, 24, ['berserk'], 0.5, '疯狂')
 
 const rowD = document.getElementById('rowD')
@@ -227,7 +227,7 @@ for (const sz of [11, 14, 18, 22, 30, 42]) cell(rowD, sz, ['ban'], 0.5, sz + 'px
 
 // E · 真 DOM，4 个相位
 const NAME = '价值 ×1.5 · 完全不能移动（拖都拖不走） · 身体是流动的黑曜石断口'
-const DESC = '金锤敲出来 · 幼虫和成虫都显形'
+const DESC = '用 Banhammer 敲出来 · 幼虫和成虫都显形'
 const grid = document.getElementById('gridPhase')
 for (let i = 0; i < 4; i++) {
   const c = document.createElement('div')

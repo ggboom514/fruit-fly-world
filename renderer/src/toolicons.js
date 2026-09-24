@@ -257,29 +257,13 @@ export function iconFillCount(id) {
 	return n
 }
 
-/**
- * 把一张像素图画到 canvas 上（**图鉴**用的那条路）。
- *
- * 和 `toolIconMaskUrl` 的分工：那个是给工具栏按钮做 CSS mask 的（单色、
- * 尺寸由 CSS 决定）；这个是直接画格子，**格子边长自己定**，所以图鉴里
- * 想画多大画多大，而且永远是硬边的方块，不会糊。
- *
- * 以 (ox, oy) 为**中心**画。
- *
- * @param {number} cell 一格多少像素。整数最干净（2 → 24×24 的图）
- */
-export function drawPixelIcon(ctx, id, cell, ox, oy, color) {
-	const px = TOOL_ICONS[id]
-	if (!px) return
-	ctx.fillStyle = color
-	const half = (ICON_SIZE * cell) / 2
-	for (let y = 0; y < ICON_SIZE; y++) {
-		for (let x = 0; x < ICON_SIZE; x++) {
-			if (px[y][x] !== '#') continue
-			ctx.fillRect(ox - half + x * cell, oy - half + y * cell, cell, cell)
-		}
-	}
-}
+// ⚠ 这里原来有个 `drawPixelIcon(ctx, id, cell, ox, oy, color)` ——
+//   把像素矩阵直接画到 canvas 上，只服务于**图鉴里那段「工具」**。
+//   那一段按用户要求整个移除了，它也就没有读者了，一并删掉。
+//
+//   ⚠ 别把它当成「以后可能有用」留着：矩阵本身（`TOOL_ICONS`）还在，
+//     工具栏按钮用的是下面这个 `toolIconMaskUrl`；真要再画到 canvas 上，
+//     从 git 历史里翻回来是十几行的事，而留着的死代码会让人以为它还在被用
 
 /**
  * 把一张像素图变成 `mask-image` 能用的 data URL。

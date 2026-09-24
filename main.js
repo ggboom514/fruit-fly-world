@@ -3007,83 +3007,32 @@ function runSelfTest() {
 						// 收回去，把工具组还原成进来时的样子
 						if (!toolsBox2.classList.contains('collapsed')) document.getElementById('btn-tools').click()
 
-						// ⑦ 图鉴里的「工具」那一段
+						// ⚠ ⑦⑧ 原来在这里：图鉴那段「工具」的 id 一致性、
+						//   渲染、快捷键、免费工具名字。用户要求把工具从图鉴移除，
+						//   那几条连同登记表（config.tools.toolCodex）一起删了。
 						//
-						// ⚠ 三份 id 必须**完全一致**：按钮的 data-tool、图标矩阵的键、
-						//   图鉴登记表。任意一处漏了或写错，那一格就是**空白**
-						//   （或者干脆整格消失），而且不报错
-						const codexIds = pet.config.tools.toolCodex.map((t) => t.id)
-						if (codexIds.slice().sort().join(',') !== keys.join(',')) {
-							return {
-								ok: false,
-								reason:
-									'图鉴登记表和图标键对不上：登记表 [' + codexIds.join(',') +
-									']，图标 [' + keys.join(',') + ']',
-							}
-						}
-						// 图鉴里的排列顺序要和工具栏一致 —— 玩家在面板上从左到右
-						// 认熟的顺序，翻图鉴不该变成另一套
-						if (codexIds.join(',') !== idsRaw.join(',')) {
-							return {
-								ok: false,
-								reason:
-									'图鉴登记表的顺序和工具栏按钮不一致：登记表 [' + codexIds.join(',') +
-									']，按钮 [' + idsRaw.join(',') + ']',
-							}
-						}
+						//   真正有价值的那一半**没有丢**，它本来就在上面 ①：
+						//   「按钮的 data-tool ↔ TOOL_ICONS 的键」一一对应 ——
+						//   漏画一个 id 就是一颗空白按钮，那和有没有图鉴无关。
+						//   原来那两条只是**绕道登记表**又比了一遍，多一份
+						//   「三处必须一致」的约束，现在少了中间那一份，反而更短
+						//   （登记表已删，见 config.tools 那段注释）
 
-						// 打开图鉴，看那一段真的渲染出来了
+						// 打开图鉴 —— 下面 ⑨ 要看那两段
 						document.getElementById('btn-codex').click()
 						pet.ui.refreshCodex()
-						const sec = pet.ui.el.codexBody.querySelector('[data-codex="工具"]')
-						if (!sec) return { ok: false, reason: '图鉴里没有「工具」这一段' }
-						const toolCells = sec.querySelectorAll('.codex-cell')
-						if (toolCells.length !== codexIds.length) {
-							return {
-								ok: false,
-								reason: '工具那一段有 ' + toolCells.length + ' 格，应当是 ' + codexIds.length + ' 格',
-							}
-						}
-						for (const c of toolCells) {
-							const id2 = c.dataset.tool
-							if (!c.querySelector('canvas')) {
-								return { ok: false, reason: '工具格「' + id2 + '」里没有画布' }
-							}
-							if (!c.textContent.includes('快捷键')) {
-								return { ok: false, reason: '工具格「' + id2 + '」没有显示快捷键' }
-							}
-						}
 
-						// ⑧ 免费工具的名字，图鉴里和按钮上必须是**同一个**
-						//
-						// ⚠ 带 from 的那几件不用比：它们的名字是从商店配置现算的
-						//   （见 config.toolCodex 那段注释），不可能漂。
-						//   免费工具的名字在 HTML 按钮上有一份、登记表里又有一份，
-						//   这份重复就是靠这条断言钉住的
-						for (const t of pet.config.tools.toolCodex) {
-							if (t.from || !t.name) continue
-							const btn2 = pet.ui.toolButtons.find((b) => b.dataset.tool === t.id)
-							if (!btn2) continue
-							if (btn2.textContent.trim() !== t.name) {
-								return {
-									ok: false,
-									reason:
-										'工具「' + t.id + '」在图鉴里叫「' + t.name +
-										'」，按钮上却是「' + btn2.textContent.trim() + '」',
-								}
-							}
-						}
-						// ⑨ 三段都能折起来，而且**折了不影响别的**
+						// ⑨ 两段都能折起来，而且**折了不影响别的**
 						//
 						// ⚠ 最后那一半才是重点：折叠状态的键如果不加
-						//   一个 codex 前缀，「工具」这个分类名会和商店里的分组撞上，
-						//   折了图鉴会顺手把商店那组也折起来
+						//   一个 codex 前缀，「食物」「基因」这些分类名会和商店里的
+						//   分组撞上，折了图鉴会顺手把商店那组也折起来
 						// ⚠ 从 codexBody 找，不是从 sec 的父节点 ——
 						//   sec 本身就是一格 [data-codex]，往上只一层的话
-						//   只会找到它自己（实得 1 而不是 3）
+						//   只会找到它自己（实得 1 而不是 2）
 						const heads = pet.ui.el.codexBody.querySelectorAll('[data-codex]')
-						if (heads.length !== 3) {
-							return { ok: false, reason: '图鉴应当有三段（工具 / 食物 / 基因），实得 ' + heads.length }
+						if (heads.length !== 2) {
+							return { ok: false, reason: '图鉴应当有两段（食物 / 基因），实得 ' + heads.length }
 						}
 						for (const grid of heads) {
 							const groupEl = grid.closest('.shop-cat')
@@ -3119,21 +3068,12 @@ function runSelfTest() {
 						}
 						pet.ui._onKey({ code: 'Escape' })
 
-						// ⚠ 画布上得有东西。只查「有 canvas」的话，一张全透明的
-						//   空图照样过 —— 而屏幕上就是一块空白
-						const probe = pet.ui.el.codexBody.querySelector('[data-codex="工具"] .codex-cell canvas')
-						if (probe) {
-							const pctx = probe.getContext('2d')
-							const img = pctx.getImageData(0, 0, probe.width, probe.height).data
-							let solid = 0
-							for (let i = 3; i < img.length; i += 4) if (img[i] > 0) solid++
-							if (solid === 0) {
-								return { ok: false, reason: '工具图鉴的画布上一个不透明像素都没有 —— 图标没画上去' }
-							}
-							iconTag = { count: keys.length, anim, codexPixels: solid }
-						} else {
-							iconTag = { count: keys.length, anim, codexPixels: 0 }
-						}
+						// ⚠ 这里原来还要探一次「工具图鉴画布上有不透明像素」——
+						//   那一段没了，探针跟着删。
+						//   「图标画得空不空」并没有失去保障：上面 ② 的
+						//   iconFillCount >= 12 查的是**矩阵本身**，
+						//   比查一张渲染出来的画布更靠前（画布空只可能是矩阵空）
+						iconTag = { count: keys.length, anim }
 					} catch (e) {
 						return { ok: false, reason: '图标断言失败: ' + e.message }
 					}
@@ -4868,13 +4808,13 @@ function runSelfTest() {
 						return {
 							ok: false,
 							reason:
-								'只知道「见过结晶」一种突变，图鉴里却有 ' + nLocked +
+								'只知道「见过炫彩」一种突变，图鉴里却有 ' + nLocked +
 								' 格是灰的（应当是 ' + wantLocked + ' 格）',
 						}
 					}
 					const crystalCell = cbody.querySelector('[data-gene="crystal"]')
 					if (!crystalCell || crystalCell.classList.contains('locked')) {
-						return { ok: false, reason: '见过结晶，图鉴里那一格却是灰的' }
+						return { ok: false, reason: '见过炫彩，图鉴里那一格却是灰的' }
 					}
 
 					// —— 基因格里的**画像** ——
@@ -4959,7 +4899,7 @@ function runSelfTest() {
 						//
 						// ⚠ 这条是整段的核心。暗影只取决于体型和性别，和是哪一种突变无关 ——
 						//   哪天灰格画了真身、或者按基因改了暗影，这几张立刻互不相同。
-						//   ⚠ 比「同一格 灰 vs 亮 逐像素不同」强得多：亮格（结晶 / 金）
+						//   ⚠ 比「同一格 灰 vs 亮 逐像素不同」强得多：亮格（炫彩 / 金）
 						//   吃 performance.now()，两张画布天然逐像素不同，那个 bug 反而会被放过
 						const lockedCells = [...geneCells].filter((c) => c.classList.contains('locked'))
 						const lockedSigs = lockedCells.map((c) => sigOf(c.querySelector('canvas')))
@@ -5226,35 +5166,35 @@ function runSelfTest() {
 							}
 						}
 
-						// 结晶那格的**淡彩流动**（同一套做法的第二个实例）
+						// 炫彩那格的**淡彩流动**（同一套做法的第二个实例）
 						//
 						// ⚠ 这里有个特别容易漏的点：**光查「填充是透明的」是不够的**。
 						//   少了 background-clip:text 的话，文字是**完全看不见**的，
 						//   而「fill 透明」那一条照样绿（透明 + 不裁到字形上 = 消失）。
 						//   所以两条必须成对查
 						const cryName = document.querySelector('[data-gene="crystal"] .codex-name')
-						if (!cryName) return { ok: false, reason: '图鉴里找不到结晶那格的说明文字' }
+						if (!cryName) return { ok: false, reason: '图鉴里找不到炫彩那格的说明文字' }
 						const cy = getComputedStyle(cryName)
 						if (cy.webkitTextFillColor.indexOf('0, 0, 0, 0') < 0) {
-							return { ok: false, reason: '结晶的说明文字不是渐变填充（淡彩流动没挂上）' }
+							return { ok: false, reason: '炫彩的说明文字不是渐变填充（淡彩流动没挂上）' }
 						}
 						const cyClip = cy.webkitBackgroundClip || cy.backgroundClip
 						if (cyClip !== 'text') {
 							return {
 								ok: false,
 								reason:
-									'结晶的说明文字没裁到字形上（background-clip = ' + cyClip +
+									'炫彩的说明文字没裁到字形上（background-clip = ' + cyClip +
 									'）—— 填充是透明的，再没裁上去的话这行字**整个看不见**',
 							}
 						}
 						if (cy.animationName !== 'border-flow') {
 							return {
 								ok: false,
-								reason: '结晶的说明文字没有在流动（animation-name = ' + cy.animationName + '）',
+								reason: '炫彩的说明文字没有在流动（animation-name = ' + cy.animationName + '）',
 							}
 						}
 
-						// 胶囊里那两个字（「◇ 结晶」）
+						// 胶囊里那两个字（「◇ 炫彩」）
 						//
 						// ⚠ 这里要查的是**两层背景都在**，不只是「有没有渐变」。
 						//   胶囊的底也是拿 background 画的，一旦 background-clip 设成 text
@@ -5262,16 +5202,16 @@ function runSelfTest() {
 						//   字还是流动的、断言里的前两条照样绿，
 						//   只有「比旁边几枚少了一层底」这一点不对
 						const cyBadge = document.querySelector('[data-gene="crystal"] .gene-badge')
-						if (!cyBadge) return { ok: false, reason: '图鉴里找不到结晶那枚胶囊' }
+						if (!cyBadge) return { ok: false, reason: '图鉴里找不到炫彩那枚胶囊' }
 						const cb2 = getComputedStyle(cyBadge)
 						if (cb2.webkitTextFillColor.indexOf('0, 0, 0, 0') < 0) {
-							return { ok: false, reason: '结晶胶囊里的字不是渐变填充' }
+							return { ok: false, reason: '炫彩胶囊里的字不是渐变填充' }
 						}
 						const cbClip = cb2.webkitBackgroundClip || cb2.backgroundClip
 						if (cbClip.indexOf('text') < 0) {
 							return {
 								ok: false,
-								reason: '结晶胶囊里的字没裁到字形上（background-clip = ' + cbClip + '）',
+								reason: '炫彩胶囊里的字没裁到字形上（background-clip = ' + cbClip + '）',
 							}
 						}
 						const cbLayers = cb2.backgroundImage.split('linear-gradient').length - 1
@@ -5279,14 +5219,14 @@ function runSelfTest() {
 							return {
 								ok: false,
 								reason:
-									'结晶胶囊只剩 ' + cbLayers + ' 层背景，应当是 2 层' +
+									'炫彩胶囊只剩 ' + cbLayers + ' 层背景，应当是 2 层' +
 									'（渐变 + 胶囊底色）—— 底被 background-clip:text 一起裁掉了，胶囊成了空壳',
 							}
 						}
 						if (cb2.animationName !== 'border-flow') {
 							return {
 								ok: false,
-								reason: '结晶胶囊里的字没有在流动（animation-name = ' + cb2.animationName + '）',
+								reason: '炫彩胶囊里的字没有在流动（animation-name = ' + cb2.animationName + '）',
 							}
 						}
 
@@ -5320,39 +5260,39 @@ function runSelfTest() {
 							}
 						}
 
-						// 结晶**没解锁**时也必须是静止的（和封禁同一条规矩）。
+						// 炫彩**没解锁**时也必须是静止的（和封禁同一条规矩）。
 						//
 						// ⚠ 得**另摆一次 seen**：上面那一步把它设成 ['crystal']，
-						//   那个状态下结晶是**亮着**的，灰态根本查不到
+						//   那个状态下炫彩是**亮着**的，灰态根本查不到
 						pet.ui._seenGenes = ['ban']
 						pet.ui.refreshCodex()
 						const cryLocked = document.querySelector('[data-gene="crystal"]')
 						if (!cryLocked || !cryLocked.classList.contains('locked')) {
-							return { ok: false, reason: '把结晶标成没见过，图鉴里那一格却没变灰' }
+							return { ok: false, reason: '把炫彩标成没见过，图鉴里那一格却没变灰' }
 						}
 						const cln = getComputedStyle(cryLocked.querySelector('.codex-name'))
 						if (cln.animationName !== 'none') {
 							return {
 								ok: false,
 								reason:
-									'没解锁的结晶格还在流动（' + cln.animationName +
+									'没解锁的炫彩格还在流动（' + cln.animationName +
 									'）—— 一格「？？？」不该是整张图鉴里最抢眼的',
 							}
 						}
 						if (cln.webkitTextFillColor.indexOf('0, 0, 0, 0') >= 0) {
 							return {
 								ok: false,
-								reason: '没解锁的结晶格文字还是渐变填充 —— locked 那条改的是 color，撤不掉渐变',
+								reason: '没解锁的炫彩格文字还是渐变填充 —— locked 那条改的是 color，撤不掉渐变',
 							}
 						}
 						const clb = getComputedStyle(cryLocked.querySelector('.gene-badge'))
 						if (clb.animationName !== 'none') {
-							return { ok: false, reason: '没解锁的结晶胶囊还在流动（' + clb.animationName + '）' }
+							return { ok: false, reason: '没解锁的炫彩胶囊还在流动（' + clb.animationName + '）' }
 						}
 						if (clb.webkitTextFillColor.indexOf('0, 0, 0, 0') >= 0) {
 							return {
 								ok: false,
-								reason: '没解锁的结晶胶囊里的字还是渐变填充',
+								reason: '没解锁的炫彩胶囊里的字还是渐变填充',
 							}
 						}
 						// ⚠ 灰态下**底要还回来**：撤渐变时顺手把 background 清空的话，
@@ -5369,7 +5309,7 @@ function runSelfTest() {
 						if (clbNoFill) {
 							return {
 								ok: false,
-								reason: '没解锁的结晶胶囊连底色都没了 —— 撤渐变时把底一起抹掉了',
+								reason: '没解锁的炫彩胶囊连底色都没了 —— 撤渐变时把底一起抹掉了',
 							}
 						}
 
@@ -5377,7 +5317,7 @@ function runSelfTest() {
 						pet.ui._seenGenes = savedSeen
 						pet.ui.refreshCodex()
 					} catch (e) {
-						return { ok: false, reason: '封禁 / 结晶那格的样式断言失败: ' + e.message }
+						return { ok: false, reason: '封禁 / 炫彩那格的样式断言失败: ' + e.message }
 					}
 
 					pet.ui._onKey({ code: 'Escape' })
@@ -5743,16 +5683,16 @@ function runSelfTest() {
 					return { ok: false, reason: '总财富口径失败: ' + e.message }
 				}
 
-				// —— 结晶成虫的外观：**真的去数像素** ——
+				// —— 炫彩成虫的外观：**真的去数像素** ——
 				//
 				// ⚠ 这是整个项目里**唯一**一条管「变异长什么样」的断言。
 				//   别的断言全都在查状态（mutations 里有没有 crystal、
 				//   面板上有没有徽章、售价乘了几倍）—— 它们一条都不会因为
-				//   「画出来是只普通蝇」而变红。用户报「结晶成虫好像没有特殊效果」
+				//   「画出来是只普通蝇」而变红。用户报「炫彩成虫好像没有特殊效果」
 				//   的时候，能回答这个问题的只有像素
 				//
 				// 三件事各查一个数：
-				//   ① 身体是不是真的透明了 —— 结晶的墨量应当远低于普通蝇
+				//   ① 身体是不是真的透明了 —— 炫彩的墨量应当远低于普通蝇
 				//   ② 描边是不是真的炫彩 —— 高饱和像素要铺满大半个色环
 				//   ③ 这圈边**不能**跑到别的变异身上 —— 金色的色相应当很窄
 				//      （②③ 必须成对：只查②的话，把描边画给所有蝇也照样绿）
@@ -5831,10 +5771,10 @@ function runSelfTest() {
 					for (const k of Object.keys(stash)) W2[k] = stash[k]
 
 					// 这条断言的用途只是「确认真的量到一只实心蝇」—— 也就是别让
-					// 下面那条「结晶 < 80」变成对空画布也成立的空断言。
+					// 下面那条「炫彩 < 80」变成对空画布也成立的空断言。
 					//
 					// 门槛 110 是**量出来的**，不是拍的：14 次采样里普通蝇的 bodyA
-					// 落在 146~162（均值 154），结晶蝇约 46 —— 110 两头都留得开。
+					// 落在 146~162（均值 154），炫彩蝇约 46 —— 110 两头都留得开。
 					//
 					// ⚠ **别把门槛调回 150 附近**。它正好落在普通蝇的自然波动里
 					//   （蝇的朝向是随机的，采样框里腿 / 翅像素的占比跟着变），
@@ -5859,7 +5799,7 @@ function runSelfTest() {
 						return {
 							ok: false,
 							reason:
-								'结晶成虫身体的平均不透明度是 ' + Math.round(crystal.bodyA) +
+								'炫彩成虫身体的平均不透明度是 ' + Math.round(crystal.bodyA) +
 								'/255 —— 身体没有变透明（普通蝇是 ' + Math.round(plain.bodyA) + '）',
 						}
 					}
@@ -5868,7 +5808,7 @@ function runSelfTest() {
 						return {
 							ok: false,
 							reason:
-								'结晶成虫身上高饱和像素的色相只铺开了 ' + crystal.span +
+								'炫彩成虫身上高饱和像素的色相只铺开了 ' + crystal.span +
 								'°（' + crystal.sat + ' 个点）—— 那圈炫彩描边没画出来',
 						}
 					}
@@ -5879,12 +5819,12 @@ function runSelfTest() {
 							ok: false,
 							reason:
 								'金色成虫的色相铺开了 ' + gold.span +
-								'° —— 结晶的炫彩描边被画到非结晶的果蝇身上了',
+								'° —— 炫彩那圈彩边被画到不是炫彩的果蝇身上了',
 						}
 					}
 					// ④ 描边还得**够粗**。只查色相的话，把线宽调回一根头发丝
 					//    也照样绿 —— 而那正是用户报的那个 bug 的样子
-					//    （「结晶成虫好像没有特殊效果」，其实效果在、只是看不见）。
+					//    （「炫彩成虫好像没有特殊效果」，其实效果在、只是看不见）。
 					//    判据用「高饱和像素 ÷ 有墨像素」：和果蝇大小无关，
 					//    因为在同一只蝇上比。当前线宽下约 0.62，头发丝时只有 0.37
 					const rimShare = crystal.sat / crystal.cover
@@ -5892,18 +5832,18 @@ function runSelfTest() {
 						return {
 							ok: false,
 							reason:
-								'结晶成虫身上高饱和像素只占 ' + Math.round(rimShare * 100) +
-								'% —— 那圈描边太细了（和结晶幼虫一样粗时约 62%），远看等于没有',
+								'炫彩成虫身上高饱和像素只占 ' + Math.round(rimShare * 100) +
+								'% —— 那圈描边太细了（和炫彩幼虫一样粗时约 62%），远看等于没有',
 						}
 					}
 					console.log(
-						'  结晶成虫：身体不透明度 ' + Math.round(crystal.bodyA) + '/255（普通蝇 ' +
+						'  炫彩成虫：身体不透明度 ' + Math.round(crystal.bodyA) + '/255（普通蝇 ' +
 							Math.round(plain.bodyA) + '）、炫彩色相铺开 ' + crystal.span +
 							'°（金色只有 ' + gold.span + '°）、描边占 ' +
 							Math.round(rimShare * 100) + '%',
 					)
 				} catch (e) {
-					return { ok: false, reason: '结晶成虫外观检查失败: ' + e.message }
+					return { ok: false, reason: '炫彩成虫外观检查失败: ' + e.message }
 				}
 
 				// —— 星空苹果：贴图是**世界锚定**的 ——
@@ -6596,7 +6536,7 @@ function runSelfTest() {
 
 				// —— 最后画一帧，**而且场上每一类东西都要有一个** ——
 				//
-				// ⚠ 这条是补一个真实的漏网之鱼：上面那条「结晶成虫外观」的像素断言
+				// ⚠ 这条是补一个真实的漏网之鱼：上面那条「炫彩成虫外观」的像素断言
 				//   会把 world 里**所有数组**暂时清空（它只想要自己摆的那一只蝇），
 				//   于是「画尸体」「画蛆尸」「画空壳」这些分支在那条断言里一次都没跑到。
 				//   实测：drawCorpse 里引用了一个已经删掉的变量（ReferenceError），
@@ -6940,7 +6880,7 @@ function runSelfTest() {
 						'达成时屏幕中上方弹入弹出、一口气拿好几个会排队、见过两次不会重复给、重置跟着清零\n' +
 					'  居中小卡：三张新卡的 ✕ 用 elementFromPoint 打出来是它自己、指针压上去 _overCard() 认、点下去真的关上；' +
 						'养蝇人的「配置」点开时商店自己让位（不再两张卡叠成一坨）\n' +
-					'  结晶成虫外观（查像素）：身体平均不透明度只有 45/255（全透明）、高饱和像素的色相铺开 350° 以上' +
+					'  炫彩成虫外观（查像素）：身体平均不透明度只有 45/255（全透明）、高饱和像素的色相铺开 350° 以上' +
 						'（炫彩描边）、这圈边既有幼虫那么粗又不会跑到金色等其他变异身上\n' +
 					'  喷水枪：没买前锁定且切不过去，买了能切；滚轮改长度、Shift+滚轮改角度（两者不串）、长度夹在 100~400；' +
 						'水线穿过偏在一侧的污渍能冲掉，转 90° 之后就不再命中\n' +
@@ -6955,7 +6895,7 @@ function runSelfTest() {
 						`  工具图标：${report.toolIcons ? report.toolIcons.count : '?'} 张 12×12 像素图，` +
 							'和按钮一一对应、每张都是 12×12、着色格数够多、**两两不同**、真的装进了按钮且有尺寸、' +
 							'没有污染按钮文字（收起时标题行的工具名还读得对）；' +
-							'金色流动只有金锤那一颗挂了，而且 `animation-name` 真的是 ' +
+							'金色流动只有 Banhammer 那一颗挂了，而且 `animation-name` 真的是 ' +
 							(report.toolIcons ? report.toolIcons.anim : '?') + '\n' +
 						'  越界等级：老存档里超出链长的等级被夹回来（表现为满级），商店照常重建、不抛异常\n' +
 					'  设置卡：正常 / 烦人切换即时生效、上限 ×50 且总数封顶、切回来不清场、「烦人模式」四个字是红的\n' +

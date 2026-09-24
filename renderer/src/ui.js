@@ -33,7 +33,9 @@ import {
 } from './market.js'
 import { badgesOf } from './mutations.js'
 import { drawFoodIcon, drawFlyIcon } from './render.js'
-import { toolIconMaskUrl, drawPixelIcon } from './toolicons.js'
+// ⚠ `drawPixelIcon` 不在这个 import 里 —— 它只被图鉴那段「工具」用，
+//   而那段已经移除了（连函数一起删了）。工具栏上的图标走的是 `toolIconMaskUrl`
+import { toolIconMaskUrl } from './toolicons.js'
 
 /** 投放面板上每一行给的两档数量。想加「投 100 个」就往这里加一个数 */
 const FEED_QUANTITIES = [1, 10]
@@ -2122,7 +2124,7 @@ export class UI {
 	 * 把一条成就排进播放队列。
 	 *
 	 * ⚠ **必须排队**，不能直接开始播：一个好时刻往往同时达成两个
-	 *   （财富刚过 $0.1 时「金苹果解锁」和苹果解锁是同一帧；一只带结晶的
+	 *   （财富刚过 $0.1 时「金苹果解锁」和苹果解锁是同一帧；一只带炫彩的
 	 *   虫出生时也可能同时点亮图鉴两格）。直接播的话后一条会立刻把
 	 *   前一条换掉 —— 而两条都只显示了一瞬间，玩家一个都没看清
 	 */
@@ -4207,15 +4209,17 @@ export class UI {
 		const body = this.el.codexBody
 		body.innerHTML = ''
 
-		// ⚠ 顺序 = 图鉴里的顺序。工具排最前，因为它是玩家最先接触的东西
-		//   （一进游戏就在面板上）；食物和基因都是后来才慢慢懂的
-		body.append(
-			this._codexSection(
-				'工具',
-				CONFIG.tools.toolCodex.map((t) => t.id),
-				(id) => this._codexToolCell(id),
-			),
-		)
+		// ⚠ 顺序 = 图鉴里的顺序
+		//
+		// ⚠ 这里原来还有**第三段「工具」**（登记表在 config.tools.toolCodex，
+		//   格子由 _codexToolCell 画）。用户要求整个移除 —— 工具在面板上
+		//   本来就一直看得见、商店里也明码标价，图鉴再列一遍是重复的。
+		//   同时删掉了三样只服务于它的东西：
+		//     · config.tools.toolCodex（登记表）
+		//     · _codexToolCell（格子构造器）
+		//     · toolicons.drawPixelIcon（把像素矩阵画到 canvas 上的那个）
+		//   ⚠ `toolIconMaskUrl` 和 `iconFillCount` **留着** ——
+		//     前者是工具栏按钮上的图标（还在用），后者被自检用来查矩阵画得空不空
 		body.append(this._codexSection('食物', this._allFoodIds(), (id) => this._codexFoodCell(id)))
 		body.append(
 			this._codexSection(
@@ -4224,76 +4228,6 @@ export class UI {
 				(id) => this._codexGeneCell(id),
 			),
 		)
-	}
-
-	/**
-	 * 一格工具：左边画出来（和工具栏按钮上**同一个像素矩阵**，
-	 * 只是画大了），右边名字 + 快捷键 + 说明 + 怎么拿到。
-	 *
-	 * ⚠ 名字和价格**一律从配置现算**，不在这里抄第二遍：
-	 *   要买的走 `market.shop`、要升级的走 `market.roastChain`。
-	 *   抄一份的话，改了价格表图鉴里还印着旧价 —— 而那种「文件里写着假话」
-	 *   没有任何东西会报错
-	 *
-	 * ⚠ 这里**不做「未解锁置灰」**：食物那边置灰是因为星空苹果是个彩蛋，
-	 *   提前剧透就没意思了；而工具是明码标价摆在商店里的，
-	 *   藏起来反而变成「图鉴里怎么少了一格」
-	 */
-	_codexToolCell(id) {
-		const info = CONFIG.tools.toolCodex.find((t) => t.id === id)
-		if (!info) return null
-
-		// 名字 + 价格 + 「怎么拿到」那句话，从登记表的 from 现算
-		let name = info.name ?? id
-		let how = '免费'
-		if (info.from && info.from.shop) {
-			const it = shopItem(info.from.shop)
-			if (it) {
-				name = it.name
-				how = `商店 ${formatMoney(it.price)}`
-			}
-		} else if (info.from && info.from.chain) {
-			const tiers = chainOf(info.from.chain) ?? []
-			const tier = tiers[info.from.level - 1]
-			if (tier) {
-				name = tier.name
-				// 链条是**逐级累加**的，所以「怎么拿到」要把前面的档也说清楚
-				how =
-					info.from.level > 1
-						? `先买${tiers[0].name}（${formatMoney(tiers[0].price)}），再付 ${formatMoney(tier.price)}`
-						: `商店 ${formatMoney(tier.price)}`
-			}
-		}
-
-		const cell = document.createElement('div')
-		cell.className = 'codex-cell'
-		cell.dataset.tool = id
-
-		const css = 34
-		const dpr = window.devicePixelRatio || 1
-		const cv = document.createElement('canvas')
-		cv.className = 'codex-icon tool-preview'
-		cv.width = Math.floor(css * dpr)
-		cv.height = Math.floor(css * dpr)
-		const ctx = cv.getContext('2d')
-		ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-		// 12 格 × 2px = 24px。⚠ 边长必须是**整数**，用小数的图会糊
-		drawPixelIcon(ctx, id, 2, css / 2, css / 2, '#e8b84b')
-
-		const text = document.createElement('div')
-		text.className = 'codex-text'
-		const nameEl = document.createElement('div')
-		nameEl.className = 'codex-name'
-		nameEl.textContent = name
-		const keyEl = document.createElement('div')
-		keyEl.className = 'codex-key'
-		keyEl.textContent = '快捷键 ' + info.key
-		const desc = document.createElement('div')
-		desc.className = 'codex-desc'
-		desc.textContent = info.desc + ' · ' + how
-		text.append(nameEl, keyEl, desc)
-		cell.append(cv, text)
-		return cell
 	}
 
 	/**
@@ -4537,7 +4471,7 @@ export class UI {
 		// 「完全不能动」没有对应的字段，漏了这一句图鉴上就只剩钱的事
 		if (t.id === 'ban') bits.push('完全不能移动（拖都拖不走）')
 		//
-		// ⚠ 这里原来还有**四条外观描述**（结晶「全身透明只剩描边」、
+		// ⚠ 这里原来还有**四条外观描述**（炫彩「全身透明只剩描边」、
 		//   点石成金「通体金色、带闪光」、星云「身体是星云上的一扇窗」、
 		//   封禁「身体是流动的黑曜石断口」）。按用户要求全删了。
 		//
